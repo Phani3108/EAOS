@@ -15,7 +15,7 @@
   guardrails:
     - Use internal examples and repos
     - Include runnable code
-    - Always reference Zeta-specific patterns
+    - Always reference organization-specific patterns
 
 - id: learning.prompt_engineering
   name: Prompt Engineering Guide
@@ -44,7 +44,7 @@
   domain: learning
   description: >
     Compare LLM models for different tasks — cost, latency, quality
-    tradeoffs with Zeta-specific benchmarks.
+    tradeoffs with organization-specific benchmarks.
   output_format: ModelComparison
   knowledge_sources:
     - evaluation_results

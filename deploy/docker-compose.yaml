@@ -127,7 +127,7 @@ services:
       - "3004:3004"
     environment:
       PORT: 3004
-      SKILL_SOURCE_URL: ${SKILL_SOURCE_URL:-https://skills.zeta.tech}
+      SKILL_SOURCE_URL: ${SKILL_SOURCE_URL:-https://skills.example.com}
       NATS_URL: nats://nats:4222
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     healthcheck:

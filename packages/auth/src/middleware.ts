@@ -46,9 +46,9 @@ export function generateApiKey(secret?: string): GeneratedApiKey {
 
 // Dev mode API keys — in production, these are hashed and stored in DB
 const DEV_API_KEYS: Record<string, AuthUser> = {
-    'eos-dev-key': { id: 'dev-user', email: 'dev@zeta.tech', name: 'Developer', role: 'admin', teams: ['engineering'], personaScopes: ['*'], tenantId: 'default' },
-    'eos-demo-key': { id: 'demo-user', email: 'demo@zeta.tech', name: 'Demo User', role: 'user', teams: ['engineering', 'marketing'], personaScopes: ['engineering', 'marketing'], tenantId: 'default' },
-    'eos-operator-key': { id: 'ops-user', email: 'ops@zeta.tech', name: 'Operator', role: 'operator', teams: ['engineering', 'product', 'marketing', 'hr'], personaScopes: ['*'], tenantId: 'default' },
+    'eos-dev-key': { id: 'dev-user', email: 'dev@agentos.dev', name: 'Developer', role: 'admin', teams: ['engineering'], personaScopes: ['*'], tenantId: 'default' },
+    'eos-demo-key': { id: 'demo-user', email: 'demo@agentos.dev', name: 'Demo User', role: 'user', teams: ['engineering', 'marketing'], personaScopes: ['engineering', 'marketing'], tenantId: 'default' },
+    'eos-operator-key': { id: 'ops-user', email: 'ops@agentos.dev', name: 'Operator', role: 'operator', teams: ['engineering', 'product', 'marketing', 'hr'], personaScopes: ['*'], tenantId: 'default' },
 };
 
 /** JWT signing secret — set via env (required in production) */

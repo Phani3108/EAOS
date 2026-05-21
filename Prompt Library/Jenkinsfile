@@ -1,9 +1,0 @@
-@Library("ci@master") _
-
-def fallbackTag = "0.1.5"
-// Honor imageTag from build parameters if set, otherwise use generated fallback
-def finalImageTag = params.imageTag ?: fallbackTag
-
-DockerPublish([
-	imageTag: finalImageTag
-])

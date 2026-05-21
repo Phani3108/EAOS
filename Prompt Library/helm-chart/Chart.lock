@@ -1,6 +1,0 @@
-dependencies:
-- name: common
-  repository: https://jfrog.internal.ciaas.zetaapps.in/artifactory/zeta-virtual-helm-global
-  version: 1.0.121
-digest: sha256:a0c3a6a2cb665d956abb94db6209a15d3802a67a90f3ec26db40612a412cdd0b
-generated: "2026-02-01T01:24:56.364355+05:30"

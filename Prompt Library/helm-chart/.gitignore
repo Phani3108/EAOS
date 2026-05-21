@@ -1,9 +1,0 @@
-# Build artifacts
-dist/
-*.tgz
-
-# Rendered manifests
-rendered-manifests*.yaml
-
-# Chart dependencies
-charts/*.tgz

@@ -140,7 +140,7 @@ export class LearningUpskillingAgent {
     private async generateTutorial(req: LearningRequest): Promise<LearningModule> {
         // 1. Retrieve internal docs about the topic
         // 2. Find internal code examples
-        // 3. Generate tutorial with Zeta-specific context
+        // 3. Generate tutorial with organization-specific context
         // 4. Include exercises
 
         return {
@@ -149,7 +149,7 @@ export class LearningUpskillingAgent {
             level: req.level,
             sections: [
                 { heading: 'Overview', content: '' },
-                { heading: 'How We Use This at Zeta', content: '' },
+                { heading: 'How We Use This Internally', content: '' },
                 { heading: 'Step-by-Step Implementation', content: '' },
                 { heading: 'Common Pitfalls', content: '' },
                 { heading: 'Testing & Validation', content: '' },
@@ -185,7 +185,7 @@ export class LearningUpskillingAgent {
     }
 
     private async getPromptLibrary(req: LearningRequest): Promise<{ templates: PromptTemplate[] }> {
-        // Return curated prompt templates from skills.zeta.tech
+        // Return curated prompt templates from the internal skills source
         return {
             templates: [
                 {

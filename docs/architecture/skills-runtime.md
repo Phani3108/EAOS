@@ -5,7 +5,7 @@
 ```mermaid
 graph TB
     subgraph External["Skill Sources"]
-        ZS["skills.zeta.tech"]
+        ZS["internal-skills-source"]
         Teams["Team Contributions"]
         Git["Git Repositories"]
     end

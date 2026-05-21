@@ -58,7 +58,7 @@ export const RICH_DESCRIPTIONS: Record<string, string> = {
 
   // Research cluster
   'wf-021':
-    'Runs a weekly competitor scan. Pulls recent announcements, product updates, pricing moves, and GTM signals via Perplexity research, then synthesizes into a concise brief for the marketing lead with Zeta-specific implications.',
+    'Runs a weekly competitor scan. Pulls recent announcements, product updates, pricing moves, and GTM signals via Perplexity research, then synthesizes into a concise brief for the marketing lead with organization-specific implications.',
   'wf-022':
     'Builds an industry trend digest on a chosen topic. Aggregates recent signals (news, research, analyst notes), filters for what matters to your ICP, and delivers a curated digest with commentary.',
   'wf-023':

@@ -1,4 +1,0 @@
-apiVersion: v1
-description: Common chartbuilding components and helpers for zeta
-name: common
-version: 1.0.121
