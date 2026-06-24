@@ -59,7 +59,9 @@ export function getLLMMetrics(): LLMMetricEntry[] {
 async function withSpan<T>(name: string, attrs: Record<string, string | number>, fn: () => Promise<T>): Promise<T> {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const otel: any = await import('@opentelemetry/api');
+    // Optional dependency — specifier cast to string so tsc treats it as a dynamic
+    // (unresolved) import; tracing is a no-op when @opentelemetry/api isn't installed.
+    const otel: any = await import('@opentelemetry/api' as string);
     const tracer = otel.trace.getTracer('agentos-gateway');
     return await tracer.startActiveSpan(name, async (span: any) => {
       for (const [k, v] of Object.entries(attrs)) span.setAttribute(k, v);
@@ -98,7 +100,9 @@ export async function tracedLLMCall(req: LLMRequest, spanName?: string): Promise
 
     // Enrich span after call
     try {
-      const otel: any = await import('@opentelemetry/api');
+      // Optional dependency — specifier cast to string so tsc treats it as a dynamic
+    // (unresolved) import; tracing is a no-op when @opentelemetry/api isn't installed.
+    const otel: any = await import('@opentelemetry/api' as string);
       const span = otel.trace.getActiveSpan();
       if (span) {
         span.setAttribute('llm.input_tokens', response.inputTokens);

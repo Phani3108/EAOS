@@ -359,7 +359,7 @@ async function execCanva(req: RealExecRequest): Promise<Record<string, unknown> 
         }),
       });
       if (!res.ok) throw new Error(`Canva ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const data = await res.json();
+      const data = await res.json() as Record<string, unknown>;
       return { ...data, simulated: false };
     }
     case 'export:create': {
@@ -372,7 +372,7 @@ async function execCanva(req: RealExecRequest): Promise<Record<string, unknown> 
         body: JSON.stringify(p),
       });
       if (!res.ok) throw new Error(`Canva ${res.status}: ${(await res.text()).slice(0, 200)}`);
-      const data = await res.json();
+      const data = await res.json() as Record<string, unknown>;
       return { ...data, simulated: false };
     }
     default:

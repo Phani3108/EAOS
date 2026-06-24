@@ -269,7 +269,7 @@ class CognitiveEngineService {
 
                 // POST /api/cognitive/process — full pipeline
                 if (path === '/api/cognitive/process' && method === 'POST') {
-                    const request = body as CognitiveRequest;
+                    const request = body as unknown as CognitiveRequest;
                     if (!request.goal) { send(res, 400, { error: 'goal required' }); return; }
                     request.id = request.id ?? `cog-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
                     request.context = request.context ?? {};

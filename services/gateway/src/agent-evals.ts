@@ -408,7 +408,7 @@ export class AgentEvalsStore {
           totalRuntime: (step.latencyMs ?? 0) / 1000,
           totalCost: step.tokenCost ?? 0,
           runtime: (step.latencyMs ?? 0) / 1000,
-          tools: step.tool ? 1 : 0,
+          tools: (step as { tool?: unknown }).tool ? 1 : 0,
         });
       }
     }
