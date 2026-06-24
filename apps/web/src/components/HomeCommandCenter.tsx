@@ -13,6 +13,8 @@ import { useConnectionsStore, CONNECTOR_CATALOG } from '../store/connections-sto
 import { useMarketingStore } from '../store/marketing-store';
 import { useEngineeringStore, useProductStore, useHRStore, useTAStore, useProgramStore } from '../store/persona-store';
 import PlatformArchitecture from './PlatformArchitecture';
+import StoryFlow from './home/StoryFlow';
+import GettingStartedChecklist from './home/GettingStartedChecklist';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -179,57 +181,14 @@ export default function HomeCommandCenter() {
         {/* ── Getting Started (shown when 0 connections + 0 executions) ── */}
         {isNewUser ? (
           <>
-            <div className="rounded-2xl bg-gradient-to-br from-blue-600 via-blue-700 to-indigo-700 p-8 text-white shadow-lg">
-              <div className="flex items-start justify-between">
-                <div className="max-w-xl">
-                  <h1 className="text-2xl font-bold tracking-tight">{greeting}, welcome to AgentOS</h1>
-                  <p className="text-blue-100 mt-2 text-[15px] leading-relaxed">
-                    Your AI orchestration platform. Connect your tools, pick a persona, choose skills, and execute — all from one place.
-                  </p>
-                  <div className="flex items-center gap-3 mt-6">
-                    <button
-                      onClick={() => setActiveSection('conn-ai-models')}
-                      className="px-5 py-2.5 bg-white text-blue-700 font-semibold text-sm rounded-lg shadow hover:bg-blue-50 transition-colors"
-                    >
-                      1. Connect your tools
-                    </button>
-                    <button
-                      onClick={() => setActiveSection('ws-marketing')}
-                      className="px-5 py-2.5 bg-white/15 hover:bg-white/25 text-white font-semibold text-sm rounded-lg transition-colors"
-                    >
-                      2. Explore a workspace
-                    </button>
-                  </div>
-                </div>
-                <div className="hidden lg:flex flex-col items-end gap-2 text-right">
-                  <div className="text-5xl font-bold tabular-nums opacity-90">3</div>
-                  <div className="text-blue-200 text-xs uppercase tracking-wider font-semibold">Steps to get started</div>
-                </div>
-              </div>
-
-              {/* Steps */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mt-6">
-                {[
-                  { step: '1', title: 'Connect Tools', desc: 'Link AI models, CRM, dev tools, and more', icon: '🔌', action: 'conn-ai-models' },
-                  { step: '2', title: 'Choose a Workspace', desc: 'Marketing, Engineering, or Product', icon: '🏢', action: 'ws-marketing' },
-                  { step: '3', title: 'Run Your First Skill', desc: 'Pick a skill, configure, and execute', icon: '⚡', action: 'ws-marketing' },
-                ].map(s => (
-                  <button
-                    key={s.step}
-                    onClick={() => setActiveSection(s.action)}
-                    className="flex items-start gap-3 p-4 rounded-xl bg-white/10 hover:bg-white/20 transition-colors text-left group"
-                  >
-                    <span className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center text-lg flex-shrink-0">{s.icon}</span>
-                    <div>
-                      <p className="text-sm font-semibold text-white">{s.title}</p>
-                      <p className="text-[12px] text-blue-200 mt-0.5">{s.desc}</p>
-                    </div>
-                  </button>
-                ))}
-              </div>
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-slate-900">{greeting}, welcome to EAOS</h1>
+              <p className="text-slate-500 mt-1 text-[15px]">Your AI orchestration platform — connect tools, pick a workspace, and run skills.</p>
             </div>
+            <GettingStartedChecklist totalExecCount={totalExecCount} />
+            <StoryFlow />
 
-            {/* Workspace shortcuts — still show even for new users */}
+                        {/* Workspace shortcuts — still show even for new users */}
             <div>
               <h2 className="section-title">Workspaces</h2>
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">

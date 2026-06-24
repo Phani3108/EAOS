@@ -7,6 +7,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { notify } from '../lib/notify';
 import { useHRStore, type PersonaExecutionStep } from '../store/persona-store';
 import { useConnectionsStore } from '../store/connections-store';
 import { useEAOSStore } from '../store/eaos-store';
@@ -165,7 +166,7 @@ function HRCommandCenter({ initialSkillSlug }: { initialSkillSlug?: string | nul
       addExecution({ id: execution.id, persona: 'hr', skillId: execution.skillId, skillName: execution.skillName, status: execution.status ?? 'queued', steps: stepEvents, outputs: execution.outputs ?? {}, startedAt: execution.startedAt });
       setSelectedSkill(null);
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Execution failed');
+      notify('error', 'Execution failed', err instanceof Error ? err.message : 'Something went wrong');
     } finally {
       setExecuting(false);
     }

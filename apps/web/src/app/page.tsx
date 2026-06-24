@@ -46,6 +46,8 @@ import { DemoModeBanner, useGatewayReachable } from '../components/DemoModeBanne
 import { MCPServersHub } from '../components/MCPServersHub';
 import { RegimentReview } from '../components/RegimentReview';
 import { SkillLibraryHub } from '../components/SkillLibraryHub';
+import { MotionConfig } from 'framer-motion';
+import { ToastViewport } from '../components/ui';
 
 function MainContent({ section }: { section: string }) {
   // Dynamic connector detail pages: connector-detail-{connectorId}
@@ -194,6 +196,7 @@ export default function Home() {
   const gatewayOk = useGatewayReachable();
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className="flex h-dscreen md:h-screen bg-white text-slate-900 overflow-hidden">
       <Sidebar mobileOpen={mobileNavOpen} onMobileClose={() => setMobileNavOpen(false)} />
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -221,6 +224,8 @@ export default function Home() {
       <CommandPalette />
       <TourOverlay />
       <OnboardingModal forceOpen={false} onClose={() => {}} />
+      <ToastViewport />
     </div>
+    </MotionConfig>
   );
 }

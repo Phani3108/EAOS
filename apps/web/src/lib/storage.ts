@@ -13,6 +13,12 @@ interface EOSUserPrefs {
     selected_role: string | null;
     onboarding_dismissed: boolean;
     tour_dismissed: boolean;
+    // Rehaul: getting-started checklist + guided first-run + theme
+    getting_started_dismissed: boolean;
+    first_run_celebrated: boolean;
+    selected_use_cases: string[];
+    magic_flow_step: string | null;
+    theme: 'light' | 'dark';
 }
 
 const DEFAULTS: EOSUserPrefs = {
@@ -21,6 +27,11 @@ const DEFAULTS: EOSUserPrefs = {
     selected_role: null,
     onboarding_dismissed: false,
     tour_dismissed: false,
+    getting_started_dismissed: false,
+    first_run_celebrated: false,
+    selected_use_cases: [],
+    magic_flow_step: null,
+    theme: 'light',
 };
 
 function getKey(key: string): string {
