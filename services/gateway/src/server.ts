@@ -23,7 +23,10 @@ import { intentEngine } from './intent-engine.js';
 import { memoryGraph } from './memory-graph.js';
 import { createUTCPPacket, storePacket, getPacket, getRecentPackets, getPacketsByStatus, updatePacketStatus, type UTCPPacket, type TaskStatus } from './utcp-protocol.js';
 import { createA2AMessage, respondToA2A, createMeeting, createSwarm, storeMessage, getMessage, getRecentMessages, getMessagesByTask, getPendingMessages, storeMeeting, getMeeting, getRecentMeetings, getActiveMeetings, storeSwarm, getSwarm, getActiveSwarms, getRecentSwarms, type A2AAgent } from './a2a-protocol.js';
-import { createMCPAction, executeMCPAction, getToolCapabilities, getToolCapability, getExecutionLog as getMCPLog, getToolStats } from './mcp-executor.js';
+import { createMCPAction, executeMCPAction, getToolCapabilities, getToolCapability, getExecutionLog as getMCPLog, getToolStats, setMcpResolver } from './mcp-executor.js';
+import { McpClientManager } from './mcp-client.js';
+import { loadMcpServerConfigs } from './mcp-config.js';
+import { scanSkill, isSkillScanConfigured } from './skill-scan.js';
 import { createAgentRuntime, createEphemeralAgent, addReACTIteration, completeExecution, assembleFullPrompt, storeRuntime, getRuntime, getActiveRuntimes, getAllRuntimes, terminateRuntime } from './agent-runtime.js';
 import { initAgentStatusReconciler, getAgentStatusSnapshot, getAgentStatus, subscribeToAgentStatus } from './agent-status-reconciler.js';
 import { initSlackNotifier } from './slack-notifier.js';
@@ -56,7 +59,9 @@ import { startWorkers, registerTaskHandler } from './task-worker.js';
 import { getQueueStats, listTasks, getTask, cancelTask as cancelQueueTask, retryTask as retryQueueTask } from './task-queue.js';
 import { createSession as createChatSession, getSession as getChatSession, listSessions as listChatSessions, archiveSession as archiveChatSession, listMessages as listChatMessages } from './chat-store.js';
 import { postMessage as postChatMessage } from './chat-engine.js';
-import { getFsSkills, reloadFsSkills, getAllFsSkills } from './skill-fs-loader.js';
+import { getFsSkills, reloadFsSkills, getAllFsSkills, warmAllFsSkills } from './skill-fs-loader.js';
+import { runReviewPipeline, getReviewChain } from './review-pipeline.js';
+import { ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT_PLACEHOLDERS } from './prompts/orchestrator-prompt.js';
 import type { AfterActionReport, RetrainingFlag } from './persona-api.js';
 import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
 import { getFullRegistry, getAgentIdentity, getAgentsByPersona, getCSuiteAgents, getAllCSuiteProfiles, getCSuiteProfile, getChainOfCommand, getOrgTree } from './agent-registry.js';
@@ -165,6 +170,56 @@ const promptStore = new PromptStore();
 const capabilityGraph = new CapabilityGraph();
 const personaSystem = new PersonaSystem();
 const licenseStore = new LicenseStore();
+
+// Eagerly load adopted community skills (skills/<persona>/<slug>/SKILL.md) so they
+// surface in the unified catalog and per-persona listings from boot.
+try {
+  const warmed = warmAllFsSkills();
+  if (warmed.total > 0) console.log(`[skills] loaded ${warmed.total} adopted skills across: ${warmed.personas.join(', ')}`);
+} catch (err) { console.warn('[skills] warm load failed:', err); }
+
+// Real MCP client (Phase 0) — connect MCP servers declared in mcp.servers.json and route
+// tool calls whose tool_id is a connected MCP server through genuine MCP. Servers gated by
+// an unset enabledWhenEnv var are skipped, so with no config the gateway runs as before.
+const mcpManager = new McpClientManager();
+setMcpResolver(async (action) => {
+  if (!mcpManager.hasServer(action.tool_id)) return null; // only MCP-server tool_ids
+  const params = { ...(action.params as Record<string, unknown>) };
+  const toolName = String(params.__mcp_tool ?? action.resource_type ?? action.action);
+  delete params.__mcp_tool;
+  const r = await mcpManager.callTool(action.tool_id, toolName, params);
+  if (!r.ok) return null; // fall back to legacy connectors / simulation on MCP failure
+  return r.structured ?? { mcp: true, server: r.server, tool: r.tool, content: r.content };
+});
+void mcpManager.init(loadMcpServerConfigs())
+  .then((n) => { if (n > 0) console.log(`[mcp] connected ${n} MCP server(s)`); })
+  .catch((err) => console.warn('[mcp] init failed:', err));
+
+/**
+ * Adapt an adopted community skill (FSSkillDef) into an executable single-step
+ * UnifiedSkillDef. The skill's markdown body is passed separately as the step's
+ * instructions (via customPrompt) so the LLM receives the actual skill content.
+ */
+function synthesizeAdoptedSkill(fs: ReturnType<typeof getAllFsSkills>[number]): any {
+  return {
+    id: fs.id,
+    slug: fs.slug,
+    name: fs.name,
+    description: fs.description || fs.name,
+    icon: '🧩',
+    persona: fs.persona,
+    executableType: 'skill',
+    cluster: fs.cluster ?? 'Adopted Skills',
+    complexity: fs.complexity ?? 'moderate',
+    estimatedTime: fs.estimatedTime ?? '~varies',
+    inputs: [{ id: 'request', label: 'Request / Context', type: 'textarea', required: false, section: 'basic', helpText: 'Optional context or target for this skill.' }],
+    steps: [{ id: `${fs.id}-s1`, order: 1, name: fs.name, agent: '', tool: 'Claude', outputKey: 'result', capability: 'content.generate' }],
+    outputs: ['result'],
+    requiredTools: ['Claude'],
+    optionalTools: fs.requiredTools ?? [],
+    tags: fs.tags ?? [],
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Gateway-wide persistence — wire all ephemeral stores to backing store
@@ -582,6 +637,126 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
+        // POST /api/skills/scan — run the Skill Security Scan on skill content: { name, persona, body }
+        if (path === '/api/skills/scan' && method === 'POST') {
+            const body = await readBody(req);
+            const scan = await scanSkill({ name: String((body as any).name ?? 'skill'), persona: (body as any).persona, body: String((body as any).body ?? (body as any).content ?? '') });
+            sendJSON(res, 200, { configured: isSkillScanConfigured(), scan: scan ?? { passed: true, riskScore: 0, findings: [], engine: 'none (not configured)' } });
+            return;
+        }
+
+        // POST /api/skills/fs/execute — run an adopted community skill (works for ANY
+        // persona, incl. design/program/ta that the unified /api/execute doesn't branch on).
+        if (path === '/api/skills/fs/execute' && method === 'POST') {
+            const body = await readBody(req);
+            const skillId = String((body.skillId as string) ?? '');
+            const reqPersona = body.persona ? String(body.persona) : undefined;
+            const inputs = (body.inputs as Record<string, unknown>) ?? {};
+            const simulate = typeof body.simulate === 'boolean' ? body.simulate : undefined;
+            const provider = body.provider as string | undefined;
+            const modelId = body.modelId as string | undefined;
+
+            const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
+            if (!fsSkill) { sendJSON(res, 404, { error: `Adopted skill not found: ${skillId}` }); return; }
+
+            const persona = fsSkill.persona || reqPersona || 'engineering';
+            if (authUser && !requirePersonaAccess(authUser, persona)) {
+                sendJSON(res, 403, { error: `Access denied for persona: ${persona}` }); return;
+            }
+
+            const skill = synthesizeAdoptedSkill(fsSkill);
+            const shouldSimulate = simulate !== undefined ? simulate : !hasAnyLLMKey();
+            const exec = createPersonaExecution(persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
+            recordAudit(userId, 'skill.execute', `${persona} / ${fsSkill.name} (adopted)`);
+            broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate: shouldSimulate, adopted: true });
+            sendJSON(res, 201, { execution: exec });
+            return;
+        }
+
+        // ── Real MCP servers (Phase 0) ──
+        // GET /api/mcp/servers — connected MCP servers + their tools
+        if (path === '/api/mcp/servers' && method === 'GET') {
+            sendJSON(res, 200, { servers: mcpManager.getServerStatus() });
+            return;
+        }
+        // GET /api/mcp/servers/:id/tools — tools exposed by one MCP server
+        if (path.match(/^\/api\/mcp\/servers\/[^/]+\/tools$/) && method === 'GET') {
+            const id = decodeURIComponent(path.split('/')[4]!);
+            sendJSON(res, 200, { server: id, tools: mcpManager.listTools(id) });
+            return;
+        }
+        // POST /api/mcp/servers/:id/call — call a tool on an MCP server: { tool, arguments }
+        if (path.match(/^\/api\/mcp\/servers\/[^/]+\/call$/) && method === 'POST') {
+            const id = decodeURIComponent(path.split('/')[4]!);
+            const body = await readBody(req);
+            const toolName = String((body.tool as string) ?? (body.name as string) ?? '');
+            const args = ((body.arguments ?? body.args) as Record<string, unknown>) ?? {};
+            if (!toolName) { sendJSON(res, 400, { error: 'tool name required' }); return; }
+            const result = await mcpManager.callTool(id, toolName, args);
+            sendJSON(res, result.ok ? 200 : 502, result);
+            return;
+        }
+
+        // ── Voice (inclusive access) — proxies to the connected voice MCP server ──
+        // POST /api/voice/transcribe — speech-to-text. 501 (graceful) when no voice server.
+        if (path === '/api/voice/transcribe' && method === 'POST') {
+            if (!mcpManager.hasServer('voicebox')) { sendJSON(res, 501, { simulated: true, reason: 'Voice server not connected — set VOICEBOX_URL.' }); return; }
+            const body = await readBody(req);
+            const r = await mcpManager.callTool('voicebox', 'voicebox.transcribe', { audio_base64: (body as any).audio_base64, audio_path: (body as any).audio_path, language: (body as any).language });
+            sendJSON(res, r.ok ? 200 : 502, { ok: r.ok, text: r.content, ...(r.structured ?? {}), error: r.error });
+            return;
+        }
+        // POST /api/voice/speak — text-to-speech (e.g. spoken after-action summaries).
+        if (path === '/api/voice/speak' && method === 'POST') {
+            if (!mcpManager.hasServer('voicebox')) { sendJSON(res, 501, { simulated: true, reason: 'Voice server not connected — set VOICEBOX_URL.' }); return; }
+            const body = await readBody(req);
+            const r = await mcpManager.callTool('voicebox', 'voicebox.speak', { text: String((body as any).text ?? ''), profile: (body as any).profile, language: (body as any).language });
+            sendJSON(res, r.ok ? 200 : 502, { ok: r.ok, ...(r.structured ?? { content: r.content }), error: r.error });
+            return;
+        }
+
+        // ── EAOS Regiment Review — collaborative multi-role review pipeline ──
+        // GET  /api/review/chain — the configured review-role chain + skill availability
+        if (path === '/api/review/chain' && method === 'GET') {
+            sendJSON(res, 200, { chain: getReviewChain() });
+            return;
+        }
+
+        // GET /api/agent-prompts — EAOS agent system prompts (e.g. the Orchestrator).
+        if (path === '/api/agent-prompts' && method === 'GET') {
+            sendJSON(res, 200, { prompts: [
+                {
+                    id: 'orchestrator',
+                    name: 'Orchestrator Agent',
+                    description: 'Long-horizon orchestrator system prompt — clarification-first, citation-required, multi-subagent orchestration.',
+                    placeholders: ORCHESTRATOR_PROMPT_PLACEHOLDERS,
+                    length: ORCHESTRATOR_PROMPT.length,
+                    content: ORCHESTRATOR_PROMPT,
+                    provenance: 'bytedance/deer-flow (MIT)',
+                },
+            ] });
+            return;
+        }
+
+        // POST /api/review/run — run an artifact through the collaborative review chain.
+        // Each reviewer agent uses an adopted gstack plan-*-review skill and sees prior verdicts.
+        if (path === '/api/review/run' && method === 'POST') {
+            const body = await readBody(req);
+            const artifact = String((body.artifact as string) ?? (body.text as string) ?? '');
+            if (!artifact.trim()) { sendJSON(res, 400, { error: 'artifact (text to review) is required' }); return; }
+            const roles = Array.isArray(body.roles) ? (body.roles as string[]).map(String) : undefined;
+            const provider = body.provider as string | undefined;
+            const modelId = body.modelId as string | undefined;
+            try {
+                const result = await runReviewPipeline(artifact, { roles, provider, modelId });
+                recordAudit(userId, 'review.run', `autoplan review → ${result.finalVerdict} (${result.reviewers.length} reviewers)`);
+                sendJSON(res, 200, result);
+            } catch (err) {
+                sendJSON(res, 500, { error: (err as Error).message });
+            }
+            return;
+        }
+
         // -----------------------------------------------------------------
         // Auth routes — token issuance + user info
         // -----------------------------------------------------------------
@@ -805,11 +980,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 return;
             }
 
+            // Fallback: adopted community skill (skills/<persona>/<slug>/SKILL.md)
+            let adoptedBody: string | undefined;
+            if (!skill) {
+                const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
+                if (fsSkill) { skill = synthesizeAdoptedSkill(fsSkill); adoptedBody = fsSkill.systemPrompt; }
+            }
+
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
 
             // If the client didn't send simulate, auto-detect: no key configured → sandbox mode
             const shouldSimulate = simulate !== undefined ? simulate : !hasAnyLLMKey();
-            const exec = createPersonaExecution(persona as any, skill, inputs ?? {}, userId, shouldSimulate, customPrompt, provider as any, modelId);
+            // Adopted skills carry their instructions in the markdown body — feed it as customPrompt.
+            const effectiveCustomPrompt = adoptedBody
+                ? (customPrompt ? `${adoptedBody}\n\n---\n${customPrompt}` : adoptedBody)
+                : customPrompt;
+            const exec = createPersonaExecution(persona as any, skill, inputs ?? {}, userId, shouldSimulate, effectiveCustomPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate, provider });
             sendJSON(res, 201, { execution: exec });
@@ -960,6 +1146,21 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 ...TA_SKILLS,
                 ...PROGRAM_SKILLS,
                 ...marketingApi.getMarketingSkills(),
+                // Adopted community skills (gstack, mattpocock/skills) loaded from disk.
+                ...(getAllFsSkills().map((s) => ({
+                    id: s.id,
+                    name: s.name,
+                    description: s.description || s.name,
+                    persona: s.persona,
+                    cluster: s.cluster ?? 'Adopted Skills',
+                    executableType: 'skill',
+                    estimatedTime: s.estimatedTime ?? '~varies',
+                    complexity: s.complexity ?? 'moderate',
+                    tags: s.tags ?? [],
+                    adopted: true,
+                    steps: s.steps ?? [],
+                    outputs: s.outputs ?? [],
+                })) as any[]),
             ];
             const filtered = all.filter(s => {
                 if (typeFilter && (s as any).executableType !== typeFilter) return false;
@@ -1297,8 +1498,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         if (path === '/api/marketplace/skills' && method === 'POST') {
             const body = await readBody(req);
+            // Skill Security Scan gate — screen risky skills before registration (skipped when unconfigured).
+            const scanBody = [body.name, body.description, (body as any).systemPrompt, (body as any).prompt, JSON.stringify((body as any).steps ?? '')].filter(Boolean).join('\n');
+            const scan = await scanSkill({ name: String((body as any).name ?? 'skill'), persona: (body as any).persona, body: scanBody });
+            if (scan && !scan.passed) {
+                sendJSON(res, 403, { error: 'Skill failed the Skill Security Scan', scan });
+                return;
+            }
             const skill = skillMarketplace.createSkill(body as Parameters<typeof skillMarketplace.createSkill>[0]);
-            sendJSON(res, 201, { skill });
+            sendJSON(res, 201, { skill, scan: scan ?? undefined });
             return;
         }
 
@@ -4828,6 +5036,7 @@ process.on('SIGTERM', () => {
     if ('flush' in store) (store as PersistentStore).flush();
     if ('close' in store) void (store as PostgresStore).close();
     void shutdownOTel();
+    void mcpManager.disconnectAll();
     server.close();
 });
 process.on('SIGINT', () => {
@@ -4835,6 +5044,7 @@ process.on('SIGINT', () => {
     if ('flush' in store) (store as PersistentStore).flush();
     if ('close' in store) void (store as PostgresStore).close();
     void shutdownOTel();
+    void mcpManager.disconnectAll();
     server.close();
 });
 

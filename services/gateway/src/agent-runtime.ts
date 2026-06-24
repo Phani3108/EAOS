@@ -334,3 +334,43 @@ export function terminateRuntime(runtimeId: string): void {
     runtimes.set(runtimeId, { ...rt, state: 'terminated', terminated_at: new Date().toISOString() });
   }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// A2A Inbox — real agent-to-agent message delivery (Track C)
+//
+// Until now `a2a_inbox` was initialized empty and never read or written, so
+// "agent-to-agent" was nominal. These functions make messages actually flow:
+// the swarm manager delivers to inboxes and agents drain them when they reason.
+// ═══════════════════════════════════════════════════════════════
+
+/** Deliver an A2A message into a runtime's inbox. Returns false if no such runtime. */
+export function deliverToInbox(runtimeId: string, msg: A2AMessage): boolean {
+  const rt = runtimes.get(runtimeId);
+  if (!rt) return false;
+  rt.a2a_inbox.push(msg);
+  rt.metrics.total_a2a_messages += 1;
+  rt.last_active_at = new Date().toISOString();
+  runtimes.set(runtimeId, rt);
+  return true;
+}
+
+/** Deliver to an agent by agent_id (resolves its active runtime). */
+export function deliverToAgent(agentId: string, msg: A2AMessage): boolean {
+  const rt = getRuntimeByAgent(agentId);
+  return rt ? deliverToInbox(rt.runtime_id, msg) : false;
+}
+
+/** Drain (read + clear) a runtime's inbox. */
+export function drainInbox(runtimeId: string): A2AMessage[] {
+  const rt = runtimes.get(runtimeId);
+  if (!rt) return [];
+  const msgs = rt.a2a_inbox;
+  rt.a2a_inbox = [];
+  runtimes.set(runtimeId, rt);
+  return msgs;
+}
+
+/** Read a runtime's inbox without clearing it. */
+export function peekInbox(runtimeId: string): A2AMessage[] {
+  return runtimes.get(runtimeId)?.a2a_inbox ?? [];
+}

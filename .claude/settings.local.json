@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn -E \"jsonwebtoken|bcrypt|jose|@agentos/auth\" --include=\"package.json\" . -not -path '*/node_modules/*')",
+      "Bash(python3 -c \"import base64; z='YWthcHVyYU0gaW5haFAgfCBha2FwdXJhbS1pbmFocC9uaS9tb2MubmlkZWtuaWwvLzpzcHR0aA=='; print\\(base64.b64decode\\(z\\).decode\\(\\)[::-1]\\)\")",
+      "Bash(grep -rniE \"bullmq|sqs|rabbitmq|kafka|redis|amqp|consume|subscribe|\\\\.on\\\\\\(|createConsumer|messageHandler|queue|broker\" .)",
+      "Bash(find . -name \"index.ts\" -o -name \"main.ts\" -o -name \"server.ts\")",
+      "Bash(grep -rniE \"^import |require\\\\\\(\" . --include=*.ts)",
+      "Bash(echo \"\\(exit: $?  — 1 means no matches\\)\")",
+      "Bash(grep -rhoE \"['\\\\\"\\\\`]/api/[a-zA-Z0-9/_:{}.-]+\" services/gateway/src/)"
+    ]
+  }
+}
