@@ -26,6 +26,11 @@ EAOS is a **control plane for enterprise work**. Agents think, decide, and orche
 - 🎯 **Model router** — Haiku → Sonnet → Opus with cost metering & circuit breakers
 - 🛡️ **Governance built-in** — RBAC, audit trail, compliance checks, cost attribution, budget controls
 - 📊 **150+ API routes** — fully implemented backend with real persistence
+- 🧩 **Skill Library** — adopted, file-defined EAOS skills (QA loop · security audit · PRD writer · technical spec · product discovery) runnable from the UI
+- 🏛️ **Regiment Review** — collaborative Strategy → Design → Engineering → DevEx review chain where each stage sees the prior verdicts
+- 🔌 **Real MCP client** — stdio + HTTP transports with graceful degradation (codebase-memory, voicebox)
+- 🎬 **Guided onboarding + dark mode** — storytelling home, an "experience the magic" first-run flow, light/dark themes, and toast feedback
+- 🔒 **Hardened security** — OIDC JWKS verification · mandatory JWT in prod · IDOR-scoped reads · CORS allowlist · safe expression eval · SkillSpector skill-scan gate
 
 ---
 
@@ -58,7 +63,11 @@ Vision → Decomposition → Cascading → Agent Assignment → Skill Execution
 | 🎯 **Model Router** | Cost-aware Haiku → Sonnet → Opus routing with circuit breakers |
 | 🎨 **Workflow Canvas** | Visual DAG builder for cross-functional templates |
 | 📡 **Protocol Monitor** | Real-time UTCP, A2A, MCP, Runtime, Cost dashboards |
-| 🛡️ **Governance** | RBAC · audit trails · compliance checks · cost attribution |
+| 🧩 **Skill Library** | Adopted EAOS skills loaded from `skills/<persona>/<slug>/SKILL.md`, runnable in-app |
+| 🏛️ **Regiment Review** | Collaborative Strategy → Design → Engineering → DevEx review chain |
+| 🔌 **Real MCP Client** | stdio + HTTP transports · dynamic tool discovery · graceful degradation |
+| 🎨 **Guided Onboarding & Theming** | Storytelling home · first-run flow · light/dark mode · toast notifications |
+| 🛡️ **Governance & Security** | RBAC · audit trails · OIDC JWKS · IDOR scoping · CORS allowlist · skill-scan gate |
 
 ---
 
@@ -100,7 +109,7 @@ docker compose -f deploy/docker-compose.production.yml up -d
 <tr>
 <td width="33%">
 
-**🎛️ Home Command Center** — Mission control with live agent stats, recent executions, and platform health.
+**🎛️ Home Command Center** — Storytelling onboarding: a live **Get Started** checklist, an animated **How EAOS Works** flow (Intent → Agents → Tools/MCP → Governance → Output), agent stats, and recent executions.
 
 ![Home](docs/screenshots/01-home-command-center.png)
 
@@ -205,6 +214,59 @@ Each persona hub provides a unified workspace with **Skills → Outputs → Prog
 **🔌 Tool Registry** — Manage integrations (HubSpot, Jira, GitHub, Slack, Salesforce) with auth and capabilities.
 
 ![Tools](docs/screenshots/13-tools-registry.png)
+
+</td>
+</tr>
+</table>
+
+### 🧩 Build & Integrate
+
+The **Build & Integrate** workspace turns backend capability into hands-on tools — adopted skills, a collaborative review chain, and live MCP servers.
+
+<table>
+<tr>
+<td width="33%">
+
+**🧩 Skill Library** — Adopted EAOS skills loaded from `skills/<persona>/<slug>/SKILL.md` (Design Review, Bug Diagnosis, QA Test Loop, Security Audit, PRD Writer, Product Discovery, Technical Spec…). Click one, supply context, run it.
+
+![Skill Library](docs/screenshots/33-skill-library.png)
+
+</td>
+<td width="33%">
+
+**🏛️ Regiment Review** — Run a plan, PRD, design doc, or diff through a collaborative **Strategy → Design → Engineering → DevEx** chain; each reviewer sees the prior verdicts.
+
+![Regiment Review](docs/screenshots/32-regiment-review.png)
+
+</td>
+<td width="33%">
+
+**🔌 MCP Servers** — Connect real Model Context Protocol servers over **stdio or HTTP**; tools are discovered dynamically and degrade gracefully when a server is offline.
+
+![MCP Servers](docs/screenshots/31-mcp-servers.png)
+
+</td>
+</tr>
+</table>
+
+### 🌗 Guided Onboarding, Dark Mode & Swarms
+
+A guided **first-run flow** walks new users from connecting an LLM → connecting a tool → running their first skill, with inline guidance and a celebration on completion. The whole app ships a polished **dark mode** alongside the white-background light brand.
+
+<table>
+<tr>
+<td width="50%">
+
+**🌑 Dark Mode** — Full light/dark theming with a toggle in Settings that honors `prefers-color-scheme`.
+
+![Dark Mode](docs/screenshots/35-home-dark-mode.png)
+
+</td>
+<td width="50%">
+
+**🌐 Cross-Functional Swarms** — Spin up a swarm of agents that collaborate over the **A2A protocol** with a live discussion thread.
+
+![Swarms](docs/screenshots/34-swarms.png)
 
 </td>
 </tr>
@@ -362,11 +424,27 @@ Each persona hub provides a unified workspace with **Skills → Outputs → Prog
 - 📚 **Prompt Library** — fork, pin, upvote curated prompts
 - 🔌 **Tool Registry** — manage external connections with OAuth & API key auth
 
-### 🔍 Observability & Governance
+### 🤝 Collaboration, Skills & Integration
+- 🧩 **Skill Library** — adopted, file-defined EAOS skills runnable from the UI (`POST /api/skills/fs/execute`)
+- 🏛️ **Regiment Review** — Strategy → Design → Engineering → DevEx review chain over shared context
+- 🔌 **Real MCP Client** — `@modelcontextprotocol/sdk` over stdio + HTTP, dynamic tool discovery, graceful fallback
+- 🐝 **A2A Swarms** — ephemeral agent swarms with a real LLM discussion thread and inbox
+- 🧠 **Adopted Orchestration** — deer-flow Orchestrator prompt (live in the swarm path) + AgentMemory schema
+
+### 🎨 Experience & Onboarding
+- 🎬 **Guided First-Run** — connect LLM → connect tool → run first skill, with a celebration on completion
+- 📖 **Storytelling Home** — animated "How EAOS Works" flow + a real-progress Get-Started checklist
+- 🌗 **Dark Mode** — full light/dark theming that honors `prefers-color-scheme`
+- 🔔 **Toast Notifications** — non-blocking feedback replacing modal alerts, with a persistent bell history
+- 🧭 **Guided Tour** — spotlight walkthrough with resolved anchors across the app
+
+### 🔍 Observability, Governance & Security
 - 🧾 **Audit Trail** — every action, handoff, decision logged immutably
 - 💸 **Cost Attribution** — per-persona · per-agent · per-task breakdown
 - 🔬 **Execution Traces** — token usage, latency, confidence metrics
 - 📑 **After-Action Reports** — auto-generated per workflow execution
+- 🔐 **Production Hardening** — OIDC JWKS id-token verification · mandatory JWT in prod · IDOR-scoped execution reads · CORS allowlist · safe expression evaluator (no `new Function`)
+- 🧪 **Skill-Scan Gate** — SkillSpector-backed scan blocks malicious skills at registration (`POST /api/skills/scan`)
 
 ---
 
@@ -390,21 +468,21 @@ Each persona hub provides a unified workspace with **Skills → Outputs → Prog
 
 ```
 EAOS/
-├── 🎨 apps/web/                # Next.js 14 frontend
+├── 🎨 apps/web/                # Next.js 14 frontend (App Router · Tailwind · Framer Motion)
 ├── 🛣️ services/
-│   ├── gateway/                # API gateway (Node.js)
-│   ├── orchestrator/           # Mother orchestrator
-│   ├── cognitive-engine/       # LLM reasoning
-│   ├── reliability-engine/     # Grounding & validation
-│   ├── skills-runtime/         # Skill execution
-│   ├── learning-engine/        # AI learning engine
-│   ├── memory/                 # Memory pipeline
-│   └── workspace-api/          # Workspace management
-├── 📦 packages/                # 20+ packages (schemas, kernel, knowledge, policy, db, llm…)
-├── 🔌 connectors/              # Jira · GitHub · Slack · Teams
-├── 👷 workers/                 # Knowledge · incident · transcript workers
+│   ├── gateway/                # API gateway (Node.js HTTP, 150+ routes) — the runtime core
+│   ├── cognitive-engine/       # Multi-step LLM reasoning pipeline
+│   └── memory/                 # Memory service
+├── 📦 packages/                # 28 packages (schemas · auth · workflow-engine · memory-pipeline · router · policy · db · sandbox…)
+├── 🧩 skills/                  # File-defined EAOS skills by persona (design · engineering · hr · product · program · marketing · leadership · learning)
+├── 🗃️ skills-unported/         # Quarantined skills pending EAOS-native rewrite
+├── 🔌 connectors/              # GitHub · Jira · Slack · Teams
+├── 👷 workers/                 # developer-knowledge · incident-intelligence · engineering · marketing · leadership · transcript-actions
 ├── 🤖 agents/marketing/        # Marketing Agent Graph (SOMAN)
+├── 🔄 workflows/               # Flagship cross-functional workflow DAGs
+├── 🧠 third_party/             # Adopted-OSS notices + licenses (deer-flow · hermes · gstack · mattpocock)
 ├── 📚 prompt-library/          # Prompt Library (Prisma-based)
+├── 🔌 mcp.servers.json         # MCP server registry (stdio + HTTP)
 └── 📸 docs/screenshots/        # App screenshots
 ```
 
@@ -426,7 +504,7 @@ pnpm dev
 
 🌐 Open [http://localhost:3010](http://localhost:3010)
 
-> 👋 First time? An onboarding modal greets you. Use the **Help menu** (top-right) to restart the guided tour anytime. ⌨️ Arrow keys navigate · Esc skips · Enter advances.
+> 👋 First time? A storytelling Home greets you with a **Get Started** checklist and a guided **"Run my first skill"** flow (connect an LLM → connect a tool → run a skill → celebrate). Replay it — or the guided tour — anytime from **Settings → Help & Learning**, and toggle **dark mode** in **Settings → Appearance**. ⌨️ Arrow keys navigate · Esc skips · Enter advances.
 
 ---
 
@@ -450,6 +528,10 @@ pnpm dev
 | 💬 **Blog/Forum** | `/api/{blog/posts,forum/threads}/*` | Content with voting |
 | 🧠 **Cognitive** | `/api/cognitive/{process,decompose,reason}` | Multi-step LLM pipeline |
 | 🔍 **Observability** | `/api/{governance/audit,events,health}` | Audit · events · health |
+| 🧩 **Skill Library** | `/api/skills/fs[/execute]` · `/api/skills/scan` | File-defined skills + scan gate |
+| 🏛️ **Review** | `/api/review/{run,chain}` | Collaborative Regiment Review chain |
+| 🔌 **MCP** | `/api/mcp/{servers,tools,execute,stats}` | Real MCP client (stdio + HTTP) |
+| 🐝 **Swarms** | `/api/swarms/{launch,templates,stats}` | A2A swarm orchestration |
 
 ---
 
@@ -491,6 +573,20 @@ All definitions are validated against JSON schemas in `packages/schemas/`:
 - 📡 `event.schema.json` — Event types
 - 🛡️ `policy.schema.json` — Policy rules
 - 🌐 `capability-graph.schema.json` — Tool capability graph
+
+---
+
+## 🧠 Adopted Open Source
+
+EAOS harvests and adapts best-in-class open-source agent tooling into EAOS-native form (full notices in `third_party/NOTICE`):
+
+| Source | Adopted as |
+|---|---|
+| **bytedance/deer-flow** | Orchestrator prompt (live in the swarm path) + AgentMemory schema |
+| **Hermes Agent** | Best-practice agent use cases |
+| **gstack · mattpocock skills** | Curated, EAOS-renamed entries in the Skill Library |
+
+> 🧩 Adopted artifacts use **EAOS nomenclature**, not source-repo names, so the platform speaks one consistent language.
 
 ---
 
