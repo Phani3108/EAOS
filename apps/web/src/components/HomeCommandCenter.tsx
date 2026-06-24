@@ -15,6 +15,9 @@ import { useEngineeringStore, useProductStore, useHRStore, useTAStore, useProgra
 import PlatformArchitecture from './PlatformArchitecture';
 import StoryFlow from './home/StoryFlow';
 import GettingStartedChecklist from './home/GettingStartedChecklist';
+import { Celebration } from './ui';
+import { notify } from '../lib/notify';
+import { getPreference, setPreference } from '../lib/storage';
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -172,10 +175,19 @@ export default function HomeCommandCenter() {
 
 
   const totalExecCount = allExecutions.length;
+  const [celebrate, setCelebrate] = useState(false);
+  useEffect(() => {
+    if (totalExecCount > 0 && !getPreference('first_run_celebrated')) {
+      setPreference('first_run_celebrated', true);
+      setCelebrate(true);
+      notify('success', 'You ran your first skill ⚡', 'Welcome aboard — explore more skills and workspaces.');
+    }
+  }, [totalExecCount]);
   const isNewUser = connectedCount === 0 && totalExecCount === 0;
 
   return (
     <div className="page-container">
+      <Celebration show={celebrate} onDone={() => setCelebrate(false)} />
       <div className="page-content space-y-6">
 
         {/* ── Getting Started (shown when 0 connections + 0 executions) ── */}
