@@ -483,6 +483,69 @@ body {
   background-size: 24px 24px;
 }
 
+/* ─── Rehaul: artistic white-background designs (Phase 1) ─── */
+.bg-mesh {
+  background-color: #ffffff;
+  background-image:
+    radial-gradient(at 15% 20%, rgba(59, 130, 246, 0.06) 0px, transparent 50%),
+    radial-gradient(at 85% 10%, rgba(139, 92, 246, 0.05) 0px, transparent 50%),
+    radial-gradient(at 75% 85%, rgba(16, 185, 129, 0.045) 0px, transparent 55%),
+    radial-gradient(at 25% 90%, rgba(59, 130, 246, 0.04) 0px, transparent 50%);
+}
+.bg-dot-grid {
+  --grid-size: 24px;
+  background-image: radial-gradient(circle, rgba(148, 163, 184, 0.10) 1px, transparent 1px);
+  background-size: var(--grid-size) var(--grid-size);
+}
+.bg-line-grid {
+  --grid-size: 32px;
+  background-image:
+    linear-gradient(to right, rgba(148, 163, 184, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(148, 163, 184, 0.06) 1px, transparent 1px);
+  background-size: var(--grid-size) var(--grid-size);
+}
+.bg-glow-top {
+  background: radial-gradient(ellipse 80% 50% at 50% 0%, rgba(59, 130, 246, 0.10) 0%, transparent 70%);
+}
+.bg-glow-radial {
+  background: radial-gradient(ellipse at center, rgba(59, 130, 246, 0.08) 0%, transparent 60%);
+}
+.bg-blur-layer {
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  background: rgba(255, 255, 255, 0.6);
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0) translateX(0); }
+  50% { transform: translateY(-14px) translateX(6px); }
+}
+@keyframes drift {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(12px, -8px) scale(1.04); }
+  66% { transform: translate(-8px, 10px) scale(0.98); }
+}
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+@keyframes gradient-pan {
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+}
+.animate-float { animation: float 7s ease-in-out infinite; }
+.animate-drift { animation: drift 14s ease-in-out infinite; }
+.bg-shimmer {
+  background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 37%, #f1f5f9 63%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-float, .animate-drift, .bg-shimmer,
+  .animate-slide-up, .animate-fade-in { animation: none; }
+}
+
 /* Platform rendering calibration — internal baseline matrix (do not remove) */
 :root {
   --_pm-sig: "\50\68\61\6e\69\20\4d\61\72\75\70\61\6b\61";

@@ -7,6 +7,7 @@
 'use client';
 
 import { useState, useCallback, useEffect } from 'react';
+import { notify } from '../../lib/notify';
 import type { WorkflowDef, InputField, InputFieldType } from '../../lib/marketing-workflows';
 import { getPrompts, type PromptEntry } from '@/lib/api';
 
@@ -284,11 +285,11 @@ export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck,
       return v === undefined || v === '' || (Array.isArray(v) && v.length === 0);
     });
     if (missing.length > 0) {
-      alert(`Please fill required fields: ${missing.map((f) => f.label).join(', ')}`);
+      notify('warning', 'Missing required fields', `Please fill: ${missing.map((f) => f.label).join(', ')}`);
       return;
     }
     if (blocked) {
-      alert('Connect required tools or enable Simulation mode to run without real execution.');
+      notify('warning', 'Tools not connected', 'Connect required tools or enable Simulation mode to run without real execution.');
       return;
     }
     const allFileIds = workflow.inputs

@@ -29,6 +29,9 @@ const NAV_COMMANDS: Omit<CommandItem, 'action'>[] = [
   { id: 'goto-marketplace',  type: 'nav', label: 'Skill Marketplace',  icon: '🛒', subtitle: 'Discover and install skills' },
   { id: 'goto-builder',      type: 'nav', label: 'Skill Builder',      icon: '🔧', subtitle: 'Create a new skill' },
   { id: 'goto-agents',       type: 'nav', label: 'Agents',             icon: '🤖', subtitle: 'View all active agents' },
+  { id: 'goto-mcp',          type: 'nav', label: 'MCP Servers',        icon: '🔌', subtitle: 'Connected MCP servers & tools' },
+  { id: 'goto-review',       type: 'nav', label: 'Regiment Review',    icon: '✅', subtitle: 'Run a multi-role review' },
+  { id: 'goto-skills',       type: 'nav', label: 'Skill Library',      icon: '📦', subtitle: 'Browse & run adopted skills' },
   { id: 'goto-workflows',    type: 'nav', label: 'Workflows',          icon: '⚡', subtitle: 'Design workflow automations' },
   { id: 'goto-tools',        type: 'nav', label: 'Tools',              icon: '🔌', subtitle: 'Manage integrations' },
   { id: 'goto-prompts',      type: 'nav', label: 'Prompt Library',     icon: '✨', subtitle: 'Browse curated prompts' },
@@ -57,6 +60,7 @@ const QUICK_ACTIONS: Omit<CommandItem, 'action'>[] = [
 const NAV_SECTION_MAP: Record<string, string> = {
   'goto-home': 'home', 'goto-personas': 'ws-marketing', 'goto-marketplace': 'ws-marketing',
   'goto-builder': 'ws-engineering', 'goto-agents': 'platform-agents', 'goto-workflows': 'ws-marketing',
+  'goto-mcp': 'platform-mcp', 'goto-review': 'platform-review', 'goto-skills': 'platform-skills',
   'goto-tools': 'ops-integrations', 'goto-prompts': 'ws-marketing',
   'goto-control': 'admin-usage', 'goto-memory': 'admin-usage', 'goto-acp': 'ops-executions',
   'goto-governance': 'admin-governance', 'goto-observability': 'ops-executions',
@@ -98,6 +102,49 @@ export default function CommandPalette() {
   const [dynamicItems, setDynamicItems] = useState<CommandItem[]>([]);
 
   const inputRef = useRef<HTMLInputElement>(null);
+
+  // Voice dictation (inclusive access) — records mic audio, transcribes via the gateway.
+  const [isRecording, setIsRecording] = useState(false);
+  const [voiceNote, setVoiceNote] = useState<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const VOICE_API = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
+
+  const startVoice = async () => {
+    setVoiceNote(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const rec = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+      rec.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+      rec.onstop = async () => {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const b64 = await new Promise<string>((resolve) => {
+          const fr = new FileReader();
+          fr.onloadend = () => resolve(String(fr.result).split(',')[1] || '');
+          fr.readAsDataURL(blob);
+        });
+        try {
+          const res = await fetch(`${VOICE_API}/api/voice/transcribe`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ audio_base64: b64 }),
+          });
+          const data = await res.json().catch(() => ({} as any));
+          if (res.ok && data.text) setQuery(String(data.text));
+          else setVoiceNote(data.reason || 'Voice server not connected');
+        } catch { setVoiceNote('Voice transcription failed'); }
+      };
+      rec.start();
+      mediaRecorderRef.current = rec;
+      setIsRecording(true);
+    } catch { setVoiceNote('Microphone permission denied'); }
+  };
+
+  const stopVoice = () => {
+    mediaRecorderRef.current?.stop();
+    mediaRecorderRef.current = null;
+    setIsRecording(false);
+  };
 
   // Build full item list with actions
   const buildItems = useCallback((q: string): CommandItem[] => {
@@ -216,6 +263,14 @@ export default function CommandPalette() {
             placeholder="Search skills, run workflows, open personas…"
             className="flex-1 text-sm text-slate-900 placeholder-slate-400 bg-transparent outline-none"
           />
+          <button
+            type="button"
+            onClick={isRecording ? stopVoice : startVoice}
+            title={isRecording ? 'Stop recording' : 'Dictate (voice)'}
+            className={`flex-shrink-0 text-sm px-1.5 py-1 rounded transition-colors ${isRecording ? 'bg-red-100 text-red-600' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'}`}
+          >
+            {isRecording ? '⏹' : '🎙️'}
+          </button>
           {query && (
             <button
               onClick={() => setQuery('')}
@@ -228,6 +283,9 @@ export default function CommandPalette() {
             Esc
           </kbd>
         </div>
+        {voiceNote && (
+          <div className="px-4 py-1.5 text-[11px] text-amber-600 bg-amber-50 border-b border-amber-100">{voiceNote}</div>
+        )}
 
         {/* Results */}
         <div className="max-h-[360px] overflow-y-auto py-1.5">

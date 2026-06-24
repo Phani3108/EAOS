@@ -85,16 +85,24 @@ const NAV: NavGroup[] = [
     ],
   },
   {
-    id: 'platform', label: 'Platform', collapsible: true,
+    id: 'platform', label: 'Agent Platform', collapsible: true,
     items: [
       { id: 'platform-agents',      label: 'Agent Registry',     icon: 'agents'      },
-      { id: 'platform-connections',  label: 'Connections',        icon: 'connections' },
       { id: 'platform-meetings',    label: 'Agent Meetings',     icon: 'meetings'    },
       { id: 'platform-swarms',      label: 'Swarms',             icon: 'swarms'      },
-      { id: 'platform-workflows',    label: 'Workflow Canvas',    icon: 'canvas'      },
       { id: 'platform-chat',        label: 'Conversations',      icon: 'chat'        },
       { id: 'platform-protocols',   label: 'Protocol Monitor',   icon: 'protocols'   },
+    ],
+  },
+  {
+    id: 'build', label: 'Build & Integrate', collapsible: true,
+    items: [
+      { id: 'platform-skills',      label: 'Skill Library',      icon: 'skills'      },
+      { id: 'platform-workflows',   label: 'Workflow Canvas',    icon: 'canvas'      },
       { id: 'platform-innovation',  label: 'Innovation Labs',    icon: 'innovation'  },
+      { id: 'platform-review',      label: 'Regiment Review',    icon: 'governance'  },
+      { id: 'platform-connections', label: 'Connections',        icon: 'connections' },
+      { id: 'platform-mcp',         label: 'MCP Servers',        icon: 'connections' },
     ],
   },
   {

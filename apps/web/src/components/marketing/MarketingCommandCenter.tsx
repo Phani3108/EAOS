@@ -6,6 +6,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { notify } from '../../lib/notify';
 import {
   MARKETING_WORKFLOWS,
   getWorkflowsByCluster,
@@ -191,7 +192,7 @@ export function MarketingCommandCenter() {
       setSelectedWorkflowId(null);
     } catch (err) {
       console.error(err);
-      alert(err instanceof Error ? err.message : 'Execution failed');
+      notify('error', 'Execution failed', err instanceof Error ? err.message : 'Something went wrong');
     } finally {
       setExecuting(false);
     }

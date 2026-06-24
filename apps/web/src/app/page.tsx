@@ -43,6 +43,11 @@ import { ProgramHub } from '../components/ProgramHub';
 import ChatPanel from '../components/ChatPanel';
 import AgentEvalsPanel from '../components/AgentEvalsPanel';
 import { DemoModeBanner, useGatewayReachable } from '../components/DemoModeBanner';
+import { MCPServersHub } from '../components/MCPServersHub';
+import { RegimentReview } from '../components/RegimentReview';
+import { SkillLibraryHub } from '../components/SkillLibraryHub';
+import { MotionConfig } from 'framer-motion';
+import { ToastViewport } from '../components/ui';
 
 function MainContent({ section }: { section: string }) {
   // Dynamic connector detail pages: connector-detail-{connectorId}
@@ -94,6 +99,9 @@ function MainContent({ section }: { section: string }) {
     case 'platform-protocols':      return <ProtocolMonitor />;
     case 'platform-workflows':      return <WorkflowCanvas />;
     case 'platform-chat':           return <ChatPanel />;
+    case 'platform-mcp':            return <MCPServersHub />;
+    case 'platform-review':         return <RegimentReview />;
+    case 'platform-skills':         return <SkillLibraryHub />;
 
     // Operations
     case 'ops-integrations':        return <ToolsRegistry />;
@@ -133,6 +141,7 @@ export default function Home() {
       'exec-marketing','exec-engineering','exec-product','exec-hr','exec-ta','exec-program',
       'platform-agents','platform-connections','platform-meetings','platform-swarms',
       'platform-protocols','platform-workflows','platform-chat','platform-innovation',
+      'platform-mcp','platform-review','platform-skills',
       'conn-ai-models','conn-storage','conn-design','conn-crm',
       'conn-devtools','conn-cms','conn-messaging','conn-data',
       'ops-executions','ops-notifications','ops-integrations','ops-discussions','ops-blog',
@@ -187,6 +196,7 @@ export default function Home() {
   const gatewayOk = useGatewayReachable();
 
   return (
+    <MotionConfig reducedMotion="user">
     <div className="flex h-dscreen md:h-screen bg-white text-slate-900 overflow-hidden">
       <Sidebar mobileOpen={mobileNavOpen} onMobileClose={() => setMobileNavOpen(false)} />
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -214,6 +224,8 @@ export default function Home() {
       <CommandPalette />
       <TourOverlay />
       <OnboardingModal forceOpen={false} onClose={() => {}} />
+      <ToastViewport />
     </div>
+    </MotionConfig>
   );
 }
