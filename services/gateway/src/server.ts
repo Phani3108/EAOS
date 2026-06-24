@@ -124,7 +124,12 @@ const store = usePostgres ? new PostgresStore() : useInMemory ? new InMemoryStor
 
 // Raw pg.Pool for direct queries (API keys, tenant GUC, audit persistence).
 // Only available when DATABASE_URL is set; undefined otherwise.
-let pgPool: import('pg').Pool | undefined;
+// Structural type avoids a direct 'pg' dependency in the gateway — the real pool is
+// supplied (when DATABASE_URL is set) by @agentos/db, which owns the pg driver.
+let pgPool: {
+    query(...args: any[]): Promise<any>;
+    connect(): Promise<{ query(...args: any[]): Promise<any>; release(): void }>;
+} | undefined;
 if (usePostgres) {
     import('@agentos/db/postgres-store').then(m => m.getRawPool()).then(p => { pgPool = p as any; }).catch(() => {});
 }

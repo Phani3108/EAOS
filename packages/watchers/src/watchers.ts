@@ -128,8 +128,9 @@ export abstract class BaseWatcher {
     private async runCheck(): Promise<void> {
         if (this._status !== 'active') return;
 
-        // Respect cooldown
-        if (this._lastAlert && this._status !== 'triggered') {
+        // Respect cooldown. (Status is provably 'active' here — line above returns while
+        // 'triggered' during cooldown, and the post-alert setTimeout resets 'triggered'→'active'.)
+        if (this._lastAlert) {
             const elapsed = Date.now() - this._lastAlert.getTime();
             if (elapsed < this.config.cooldownMs) return;
         }

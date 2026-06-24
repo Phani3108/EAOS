@@ -135,7 +135,7 @@ export class SlackConnector {
     async sendDM(userId: string, text: string): Promise<{ ts: string }> {
         // Open a DM conversation first
         const conv = await this.api('conversations.open', { users: userId });
-        const channelId = (conv.channel as { id: string }).id;
+        const channelId = (conv.channel as unknown as { id: string }).id;
         return this.postMessage({ channel: channelId, text });
     }
 

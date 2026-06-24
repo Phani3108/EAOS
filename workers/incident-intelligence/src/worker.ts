@@ -14,11 +14,22 @@
  *   8. Post to Slack/Jira with remediation steps
  */
 
-import type { Connector, ConnectorResult } from '../../../workers/developer-knowledge/src/worker.js';
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
+
+/** Generic data-source connector contract (kept local — workers are independent bounded contexts). */
+export interface Connector {
+    search(query: string, options: Record<string, unknown>): Promise<ConnectorResult[]>;
+}
+
+export interface ConnectorResult {
+    title: string;
+    url: string;
+    excerpt?: string;
+    score?: number;
+    metadata?: Record<string, unknown>;
+}
 
 export interface IncidentInput {
     incidentId: string;
