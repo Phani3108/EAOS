@@ -8,6 +8,8 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { notify } from '../../lib/notify';
+import { useEAOSStore } from '../../store/eaos-store';
+import { InlineError } from '../ui';
 import type { WorkflowDef, InputField, InputFieldType } from '../../lib/marketing-workflows';
 import { getPrompts, type PromptEntry } from '@/lib/api';
 
@@ -240,6 +242,7 @@ const MKT_LLM_MODELS = [
 ];
 
 export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck, onPreCheck }: WorkflowExecutionFormProps) {
+  const setActiveSection = useEAOSStore((s) => s.setActiveSection);
   const [inputs, setInputs] = useState<Record<string, unknown>>({});
   const [simulateMode, setSimulateMode] = useState(false);
   const [selectedModelId, setSelectedModelId] = useState(MKT_LLM_MODELS[0]!.id);
@@ -337,20 +340,27 @@ export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck,
       )}
 
       {blocked && (
-        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
-          <p className="text-sm font-semibold text-amber-800">Tools not connected</p>
-          <p className="text-xs text-amber-700 mt-1">{preCheck?.reason}</p>
-          {preCheck?.missingTools && preCheck.missingTools.length > 0 && (
-            <ul className="text-xs text-amber-700 mt-2 list-disc list-inside">
-              {preCheck.missingTools.map((t) => (
-                <li key={t}>{t}</li>
-              ))}
-            </ul>
-          )}
-          <p className="text-xs text-amber-700 mt-2">
-            Connect tools in Integrations, or enable Simulation mode below to run without real execution.
-          </p>
-        </div>
+        <InlineError
+          tone="warning"
+          problem="Tools not connected"
+          why={preCheck?.reason}
+          fixLabel="Open Connections"
+          onFix={() => setActiveSection('platform-connections')}
+          extra={
+            <>
+              {preCheck?.missingTools && preCheck.missingTools.length > 0 && (
+                <ul className="text-xs text-amber-700 mt-2 list-disc list-inside">
+                  {preCheck.missingTools.map((t) => (
+                    <li key={t}>{t}</li>
+                  ))}
+                </ul>
+              )}
+              <p className="text-xs text-amber-700 mt-2">
+                Connect tools in Integrations, or enable Simulation mode below to run without real execution.
+              </p>
+            </>
+          }
+        />
       )}
 
       {/* Prompt template selector */}

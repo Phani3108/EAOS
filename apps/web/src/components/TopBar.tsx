@@ -107,7 +107,7 @@ export function TopBar({ onOpenMobileNav }: TopBarProps = {}) {
           </button>
         )}
         <div className="flex items-center gap-1.5 text-[13px] text-slate-500 min-w-0">
-          <button onClick={() => setActiveSection('home')} className="hidden sm:inline text-slate-400 hover:text-slate-600 transition-colors">AgentOS</button>
+          <button onClick={() => setActiveSection('home')} data-tour="sidebar-logo" className="hidden sm:inline text-slate-400 hover:text-slate-600 transition-colors">AgentOS</button>
           {group && <><span className="hidden sm:inline text-slate-300">/</span><span className="hidden md:inline text-slate-400">{group}</span></>}
           <span className="hidden sm:inline text-slate-300">/</span>
           <span className="text-slate-900 font-medium truncate">{title}</span>

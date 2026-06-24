@@ -7,7 +7,8 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import { useTour } from './tour/TourProvider';
-import { resetAllPreferences, getSelectedRole } from '../lib/storage';
+import { TOUR_STEPS } from '../lib/tour-data';
+import { resetAllPreferences, getSelectedRole, getPreference, setPreference } from '../lib/storage';
 import { useEAOSStore } from '../store/eaos-store';
 import { useConnectionsStore } from '../store/connections-store';
 
@@ -81,6 +82,31 @@ function Select({ value, options, onChange }: { value: string; options: { value:
   );
 }
 
+function ThemeSegmented({ value, onChange }: { value: 'light' | 'dark'; onChange: (v: 'light' | 'dark') => void }) {
+  const opts: { value: 'light' | 'dark'; label: string; icon: string }[] = [
+    { value: 'light', label: 'Light', icon: '☀️' },
+    { value: 'dark', label: 'Dark', icon: '🌙' },
+  ];
+  return (
+    <div className="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+      {opts.map(o => (
+        <button
+          key={o.value}
+          onClick={() => onChange(o.value)}
+          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
+            value === o.value
+              ? 'bg-white text-slate-900 shadow-sm'
+              : 'text-slate-500 hover:text-slate-700'
+          }`}
+        >
+          <span>{o.icon}</span>
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // Main Component
 // ═══════════════════════════════════════════════════════════════════
@@ -92,14 +118,31 @@ interface SettingsPanelProps {
 export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProps = {}) {
   const { start: startTour, isCompleted: tourCompleted } = useTour();
   const setActiveSection = useEAOSStore(s => s.setActiveSection);
+  const setFirstRunOpen = useEAOSStore(s => s.setFirstRunOpen);
   const connectedCount = useConnectionsStore(s => s.getConnectedCount());
   const [activeTab, setActiveTab] = useState<SettingsTab>('profile');
   const [settings, setSettings] = useState<Record<string, unknown>>(loadSettings);
   const [saved, setSaved] = useState(false);
+  const [theme, setThemeState] = useState<'light' | 'dark'>('light');
   const role = getSelectedRole();
 
   // Load settings on mount
   useEffect(() => { setSettings(loadSettings()); }, []);
+
+  // Sync theme control with the persisted preference / live <html> class on mount.
+  useEffect(() => {
+    setThemeState(document.documentElement.classList.contains('dark') ? 'dark' : getPreference('theme'));
+  }, []);
+
+  const setTheme = useCallback((value: 'light' | 'dark') => {
+    setThemeState(value);
+    setPreference('theme', value);
+    const root = document.documentElement;
+    if (value === 'dark') { root.classList.add('dark'); root.classList.remove('light'); }
+    else { root.classList.add('light'); root.classList.remove('dark'); }
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1500);
+  }, []);
 
   const update = useCallback((key: string, value: unknown) => {
     setSettings(prev => {
@@ -198,8 +241,17 @@ export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProp
               </Row>
             </Section>
 
+            <Section title="Appearance">
+              <Row label="Theme" description="Switch between light and dark mode">
+                <ThemeSegmented value={theme} onChange={setTheme} />
+              </Row>
+            </Section>
+
             <Section title="Help & Learning">
-              <Row label="Guided Tour" description="25-step walkthrough of every feature">
+              <Row label="Guided First Run" description="Step-by-step path to your first successful skill run">
+                <button onClick={() => setFirstRunOpen(true)} className="btn btn-secondary btn-sm">Replay</button>
+              </Row>
+              <Row label="Guided Tour" description={`${TOUR_STEPS.length}-step walkthrough of every feature`}>
                 <button onClick={() => startTour()} className="btn btn-secondary btn-sm">
                   {tourCompleted ? 'Replay Tour' : 'Start Tour'}
                 </button>

@@ -421,7 +421,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const method = req.method ?? 'GET';
 
     // CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // Allowlist read from CORS_ALLOWED_ORIGINS (comma-separated). When UNSET,
+    // fall back to '*' to preserve the dev/demo flow. When set, reflect the
+    // request Origin only if it is in the allowlist (otherwise omit the header).
+    const corsAllowedRaw = process.env.CORS_ALLOWED_ORIGINS;
+    if (corsAllowedRaw === undefined) {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+    } else {
+        const allowed = corsAllowedRaw.split(',').map(o => o.trim()).filter(Boolean);
+        const origin = req.headers.origin;
+        if (typeof origin === 'string' && allowed.includes(origin)) {
+            res.setHeader('Access-Control-Allow-Origin', origin);
+            res.setHeader('Vary', 'Origin');
+        }
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
     if (method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
@@ -470,6 +483,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
         return false;
     };
+
+    /**
+     * Ownership enforcement for execution records.
+     *
+     * Returns true when the requester is NOT permitted to scope ownership —
+     * i.e. ownership filtering should be ENFORCED. Returns false (do NOT filter,
+     * show everything) for the dev/demo flow:
+     *   - non-production (NODE_ENV !== 'production'), OR
+     *   - the resolved user is anonymous, OR
+     *   - the user role is admin/operator.
+     * Only in production, for a concrete non-admin user, do we enforce ownership.
+     */
+    const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+    const enforceExecutionOwnership = (): boolean => {
+        if (!IS_PRODUCTION) return false;
+        if (!authUser || authUser.id === 'anonymous') return false;
+        if (authUser.role === 'admin' || authUser.role === 'operator') return false;
+        return true;
+    };
+    const ownsExecution = (exec: { userId?: string }): boolean =>
+        exec.userId === userId;
 
     try {
         // Health — liveness check
@@ -1022,6 +1056,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                     .slice(0, limit);
             }
             if (status) { execs = execs.filter(e => e.status === status); }
+            // IDOR: in production, a concrete non-admin user only sees their own
+            // executions. Dev/demo/anonymous/admin/operator see everything.
+            if (enforceExecutionOwnership()) { execs = execs.filter(ownsExecution); }
             sendJSON(res, 200, { executions: execs, total: execs.length });
             return;
         }
@@ -1030,6 +1067,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const execId = path.split('/').pop()!;
             const exec = getPersonaExecution(execId) ?? marketingApi.getMarketingExecution(execId);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
+            // IDOR: in production, a concrete non-admin user may only read their
+            // own execution. 404 (not 403) to avoid leaking existence.
+            if (enforceExecutionOwnership() && !ownsExecution(exec)) {
+                sendJSON(res, 404, { error: 'Execution not found' });
+                return;
+            }
             const aar = getAfterActionReport(execId);
             sendJSON(res, 200, { execution: exec, afterActionReport: aar ?? null });
             return;

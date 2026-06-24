@@ -353,15 +353,291 @@ export class WorkflowEngine {
     }
 
     private evaluateExpression(expr: string, vars: Record<string, unknown>): boolean {
-        // Simple expression evaluator for conditions
-        // In production: use a proper expression parser (e.g., filtrex)
+        // Safe expression evaluator for workflow conditions.
+        //
+        // Replaces the previous `new Function(...)` (a code-injection vector)
+        // with a small tokenizer + recursive-descent parser. NO Function/eval.
+        //
+        // Supported grammar (anything outside it FAILS CLOSED → returns false):
+        //   - variable references over `vars`            e.g. budget_shift_percent
+        //   - literals: number, 'string' / "string", true, false, null
+        //   - comparisons:  ===  ==  !==  !=  >  <  >=  <=
+        //   - logical:      &&  ||  !
+        //   - arithmetic:   +  -  *  /  (and unary -)
+        //   - parentheses for grouping
+        //
+        // The boolean result mirrors the old `Boolean(fn(...))` coercion: a
+        // bare variable reference (e.g. "performance_below_threshold") yields
+        // the truthiness of that variable's value.
         try {
-            const fn = new Function(...Object.keys(vars), `return ${expr}`);
-            return Boolean(fn(...Object.values(vars)));
+            const value = evalSafeExpression(expr, vars);
+            return Boolean(value);
         } catch {
+            // Fail closed: unparseable / out-of-grammar expressions are false.
             return false;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Safe expression evaluator (no Function / eval)
+// ---------------------------------------------------------------------------
+
+type TokenType =
+    | 'number' | 'string' | 'ident'
+    | 'op' | 'lparen' | 'rparen';
+
+interface Token { type: TokenType; value: string }
+
+/** Tokenize an expression. Throws on any unrecognized character (fail closed). */
+function tokenizeExpression(input: string): Token[] {
+    const tokens: Token[] = [];
+    let i = 0;
+    const n = input.length;
+
+    const isIdentStart = (c: string) => /[A-Za-z_$]/.test(c);
+    const isIdentPart = (c: string) => /[A-Za-z0-9_$.]/.test(c);
+    const isDigit = (c: string) => /[0-9]/.test(c);
+
+    while (i < n) {
+        const c = input[i];
+
+        // Whitespace
+        if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+
+        // String literal ('...' or "...")
+        if (c === '"' || c === "'") {
+            const quote = c;
+            let str = '';
+            i++;
+            while (i < n && input[i] !== quote) {
+                if (input[i] === '\\' && i + 1 < n) {
+                    // Minimal escape handling for quote / backslash.
+                    const next = input[i + 1];
+                    if (next === quote || next === '\\') { str += next; i += 2; continue; }
+                }
+                str += input[i];
+                i++;
+            }
+            if (i >= n) throw new Error('Unterminated string literal');
+            i++; // closing quote
+            tokens.push({ type: 'string', value: str });
+            continue;
+        }
+
+        // Number literal (integer or decimal)
+        if (isDigit(c) || (c === '.' && isDigit(input[i + 1] ?? ''))) {
+            let num = '';
+            while (i < n && (isDigit(input[i]) || input[i] === '.')) { num += input[i]; i++; }
+            if ((num.match(/\./g) ?? []).length > 1) throw new Error(`Invalid number: ${num}`);
+            tokens.push({ type: 'number', value: num });
+            continue;
+        }
+
+        // Identifier / keyword (variable, true, false, null)
+        if (isIdentStart(c)) {
+            let id = '';
+            while (i < n && isIdentPart(input[i])) { id += input[i]; i++; }
+            tokens.push({ type: 'ident', value: id });
+            continue;
+        }
+
+        // Parentheses
+        if (c === '(') { tokens.push({ type: 'lparen', value: '(' }); i++; continue; }
+        if (c === ')') { tokens.push({ type: 'rparen', value: ')' }); i++; continue; }
+
+        // Multi-char operators (longest match first)
+        const three = input.slice(i, i + 3);
+        if (three === '===' || three === '!==') { tokens.push({ type: 'op', value: three }); i += 3; continue; }
+
+        const two = input.slice(i, i + 2);
+        if (two === '==' || two === '!=' || two === '>=' || two === '<=' || two === '&&' || two === '||') {
+            tokens.push({ type: 'op', value: two }); i += 2; continue;
+        }
+
+        if (c === '>' || c === '<' || c === '+' || c === '-' || c === '*' || c === '/' || c === '!') {
+            tokens.push({ type: 'op', value: c }); i++; continue;
+        }
+
+        throw new Error(`Unexpected character: ${c}`);
+    }
+
+    return tokens;
+}
+
+/**
+ * Recursive-descent parser + evaluator over the token stream.
+ * Precedence (low → high): || , && , equality , comparison , additive ,
+ * multiplicative , unary , primary.
+ */
+function evalSafeExpression(expr: string, vars: Record<string, unknown>): unknown {
+    const tokens = tokenizeExpression(expr);
+    let pos = 0;
+
+    const peek = (): Token | undefined => tokens[pos];
+    const next = (): Token => {
+        const t = tokens[pos];
+        if (!t) throw new Error('Unexpected end of expression');
+        pos++;
+        return t;
+    };
+    const eatOp = (value: string): boolean => {
+        const t = peek();
+        if (t && t.type === 'op' && t.value === value) { pos++; return true; }
+        return false;
+    };
+
+    // primary := number | string | ident-literal | variable | '(' expr ')' | unary
+    function parsePrimary(): unknown {
+        const t = peek();
+        if (!t) throw new Error('Unexpected end of expression');
+
+        if (t.type === 'op' && (t.value === '!' || t.value === '-')) {
+            next();
+            const operand = parsePrimary();
+            if (t.value === '!') return !operand;
+            return -toNumber(operand);
+        }
+
+        if (t.type === 'lparen') {
+            next();
+            const val = parseOr();
+            const close = next();
+            if (close.type !== 'rparen') throw new Error('Expected )');
+            return val;
+        }
+
+        if (t.type === 'number') { next(); return Number(t.value); }
+        if (t.type === 'string') { next(); return t.value; }
+
+        if (t.type === 'ident') {
+            next();
+            if (t.value === 'true') return true;
+            if (t.value === 'false') return false;
+            if (t.value === 'null') return null;
+            if (t.value === 'undefined') return undefined;
+            return resolveVar(t.value, vars);
+        }
+
+        throw new Error(`Unexpected token: ${t.value}`);
+    }
+
+    // multiplicative := primary (('*' | '/') primary)*
+    function parseMul(): unknown {
+        let left = parsePrimary();
+        for (;;) {
+            if (eatOp('*')) left = toNumber(left) * toNumber(parsePrimary());
+            else if (eatOp('/')) left = toNumber(left) / toNumber(parsePrimary());
+            else break;
+        }
+        return left;
+    }
+
+    // additive := multiplicative (('+' | '-') multiplicative)*
+    function parseAdd(): unknown {
+        let left = parseMul();
+        for (;;) {
+            if (eatOp('+')) {
+                const right = parseMul();
+                // '+' is arithmetic-only in this grammar (string concat is not
+                // a supported workflow operation); coerce to number.
+                left = toNumber(left) + toNumber(right);
+            } else if (eatOp('-')) {
+                left = toNumber(left) - toNumber(parseMul());
+            } else break;
+        }
+        return left;
+    }
+
+    // comparison := additive (('>' | '<' | '>=' | '<=') additive)*
+    function parseComparison(): unknown {
+        let left = parseAdd();
+        for (;;) {
+            const t = peek();
+            if (t && t.type === 'op' && (t.value === '>' || t.value === '<' || t.value === '>=' || t.value === '<=')) {
+                next();
+                const right = parseAdd();
+                const l = toNumber(left), r = toNumber(right);
+                if (t.value === '>') left = l > r;
+                else if (t.value === '<') left = l < r;
+                else if (t.value === '>=') left = l >= r;
+                else left = l <= r;
+            } else break;
+        }
+        return left;
+    }
+
+    // equality := comparison (('===' | '==' | '!==' | '!=') comparison)*
+    function parseEquality(): unknown {
+        let left = parseComparison();
+        for (;;) {
+            const t = peek();
+            if (t && t.type === 'op' && (t.value === '===' || t.value === '==' || t.value === '!==' || t.value === '!=')) {
+                next();
+                const right = parseComparison();
+                // Use strict comparison semantics for both == and === (and the
+                // negated forms) to avoid surprising coercions; this matches the
+                // intent of the simple equality checks workflows author.
+                const eq = left === right;
+                left = (t.value === '===' || t.value === '==') ? eq : !eq;
+            } else break;
+        }
+        return left;
+    }
+
+    // and := equality ('&&' equality)*
+    function parseAnd(): unknown {
+        let left = parseEquality();
+        while (eatOp('&&')) {
+            const right = parseEquality();
+            left = Boolean(left) && Boolean(right);
+        }
+        return left;
+    }
+
+    // or := and ('||' and)*
+    function parseOr(): unknown {
+        let left = parseAnd();
+        while (eatOp('||')) {
+            const right = parseAnd();
+            left = Boolean(left) || Boolean(right);
+        }
+        return left;
+    }
+
+    const result = parseOr();
+    if (pos !== tokens.length) {
+        // Trailing tokens → not a valid single expression. Fail closed.
+        throw new Error('Unexpected trailing tokens in expression');
+    }
+    return result;
+}
+
+/** Coerce a value to a number for arithmetic/comparison; NaN propagates. */
+function toNumber(value: unknown): number {
+    if (typeof value === 'number') return value;
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    if (typeof value === 'string' && value.trim() !== '') return Number(value);
+    if (value === null) return 0;
+    return NaN;
+}
+
+/**
+ * Resolve a (possibly dotted) variable reference over `vars`.
+ * Unknown variables resolve to `undefined` (matching the previous evaluator,
+ * where a referenced-but-undefined name would be `undefined`). Only own
+ * enumerable properties are traversed — no prototype walking.
+ */
+function resolveVar(path: string, vars: Record<string, unknown>): unknown {
+    const segments = path.split('.');
+    let current: unknown = vars;
+    for (const seg of segments) {
+        if (current === null || current === undefined) return undefined;
+        if (typeof current !== 'object') return undefined;
+        if (!Object.prototype.hasOwnProperty.call(current, seg)) return undefined;
+        current = (current as Record<string, unknown>)[seg];
+    }
+    return current;
 }
 
 // ---------------------------------------------------------------------------

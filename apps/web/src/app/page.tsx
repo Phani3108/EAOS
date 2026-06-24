@@ -48,6 +48,8 @@ import { RegimentReview } from '../components/RegimentReview';
 import { SkillLibraryHub } from '../components/SkillLibraryHub';
 import { MotionConfig } from 'framer-motion';
 import { ToastViewport } from '../components/ui';
+import FirstRunFlow from '../components/firstrun/FirstRunFlow';
+import { hasCompletedOnboarding } from '../lib/storage';
 
 function MainContent({ section }: { section: string }) {
   // Dynamic connector detail pages: connector-detail-{connectorId}
@@ -125,6 +127,8 @@ export default function Home() {
   const setActiveSection = useEAOSStore(s => s.setActiveSection);
   const setCommandOpen   = useEAOSStore(s => s.setCommandOpen);
   const commandOpen      = useEAOSStore(s => s.commandOpen);
+  const firstRunOpen     = useEAOSStore(s => s.firstRunOpen);
+  const setFirstRunOpen  = useEAOSStore(s => s.setFirstRunOpen);
   const [mobileNavOpen, setMobileNavOpen]   = useState(false);
 
   // -----------------------------------------------------------------------
@@ -149,7 +153,10 @@ export default function Home() {
     ];
     // Allow connector-detail-{id} dynamic sections to round-trip through URL
     const isKnown = knownSections.includes(path) || path.startsWith('connector-detail-');
-    setActiveSection(isKnown ? path : 'landing');
+    const resolved = isKnown ? path : 'landing';
+    // Returning users (completed onboarding) skip the Landing splash → straight to Home
+    const finalSection = resolved === 'landing' && hasCompletedOnboarding() ? 'home' : resolved;
+    setActiveSection(finalSection);
     assertProvenance();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -225,6 +232,7 @@ export default function Home() {
       <TourOverlay />
       <OnboardingModal forceOpen={false} onClose={() => {}} />
       <ToastViewport />
+      <FirstRunFlow open={firstRunOpen} onClose={() => setFirstRunOpen(false)} />
     </div>
     </MotionConfig>
   );

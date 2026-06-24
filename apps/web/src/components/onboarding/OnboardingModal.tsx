@@ -7,6 +7,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { ROLES, getUseCasesForRole, getQuickStartsForRole, type Role, type QuickStartCard } from '../../lib/onboarding-data';
 import { hasCompletedOnboarding, setPreference } from '../../lib/storage';
+import { TOUR_STEPS } from '../../lib/tour-data';
 import { useTour } from '../tour/TourProvider';
 import { useEAOSStore } from '../../store/eaos-store';
 
@@ -22,6 +23,7 @@ export default function OnboardingModal({ forceOpen, onClose }: OnboardingModalP
     const [visible, setVisible] = useState(false);
     const { start: startTour } = useTour();
     const setActiveSection = useEAOSStore(s => s.setActiveSection);
+    const setFirstRunOpen = useEAOSStore(s => s.setFirstRunOpen);
 
     useEffect(() => {
         if (forceOpen) {
@@ -45,6 +47,11 @@ export default function OnboardingModal({ forceOpen, onClose }: OnboardingModalP
         handleClose();
         setTimeout(() => startTour(), 300);
     }, [handleClose, startTour]);
+
+    const handleRunFirstSkill = useCallback(() => {
+        handleClose();
+        setTimeout(() => setFirstRunOpen(true), 300);
+    }, [handleClose, setFirstRunOpen]);
 
     const handleQuickStart = useCallback((card: QuickStartCard) => {
         handleClose();
@@ -232,10 +239,16 @@ export default function OnboardingModal({ forceOpen, onClose }: OnboardingModalP
 
                             <div className="flex flex-col gap-3 items-center border-t border-slate-200 pt-6">
                                 <button
-                                    onClick={handleStartTour}
+                                    onClick={handleRunFirstSkill}
                                     className="w-full px-6 py-3 rounded-xl bg-accent/20 text-accent font-medium text-sm hover:bg-accent/30 transition-colors border border-accent/20"
                                 >
-                                    🎯 Take the Guided Tour ({25} steps)
+                                    ⚡ Run my first skill
+                                </button>
+                                <button
+                                    onClick={handleStartTour}
+                                    className="w-full px-6 py-2.5 rounded-xl bg-slate-50 text-slate-700 font-medium text-sm hover:bg-slate-100 transition-colors border border-slate-200"
+                                >
+                                    🎯 Take the Guided Tour ({TOUR_STEPS.length} steps)
                                 </button>
                                 <button
                                     onClick={handleClose}

@@ -33,6 +33,10 @@ interface EAOSState {
     setCommandOpen: (open: boolean) => void;
     setCommandQuery: (query: string) => void;
 
+    // Guided first-run "experience the magic" flow
+    firstRunOpen: boolean;
+    setFirstRunOpen: (open: boolean) => void;
+
     // Right panel — only show when execution running or explicitly toggled on relevant pages
     rightPanelOpen: boolean;
     toggleRightPanel: () => void;
@@ -125,6 +129,10 @@ export const useEAOSStore = create<EAOSState>()(persist((set) => ({
     commandQuery: '',
     setCommandOpen: (open) => set({ commandOpen: open, commandQuery: '' }),
     setCommandQuery: (query) => set({ commandQuery: query }),
+
+    // Guided first-run "experience the magic" flow
+    firstRunOpen: false,
+    setFirstRunOpen: (open) => set({ firstRunOpen: open }),
 
     // Right panel — hidden by default; show only when execution running or toggled on relevant pages
     rightPanelOpen: false,
