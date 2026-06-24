@@ -5,6 +5,8 @@
  * Each persona contains exhaustive skills, agents, tool integrations, courses.
  */
 
+import { getFsSkills } from './skill-fs-loader.js';
+
 // ---------------------------------------------------------------------------
 // Interfaces
 // ---------------------------------------------------------------------------
@@ -867,7 +869,22 @@ export class PersonaSystem {
   }
 
   getSkillsForPersona(personaId: string): SkillCategory[] {
-    return this.personas.find(p => p.id === personaId)?.skillCategories ?? [];
+    const base = this.personas.find(p => p.id === personaId)?.skillCategories ?? [];
+    // Merge adopted community skills loaded from skills/<persona>/<slug>/SKILL.md.
+    const fs = getFsSkills(personaId);
+    if (fs && fs.skills.length > 0) {
+      const adopted: Skill[] = fs.skills.map(s => ({
+        id: s.id,
+        name: s.name,
+        description: s.description || s.name,
+        agents: [],
+        estimatedTime: s.estimatedTime ?? '~varies',
+        complexity: (s.complexity ?? 'moderate') as Skill['complexity'],
+        outputs: s.outputs ?? [],
+      }));
+      return [...base, { name: 'Adopted Skills', skills: adopted }];
+    }
+    return base;
   }
 
   getAgentsForPersona(personaId: string): AgentDef[] {

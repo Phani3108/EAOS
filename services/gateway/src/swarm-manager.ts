@@ -11,10 +11,12 @@ import { randomUUID } from 'crypto';
 import {
   createSwarm, storeSwarm, getSwarm, getActiveSwarms, getRecentSwarms,
   createMeeting, storeMeeting, createA2AMessage, storeMessage,
-  type AgentSwarm, type A2AAgent, type AgentMeeting,
+  type AgentSwarm, type A2AAgent, type AgentMeeting, type MeetingEntry,
 } from './a2a-protocol.js';
 import { createUTCPPacket, storePacket, type UTCPPacket } from './utcp-protocol.js';
-import { createEphemeralAgent, storeRuntime, type AgentRuntime } from './agent-runtime.js';
+import { createEphemeralAgent, storeRuntime, drainInbox, deliverToAgent, type AgentRuntime } from './agent-runtime.js';
+import { callLLM, hasAnyLLMKey } from './llm-provider.js';
+import { renderOrchestratorPrompt } from './prompts/orchestrator-prompt.js';
 
 // ═══════════════════════════════════════════════════════════════
 // Swarm Templates
@@ -187,6 +189,10 @@ export function launchSwarm(params: {
       stage_prompt: `You are participating in a ${template.name}. Your role: ${agent.rank} ${agent.name}.`,
       task_prompt: `Mission: ${params.mission}. Collaborate with other agents via A2A protocol.`,
     });
+    // Link the runtime to the swarm agent so A2A messages addressed to the agent_id
+    // are delivered to this runtime's inbox (deliverToAgent → getRuntimeByAgent).
+    rt.agent_id = agent.agent_id;
+    rt.agent_name = agent.name;
     storeRuntime(rt);
     return rt;
   });
@@ -256,6 +262,7 @@ export function launchSwarm(params: {
       priority: params.templateType === 'incident_response' ? 'critical' : 'high',
     });
     storeMessage(initMsg);
+    deliverToAgent(agents[1].agent_id, initMsg); // real A2A delivery into the inbox
     swarm.messages.push(initMsg);
   }
 
@@ -263,7 +270,105 @@ export function launchSwarm(params: {
   swarm.meetings.push(kickoffMeeting);
   storeSwarm(swarm);
 
+  // Real collaborative kickoff when an LLM key is present — replaces the scripted
+  // baseline above with genuine agent-to-agent contributions exchanged via the A2A
+  // inbox. Fire-and-forget: the synchronous return preserves the existing contract,
+  // and the stored meeting/swarm are upgraded in place once the discussion completes.
+  if (hasAnyLLMKey() && agents.length > 0) {
+    void runSwarmDiscussion(swarm, agents, runtimes, params.mission, template, kickoffMeeting)
+      .catch(err => console.warn('[swarm] real discussion failed:', err));
+  }
+
   return { swarm, utcpPacket, runtimes, kickoffMeeting };
+}
+
+/**
+ * Real collaborative swarm kickoff. The leader delegates the mission into each agent's
+ * A2A inbox; each agent then drains its inbox, contributes via an LLM call (using the
+ * adopted deer-flow lead-agent prompt and seeing the discussion so far), and posts a
+ * response back through the inbox. The meeting's discussion + decision are derived from
+ * the real contributions — replacing the scripted baseline. A bounded sequential round
+ * (one agent at a time) keeps each agent's context aware of prior speakers, mirroring
+ * deer-flow's coordinated subagent fan-out. Degrades to the scripted baseline when no
+ * LLM key is configured (this function is only invoked when one is).
+ */
+async function runSwarmDiscussion(
+  swarm: AgentSwarm,
+  agents: A2AAgent[],
+  agentRuntimes: AgentRuntime[],
+  mission: string,
+  template: SwarmTemplate,
+  meeting: AgentMeeting,
+): Promise<void> {
+  const leader = agents[0];
+
+  // Leader delegates the mission to every other agent's inbox (real A2A).
+  for (let i = 1; i < agents.length; i++) {
+    const msg = createA2AMessage({
+      type: 'delegate', sender: leader, receiver: agents[i], task_ref: swarm.task_ref,
+      payload: { objective: mission, context: { phase: 0, role: agents[i].name } },
+      priority: template.type === 'incident_response' ? 'critical' : 'high',
+    });
+    storeMessage(msg);
+    deliverToAgent(agents[i].agent_id, msg);
+    swarm.messages.push(msg);
+  }
+
+  const discussion: MeetingEntry[] = [];
+  for (const agent of agents) {
+    const rt = agentRuntimes.find(r => r.agent_id === agent.agent_id);
+    const inbox = rt ? drainInbox(rt.runtime_id) : [];
+    const prior = discussion.map(d => `${d.speaker}: ${d.message}`).join('\n');
+
+    const systemPrompt = `${renderOrchestratorPrompt({ agent_name: agent.name })}
+
+You are ${agent.rank} ${agent.name}, the ${agent.persona} member of a ${template.name}. Collaborate with the other agents — be specific and build on what they have said.`;
+    const userPrompt = `Mission: ${mission}
+
+Your A2A inbox (${inbox.length} message(s)):
+${inbox.map(m => `- ${m.type}: ${JSON.stringify(m.payload)}`).join('\n') || '(empty)'}
+
+Discussion so far:
+${prior || '(you are opening the discussion)'}
+
+Give your kickoff contribution in 2-3 sentences: what you will own and your first concrete action. End with exactly one line: "READINESS: READY" or "READINESS: BLOCKED - <reason>".`;
+
+    try {
+      const res = await callLLM({ systemPrompt, userPrompt, maxTokens: 400, temperature: 0.4 });
+      const text = res.content.trim();
+      discussion.push({ speaker: agent.name, agent_id: agent.agent_id, message: text, type: 'update', timestamp: new Date().toISOString() });
+
+      // Round-trip: post the contribution back to the leader's inbox (real A2A).
+      if (agent.agent_id !== leader.agent_id) {
+        const back = createA2AMessage({
+          type: 'query', sender: agent, receiver: leader, task_ref: swarm.task_ref,
+          payload: { objective: 'kickoff-response', context: { summary: text.slice(0, 500) } },
+          priority: 'medium',
+        });
+        storeMessage(back);
+        deliverToAgent(leader.agent_id, back);
+        swarm.messages.push(back);
+      }
+    } catch (err) {
+      discussion.push({ speaker: agent.name, agent_id: agent.agent_id, message: `(could not contribute: ${(err as Error).message})`, type: 'blocker', timestamp: new Date().toISOString() });
+    }
+  }
+
+  if (discussion.length > 0) {
+    const isReady = (m: string) => /READINESS:\s*READY/i.test(m);
+    const ready = discussion.filter(d => isReady(d.message)).length;
+    meeting.discussion = discussion;
+    meeting.decisions = [{
+      topic: 'Mission activation',
+      outcome: `${template.name}: ${ready}/${discussion.length} agents READY`,
+      votes: Object.fromEntries(discussion.map(d => [d.agent_id, isReady(d.message) ? 'agree' : 'abstain'])) as Record<string, 'agree' | 'disagree' | 'abstain'>,
+      confidence: discussion.length ? ready / discussion.length : 0,
+      rationale: 'Derived from real agent kickoff contributions (LLM-driven A2A discussion).',
+    }];
+    meeting.completed_at = new Date().toISOString();
+    storeMeeting(meeting);
+    storeSwarm(swarm);
+  }
 }
 
 /** Advance a swarm to the next phase */

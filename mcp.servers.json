@@ -1,0 +1,26 @@
+{
+  "$comment": "Real MCP servers EAOS connects to (Phase 0). A server is only connected when its enabledWhenEnv var is set — otherwise it is skipped (simulation-fallback). ${VARS} are substituted from the environment.",
+  "servers": [
+    {
+      "id": "voicebox",
+      "transport": "http",
+      "url": "${VOICEBOX_URL}",
+      "headers": { "X-Voicebox-Client-Id": "eaos-gateway" },
+      "enabledWhenEnv": "VOICEBOX_URL"
+    },
+    {
+      "id": "code-memory",
+      "transport": "stdio",
+      "command": "${CODE_MEMORY_BIN}",
+      "args": [],
+      "enabledWhenEnv": "CODE_MEMORY_BIN"
+    },
+    {
+      "id": "skillspector",
+      "transport": "stdio",
+      "command": "${SKILLSPECTOR_CMD}",
+      "args": ["mcp", "--transport", "stdio"],
+      "enabledWhenEnv": "SKILLSPECTOR_CMD"
+    }
+  ]
+}

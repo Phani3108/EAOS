@@ -56,6 +56,12 @@ async function patch(path, data = {}) {
     });
     return { status: res.status, body: await res.json() };
 }
+async function put(path, data = {}) {
+    const res = await fetch(`${BASE}${path}`, {
+        method: 'PUT', headers: HEADERS, body: JSON.stringify(data),
+    });
+    return { status: res.status, body: await res.json() };
+}
 async function del(path) {
     const res = await fetch(`${BASE}${path}`, { method: 'DELETE', headers: HEADERS });
     return { status: res.status, body: await res.json() };
@@ -754,6 +760,111 @@ async function testErrorHandling() {
     });
 }
 // ---------------------------------------------------------------------------
+// Agent Evals Tests
+// ---------------------------------------------------------------------------
+async function testAgentEvals() {
+    console.log('\n── Agent Evals ──────────────────────────────────');
+    await test('GET /api/evals/dashboard returns dashboard data', async () => {
+        const { status, body } = await get('/api/evals/dashboard');
+        assertStatus(status, 200);
+        assert(typeof body.totalAgents === 'number', 'totalAgents should be a number');
+        assert(typeof body.avgHealthScore === 'number', 'avgHealthScore should be a number');
+        assert(Array.isArray(body.agents), 'agents should be an array');
+    });
+    await test('GET /api/evals/agents returns agent configs', async () => {
+        const { status, body } = await get('/api/evals/agents');
+        assertStatus(status, 200);
+        const agents = body.agents;
+        assert(Array.isArray(agents), 'agents should be an array');
+        assert(agents.length > 0, 'should have seeded agents');
+        assert(typeof agents[0].agentId === 'string', 'agentId should be string');
+        assert(typeof agents[0].healthScore === 'number', 'healthScore should be a number');
+        assert(typeof agents[0].currentFingerprint === 'object', 'currentFingerprint should be object');
+    });
+    let testAgentId = '';
+    await test('GET /api/evals/agents/:id returns single agent', async () => {
+        const { body: listBody } = await get('/api/evals/agents');
+        testAgentId = listBody.agents[0].agentId;
+        const { status, body } = await get(`/api/evals/agents/${testAgentId}`);
+        assertStatus(status, 200);
+        assert(body.agent.agentId === testAgentId, 'should match requested agent');
+    });
+    await test('PUT /api/evals/agents/:id updates config', async () => {
+        const { status, body } = await put(`/api/evals/agents/${testAgentId}`, { driftThreshold: 25 });
+        assertStatus(status, 200);
+        assert(body.agent.driftThreshold === 25, 'driftThreshold should be updated');
+    });
+    await test('GET /api/evals/agents/:id/report returns health report', async () => {
+        const { status, body } = await get(`/api/evals/agents/${testAgentId}/report`);
+        assertStatus(status, 200);
+        const report = body.report;
+        assert(typeof report.healthScore === 'number', 'healthScore should be a number');
+        assert(typeof report.fingerprint === 'object', 'fingerprint should be object');
+        assert(Array.isArray(report.alerts), 'alerts should be array');
+        assert(Array.isArray(report.predictedFailures), 'predictedFailures should be array');
+    });
+    await test('GET /api/evals/agents/:id/drift returns drift history', async () => {
+        const { status, body } = await get(`/api/evals/agents/${testAgentId}/drift`);
+        assertStatus(status, 200);
+        assert(Array.isArray(body.history), 'history should be array');
+    });
+    await test('POST /api/evals/agents/:id/baseline sets baseline', async () => {
+        const { status, body } = await post(`/api/evals/agents/${testAgentId}/baseline`, {});
+        assertStatus(status, 200);
+        assert(body.agent.driftScore === 0, 'driftScore should be 0 after baseline reset');
+    });
+    await test('GET /api/evals/alerts returns alerts list', async () => {
+        const { status, body } = await get('/api/evals/alerts');
+        assertStatus(status, 200);
+        assert(Array.isArray(body.alerts), 'alerts should be array');
+    });
+    await test('GET /api/evals/agents/nonexistent returns 404', async () => {
+        const { status } = await get('/api/evals/agents/does-not-exist-xyz');
+        assertStatus(status, 404);
+    });
+}
+// ---------------------------------------------------------------------------
+// Marketing API Tests
+// ---------------------------------------------------------------------------
+async function testMarketing() {
+    console.log('\n── Marketing API ────────────────────────────────');
+    await test('GET /api/marketing/workflows returns workflow list', async () => {
+        const { status, body } = await get('/api/marketing/workflows');
+        assertStatus(status, 200);
+        assert(Array.isArray(body.workflows), 'workflows should be an array');
+        assert(body.workflows.length > 0, 'should have marketing workflows');
+    });
+    await test('GET /api/marketing/projects returns projects', async () => {
+        const { status, body } = await get('/api/marketing/projects');
+        assertStatus(status, 200);
+        assert(Array.isArray(body.projects), 'projects should be an array');
+    });
+    await test('POST /api/marketing/precheck validates execution', async () => {
+        const { body: listBody } = await get('/api/marketing/workflows');
+        const workflows = listBody.workflows;
+        if (workflows?.length > 0) {
+            const wfId = workflows[0].id;
+            const { status, body } = await post('/api/marketing/precheck', { workflowId: wfId });
+            assertStatus(status, 200);
+            assert(typeof body.ready === 'boolean', 'ready should be boolean');
+        }
+    });
+    await test('POST /api/marketing/execute runs a workflow', async () => {
+        const { body: listBody } = await get('/api/marketing/workflows');
+        const workflows = listBody.workflows;
+        if (workflows?.length > 0) {
+            const wfId = workflows[0].id;
+            const { status, body } = await post('/api/marketing/execute', { workflowId: wfId, inputs: {} });
+            assertStatus(status, 200);
+            assert(body.execution, 'should return execution record');
+        }
+    });
+    await test('GET /api/marketing/dashboard returns dashboard metrics', async () => {
+        const { status, body } = await get('/api/marketing/dashboard');
+        assertStatus(status, 200);
+    });
+}
+// ---------------------------------------------------------------------------
 // Main runner
 // ---------------------------------------------------------------------------
 async function checkGateway() {
@@ -789,6 +900,8 @@ async function main() {
     await testForum();
     await testObservability();
     await testLicenses();
+    await testAgentEvals();
+    await testMarketing();
     await testErrorHandling();
     const duration = Date.now() - start;
     console.log('\n╔══════════════════════════════════════════════════╗');

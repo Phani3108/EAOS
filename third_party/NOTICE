@@ -1,0 +1,34 @@
+EAOS — Third-Party Provenance
+=============================
+
+EAOS adopts substance (methodology, prompts, schemas, scan rules) from the open-source
+projects below, each under its original license (copies in this directory). User-facing
+features use EAOS nomenclature; the names below are recorded here for license compliance
+and provenance only — they are not feature names in the product.
+
+Skill methodology (live, EAOS-renamed) — skills/<persona>/<slug>/SKILL.md:
+  mattpocock/skills — MIT (third_party/mattpocock-skills/LICENSE), © Matt Pocock
+    11 tooling-agnostic engineering/product skills adopted and renamed to EAOS names
+    (e.g. Test-Driven Development, Bug Diagnosis, PRD Writer, Skill Router, Session Handoff).
+
+Skill methodology (quarantined, NOT loaded) — skills-unported/:
+  garrytan/gstack — MIT (third_party/gstack/LICENSE), © Garry Tan
+    18 skills preserved for a future EAOS-native rewrite. Held out of the live catalog
+    because they are tightly coupled to gstack's own tooling vocabulary (browse binary,
+    .gstack/ dirs, GBrain, Conductor) and would misrepresent EAOS capabilities if loaded as-is.
+
+Agent prompts & schemas (live, EAOS-renamed):
+  bytedance/deer-flow — MIT (third_party/deer-flow/LICENSE), © ByteDance
+    - Orchestrator Agent system prompt → services/gateway/src/prompts/orchestrator-prompt.ts
+    - Agent Memory schema → packages/memory-pipeline/src/agent-memory-schema.ts
+  NousResearch/hermes-agent — MIT (third_party/hermes-agent/LICENSE), © Nous Research
+    - Prompt-cache assembly → services/gateway/src/prompts/prompt-cache.ts
+
+Skill Security Scan engine (optional, external):
+  NVIDIA/SkillSpector — Apache-2.0
+    Backs the EAOS "Skill Security Scan" gate (services/gateway/src/skill-scan.ts) when
+    SKILLSPECTOR_CMD is configured. Invoked as a subprocess; not vendored.
+
+MCP servers (optional, external — connected via mcp.servers.json, never vendored):
+  jamiepine/voicebox — MIT (voice)
+  DeusData/codebase-memory-mcp — MIT (semantic code memory)

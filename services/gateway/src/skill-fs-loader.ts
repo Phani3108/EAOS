@@ -41,7 +41,23 @@
  */
 
 import { readdirSync, readFileSync, statSync, existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * Locate the repo-root `skills/` directory regardless of the process working dir
+ * (the gateway is launched from services/gateway/, so process.cwd() is wrong).
+ * Resolution order: EAOS_SKILLS_DIR env → module-relative repo root → cwd/skills.
+ */
+function skillsBaseDir(): string {
+    if (process.env.EAOS_SKILLS_DIR) return process.env.EAOS_SKILLS_DIR;
+    try {
+        // services/gateway/{src,dist}/skill-fs-loader → up 3 → repo root
+        const repoSkills = resolve(dirname(fileURLToPath(import.meta.url)), '../../../skills');
+        if (existsSync(repoSkills)) return repoSkills;
+    } catch { /* fall through */ }
+    return resolve(process.cwd(), 'skills');
+}
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -67,6 +83,8 @@ export interface FSSkillDef {
     sourcePath?: string;       // absolute path to SKILL.md
     supportingFiles?: string[]; // relative paths
     extends?: string;          // parent skill id
+    adopted?: boolean;         // true when imported from an external SKILL.md (no native id/slug)
+    attribution?: string;      // upstream source label (e.g. "gstack (MIT)")
 }
 
 export interface FSLoadResult {
@@ -212,27 +230,56 @@ function parseSkillMd(content: string, sourcePath: string): FSSkillDef | null {
 
     try {
         const frontmatter = parseYaml(yaml) as any;
-        if (!frontmatter.id || !frontmatter.slug || !frontmatter.name) return null;
+
+        // Derive identity from the folder layout when the frontmatter omits it.
+        // External skill libraries (gstack, mattpocock/skills — the `.claude` SKILL.md
+        // standard) ship only `name` + `description`, so synthesize id/slug/persona from
+        // skills/<persona>/<slug>/SKILL.md rather than rejecting them.
+        const segs = sourcePath.split(/[\\/]/);
+        const dirSlug = segs.length >= 2 ? segs[segs.length - 2]! : 'skill';
+        const dirPersona = segs.length >= 3 ? segs[segs.length - 3]! : 'general';
+
+        const slug = frontmatter.slug ? String(frontmatter.slug) : dirSlug;
+        const name = frontmatter.name ? String(frontmatter.name) : slug;
+        const adopted = !frontmatter.id;
+        const id = frontmatter.id ? String(frontmatter.id) : `fs.${dirPersona}.${slug}`;
+
+        // A SKILL.md with frontmatter but no usable name and no body is not a skill.
+        if (!name && !body) return null;
+
+        // Normalize the two community frontmatter dialects onto our fields:
+        //   gstack:     allowed-tools[], triggers[], preamble-tier
+        //   mattpocock: name, description (the markdown body carries the skill)
+        const allowedTools = frontmatter['allowed-tools'] ?? frontmatter.allowedTools;
+        const triggers = frontmatter.triggers;
+        const requiredTools = Array.isArray(frontmatter.requiredTools)
+            ? frontmatter.requiredTools.map(String)
+            : Array.isArray(allowedTools) ? allowedTools.map(String) : [];
+        const tags = [
+            ...(Array.isArray(frontmatter.tags) ? frontmatter.tags.map(String) : []),
+            ...(Array.isArray(triggers) ? triggers.map(String) : []),
+        ];
 
         const skill: FSSkillDef = {
-            id: String(frontmatter.id),
-            slug: String(frontmatter.slug),
-            name: String(frontmatter.name),
+            id,
+            slug,
+            name,
             description: String(frontmatter.description ?? ''),
             icon: frontmatter.icon ? String(frontmatter.icon) : undefined,
-            persona: String(frontmatter.persona ?? 'general'),
-            cluster: frontmatter.cluster ? String(frontmatter.cluster) : undefined,
+            persona: String(frontmatter.persona ?? dirPersona),
+            cluster: frontmatter.cluster ? String(frontmatter.cluster) : (adopted ? 'Adopted Skills' : undefined),
             complexity: frontmatter.complexity as any,
             estimatedTime: frontmatter.estimatedTime ? String(frontmatter.estimatedTime) : undefined,
             inputs: Array.isArray(frontmatter.inputs) ? frontmatter.inputs : [],
             steps: Array.isArray(frontmatter.steps) ? frontmatter.steps : [],
             outputs: Array.isArray(frontmatter.outputs) ? frontmatter.outputs : [],
-            requiredTools: Array.isArray(frontmatter.requiredTools) ? frontmatter.requiredTools : [],
-            optionalTools: Array.isArray(frontmatter.optionalTools) ? frontmatter.optionalTools : [],
-            tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : [],
+            requiredTools,
+            optionalTools: Array.isArray(frontmatter.optionalTools) ? frontmatter.optionalTools.map(String) : [],
+            tags,
             systemPrompt: body || undefined,
             sourcePath,
             extends: frontmatter.extends ? String(frontmatter.extends) : undefined,
+            adopted,
         };
         return skill;
     } catch (err) {
@@ -248,7 +295,7 @@ function parseSkillMd(content: string, sourcePath: string): FSSkillDef | null {
  * the existing TS literal arrays.
  */
 export function loadSkillsFromFs(persona: string, skillsRoot?: string): FSLoadResult | null {
-    const root = skillsRoot ?? resolve(process.cwd(), 'skills', persona);
+    const root = skillsRoot ?? join(skillsBaseDir(), persona);
 
     if (!existsSync(root)) return null;
 
@@ -345,4 +392,32 @@ export function getAllFsSkills(): FSSkillDef[] {
         all.push(...result.skills);
     }
     return all;
+}
+
+/**
+ * Eagerly load every persona folder under skills/ (skills/<persona>/<slug>/SKILL.md).
+ * Called once at gateway boot so getAllFsSkills() and the unified catalog include
+ * adopted community skills without waiting for a per-persona request to warm the cache.
+ */
+export function warmAllFsSkills(skillsRoot?: string): { personas: string[]; total: number } {
+    const root = skillsRoot ?? skillsBaseDir();
+    if (!existsSync(root)) return { personas: [], total: 0 };
+
+    let entries: string[];
+    try { entries = readdirSync(root); } catch { return { personas: [], total: 0 }; }
+
+    const personas: string[] = [];
+    let total = 0;
+    for (const entry of entries) {
+        let st;
+        try { st = statSync(join(root, entry)); } catch { continue; }
+        if (!st.isDirectory()) continue;
+
+        const result = loadSkillsFromFs(entry);
+        if (result) {
+            loadedCache.set(entry, result);
+            if (result.skills.length > 0) { personas.push(entry); total += result.skills.length; }
+        }
+    }
+    return { personas, total };
 }

@@ -179,6 +179,14 @@ export function getCredentials(ref: string): Record<string, string> | undefined 
   return credentials.get(ref);
 }
 
+// Real MCP resolver (Phase 0) — injected from server.ts to avoid a circular import.
+// Returns the tool result when a connected MCP server handles the action, else null
+// (so legacy connectors / simulation remain the fallback). Matches only MCP-server
+// tool_ids, so existing jira/github/slack/etc. behaviour is unchanged.
+type McpResolver = (action: MCPToolAction) => Promise<Record<string, unknown> | null>;
+let mcpResolver: McpResolver | null = null;
+export function setMcpResolver(fn: McpResolver | null): void { mcpResolver = fn; }
+
 // Execution log
 const executionLog: MCPToolResponse[] = [];
 
@@ -263,6 +271,13 @@ async function executeToolCall(
   if (!policy.allowed) {
     const reasons = policy.matchedDenies.map((d) => d.reason).join('; ');
     throw new Error(`Denied by policy: ${reasons}`);
+  }
+
+  // Real MCP server first (Phase 0). Resolves only when tool_id is a connected MCP
+  // server; returns null otherwise, leaving legacy connectors/simulation untouched.
+  if (mcpResolver) {
+    const viaMcp = await mcpResolver(action);
+    if (viaMcp) return viaMcp;
   }
 
   // Attempt real execution first. Returns null if connector is not wired for
