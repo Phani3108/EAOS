@@ -101,6 +101,7 @@ export default function HomeCommandCenter() {
   const setActiveSection = useEAOSStore(s => s.setActiveSection);
   const setCommandOpen   = useEAOSStore(s => s.setCommandOpen);
   const notifications    = useEAOSStore(s => s.notifications);
+  const setFirstRunOpen  = useEAOSStore(s => s.setFirstRunOpen);
   const connectedCount   = useConnectionsStore(s => s.getConnectedCount());
   const totalConnectors  = CONNECTOR_CATALOG.length;
   const coveragePct      = Math.round((connectedCount / totalConnectors) * 100);
@@ -197,7 +198,7 @@ export default function HomeCommandCenter() {
               <h1 className="text-2xl font-bold tracking-tight text-slate-900">{greeting}, welcome to EAOS</h1>
               <p className="text-slate-500 mt-1 text-[15px]">Your AI orchestration platform — connect tools, pick a workspace, and run skills.</p>
             </div>
-            <GettingStartedChecklist totalExecCount={totalExecCount} />
+            <GettingStartedChecklist totalExecCount={totalExecCount} onRunFirstSkill={() => setFirstRunOpen(true)} />
             <StoryFlow />
 
                         {/* Workspace shortcuts — still show even for new users */}

@@ -5,8 +5,9 @@
  */
 'use client';
 
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useEAOSStore } from '../store/eaos-store';
+import { setPreference } from '../lib/storage';
 
 // ═══════════════════════════════════════════════════════════════
 // Data Constants
@@ -195,11 +196,28 @@ const SECURITY_FLOW = [
 ];
 
 // ═══════════════════════════════════════════════════════════════
+// Canonical app entry
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Canonical entry point for every primary CTA on the landing page.
+ * Marks onboarding/landing as seen, then navigates into the app's
+ * 'home' section — matching the OnboardingModal entry pattern.
+ */
+function useEnterApp() {
+  const setActiveSection = useEAOSStore(s => s.setActiveSection);
+  return useCallback(() => {
+    setPreference('onboarding_completed', true);
+    setActiveSection('home');
+  }, [setActiveSection]);
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Sub-Components
 // ═══════════════════════════════════════════════════════════════
 
 function LandingNav() {
-  const setActiveSection = useEAOSStore(s => s.setActiveSection);
+  const enterApp = useEnterApp();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   const scrollTo = (href: string) => {
@@ -229,12 +247,15 @@ function LandingNav() {
         {/* Right */}
         <div className="flex items-center gap-2 sm:gap-3">
           <button
-            onClick={() => setActiveSection('dashboard')}
+            onClick={enterApp}
             className="hidden md:inline text-sm text-slate-400 hover:text-white transition-colors"
           >
             Go to Dashboard
           </button>
-          <button className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-3.5 sm:px-5 py-2 text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap">
+          <button
+            onClick={enterApp}
+            className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-3.5 sm:px-5 py-2 text-xs sm:text-sm font-semibold transition-colors whitespace-nowrap"
+          >
             <span className="hidden sm:inline">Request Early Access</span>
             <span className="sm:hidden">Early Access</span>
           </button>
@@ -257,7 +278,7 @@ function LandingNav() {
               {l.label}
             </button>
           ))}
-          <button onClick={() => { setActiveSection('dashboard'); setMobileOpen(false); }} className="block text-sm text-blue-400 hover:text-blue-300">
+          <button onClick={() => { enterApp(); setMobileOpen(false); }} className="block text-sm text-blue-400 hover:text-blue-300">
             Go to Dashboard
           </button>
         </div>
@@ -267,6 +288,7 @@ function LandingNav() {
 }
 
 function HeroSection() {
+  const enterApp = useEnterApp();
   return (
     <section className="relative pt-28 sm:pt-32 pb-16 sm:pb-20 landing-glow">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 text-center">
@@ -324,7 +346,10 @@ function HeroSection() {
 
         {/* CTAs */}
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-3 sm:gap-4 mt-8 sm:mt-10 max-w-sm sm:max-w-none mx-auto">
-          <button className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors shadow-lg shadow-blue-600/20">
+          <button
+            onClick={enterApp}
+            className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors shadow-lg shadow-blue-600/20"
+          >
             Get Started
           </button>
           <button className="border border-slate-600 hover:border-slate-400 text-slate-300 hover:text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors">
@@ -663,6 +688,7 @@ function SecuritySection() {
 }
 
 function PricingSection() {
+  const enterApp = useEnterApp();
   return (
     <section id="pricing" className="py-16 sm:py-24 border-t border-slate-900">
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
@@ -700,11 +726,14 @@ function PricingSection() {
                   </li>
                 ))}
               </ul>
-              <button className={`w-full py-2.5 rounded-full text-sm font-semibold transition-colors ${
-                tier.highlight
-                  ? 'bg-blue-600 hover:bg-blue-500 text-white'
-                  : 'border border-slate-600 hover:border-slate-400 text-slate-300 hover:text-white'
-              }`}>
+              <button
+                onClick={tier.cta === 'Contact Sales' ? undefined : enterApp}
+                className={`w-full py-2.5 rounded-full text-sm font-semibold transition-colors ${
+                  tier.highlight
+                    ? 'bg-blue-600 hover:bg-blue-500 text-white'
+                    : 'border border-slate-600 hover:border-slate-400 text-slate-300 hover:text-white'
+                }`}
+              >
                 {tier.cta}
               </button>
             </div>
@@ -716,6 +745,7 @@ function PricingSection() {
 }
 
 function CTASection() {
+  const enterApp = useEnterApp();
   return (
     <section className="py-20 sm:py-32 border-t border-slate-900">
       <div className="max-w-4xl mx-auto px-4 sm:px-6 text-center">
@@ -729,7 +759,10 @@ function CTASection() {
           START YOUR FREE TRIAL TODAY.
         </p>
         <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-center gap-3 sm:gap-4 max-w-sm sm:max-w-none mx-auto">
-          <button className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors shadow-lg shadow-blue-600/20">
+          <button
+            onClick={enterApp}
+            className="bg-blue-600 hover:bg-blue-500 text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors shadow-lg shadow-blue-600/20"
+          >
             Get Started Free
           </button>
           <button className="border border-slate-600 hover:border-slate-400 text-slate-300 hover:text-white rounded-full px-8 py-3 text-sm font-semibold transition-colors">

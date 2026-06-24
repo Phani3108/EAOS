@@ -76,6 +76,89 @@
   --shadow-focus: 0 0 0 3px var(--accent-glow);
 }
 
+/* ── Dark Theme Tokens ───────────────────────────────────────
+   Retrofit dark mode. Activated by `.dark` on <html> (Tailwind
+   darkMode:'class'). Light mode (brand default) is untouched.
+   Slate-900/800 surfaces, light text, preserved blue accent. */
+.dark {
+  /* Surfaces */
+  --bg-primary: #0f172a;     /* slate-900 */
+  --bg-secondary: #111c33;   /* slate-900/800 blend */
+  --bg-raised: #1e293b;      /* slate-800 */
+  --bg-overlay: #334155;     /* slate-700 */
+  --bg-sidebar: #0b1322;     /* deeper than primary */
+  --bg-sidebar-hover: #1e293b;
+  --bg-sidebar-active: #334155;
+
+  /* Borders */
+  --border: #1e293b;         /* slate-800 */
+  --border-light: #172033;
+  --border-active: #475569;  /* slate-600 */
+  --border-focus: #60a5fa;   /* blue-400 */
+
+  /* Text */
+  --text-primary: #f1f5f9;   /* slate-100 */
+  --text-secondary: #cbd5e1; /* slate-300 */
+  --text-muted: #94a3b8;     /* slate-400 */
+  --text-inverse: #0f172a;
+
+  /* Brand / Accent (kept blue, slightly brighter for dark) */
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
+  --accent-light: #1e293b;
+  --accent-glow: rgba(96, 165, 250, 0.18);
+
+  /* Semantic — darker tinted backgrounds */
+  --success: #34d399;
+  --success-light: #052e22;
+  --warning: #fbbf24;
+  --warning-light: #3a2a08;
+  --danger: #f87171;
+  --danger-light: #3a1414;
+  --info: #60a5fa;
+  --info-light: #11233f;
+
+  /* Shadows — deeper for dark surfaces */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-md: 0 2px 8px rgba(0,0,0,0.5);
+  --shadow-lg: 0 4px 16px rgba(0,0,0,0.6);
+  --shadow-focus: 0 0 0 3px var(--accent-glow);
+}
+
+/* ── Dark Retrofit: hardcoded-utility remaps ──────────────────
+   Most components use literal Tailwind color utilities instead of
+   tokens. These remaps flip the ~20 most frequent surface/text/
+   border utilities to dark tokens so the whole app coheres without
+   editing every component. Brand colors (blue/green/red/amber) and
+   text-white are intentionally NOT remapped. */
+.dark .bg-white          { background-color: var(--bg-primary)   !important; }
+.dark .bg-slate-50       { background-color: var(--bg-secondary) !important; }
+.dark .bg-slate-100      { background-color: var(--bg-raised)    !important; }
+.dark .bg-slate-200      { background-color: var(--bg-overlay)   !important; }
+.dark .bg-slate-800      { background-color: var(--bg-raised)    !important; }
+.dark .bg-slate-900      { background-color: var(--bg-sidebar)   !important; }
+
+.dark .text-slate-900    { color: var(--text-primary)   !important; }
+.dark .text-slate-800    { color: var(--text-primary)   !important; }
+.dark .text-slate-700    { color: var(--text-secondary) !important; }
+.dark .text-slate-600    { color: var(--text-secondary) !important; }
+.dark .text-slate-500    { color: var(--text-muted)     !important; }
+.dark .text-slate-400    { color: var(--text-muted)     !important; }
+
+.dark .border-slate-100  { border-color: var(--border-light) !important; }
+.dark .border-slate-200  { border-color: var(--border)       !important; }
+.dark .border-slate-300  { border-color: var(--border-active)!important; }
+
+.dark .divide-slate-100 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border-light) !important; }
+.dark .divide-slate-200 > :not([hidden]) ~ :not([hidden]) { border-color: var(--border)       !important; }
+
+.dark .placeholder-slate-400::placeholder { color: var(--text-muted) !important; }
+
+.dark .hover\:bg-slate-50:hover  { background-color: var(--bg-raised)   !important; }
+.dark .hover\:bg-slate-100:hover { background-color: var(--bg-overlay)  !important; }
+
+.dark .ring-slate-300 { --tw-ring-color: var(--border-active) !important; }
+
 /* ── Reset & Base ────────────────────────────────────────── */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -111,6 +194,8 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.18); }
+.dark ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); }
+.dark ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.24); }
 
 /* ── Utility Classes ─────────────────────────────────────── */
 
@@ -430,6 +515,9 @@ body {
   -webkit-backdrop-filter: blur(16px);
   border: 1px solid var(--border);
 }
+
+.dark .glass { background: rgba(15, 23, 42, 0.92); }
+.dark .glass-surface { background: rgba(15, 23, 42, 0.95); }
 
 .command-bar::placeholder {
   color: var(--text-muted);
