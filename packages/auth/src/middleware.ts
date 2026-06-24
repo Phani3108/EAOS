@@ -39,7 +39,12 @@ export interface GeneratedApiKey {
  */
 export function generateApiKey(secret?: string): GeneratedApiKey {
     const rawKey = `ak_${randomBytes(32).toString('hex')}`;
-    const keyHash = createHmac('sha256', secret ?? JWT_SECRET ?? 'agentos').update(rawKey).digest('hex');
+    // No hardcoded fallback secret: an API key hash is only meaningful when a real
+    // signing secret exists. Require an explicit secret or JWT_SECRET — never a
+    // predictable constant baked into the source.
+    const signingSecret = secret ?? JWT_SECRET;
+    if (!signingSecret) throw new Error('generateApiKey: no signing secret (set JWT_SECRET/AUTH_SECRET or pass one)');
+    const keyHash = createHmac('sha256', signingSecret).update(rawKey).digest('hex');
     const keyPrefix = rawKey.slice(0, 10);
     return { rawKey, keyHash, keyPrefix };
 }
@@ -147,19 +152,19 @@ export function generateJWT(user: AuthUser, expiresInSec = 86400): string {
 // ---------------------------------------------------------------------------
 
 function resolveApiKey(key: string): AuthUser | undefined {
-    // Dev mode: direct lookup
+    // Dev mode: direct lookup against the hardcoded demo keys (eos-dev-key, etc.).
+    // These keys grant admin/operator and MUST NEVER be honored in production —
+    // they are only reachable on this non-production branch.
     if (!IS_PRODUCTION) {
         return DEV_API_KEYS[key];
     }
-    // Production: hash the incoming key and compare against stored hashes
-    // (API key storage would be in DB — for now, timing-safe compare against dev keys)
-    const hash = createHmac('sha256', JWT_SECRET || 'agentos').update(key).digest('hex');
-    for (const [devKey, user] of Object.entries(DEV_API_KEYS)) {
-        const expectedHash = createHmac('sha256', JWT_SECRET || 'agentos').update(devKey).digest('hex');
-        if (hash.length === expectedHash.length && timingSafeEqual(Buffer.from(hash), Buffer.from(expectedHash))) {
-            return user;
-        }
-    }
+    // Production: the hardcoded DEV_API_KEYS are rejected outright (never consulted
+    // here). Real API keys would be hashed with JWT_SECRET and compared (timing-safe)
+    // against DB-stored hashes. We never substitute a predictable constant for the
+    // secret, and there is no DB-backed key store wired up yet, so no API key can
+    // authenticate in production. The eos-dev-key/eos-demo-key/eos-operator-key
+    // demo keys therefore cannot grant access under NODE_ENV=production.
+    void key;
     return undefined;
 }
 
@@ -170,7 +175,12 @@ function verifyJWT(token: string): AuthUser | null {
 
         const [encodedHeader, encodedPayload, signature] = parts;
 
-        // Verify signature if secret is configured
+        // Signature verification.
+        // Production: MANDATORY — a token whose signature cannot be verified is
+        // rejected. (IS_PRODUCTION guarantees JWT_SECRET is set via the fail-fast
+        // check at module load, so an unsigned/unverifiable token is rejected.)
+        // Development: lenient — if no JWT_SECRET is configured we skip the HMAC
+        // path entirely rather than substitute a known/predictable key.
         if (JWT_SECRET) {
             const expectedSig = hmacSign(`${encodedHeader}.${encodedPayload}`, JWT_SECRET);
             const sigBuf = Buffer.from(signature, 'base64url');
@@ -178,6 +188,9 @@ function verifyJWT(token: string): AuthUser | null {
             if (sigBuf.length !== expectedBuf.length || !timingSafeEqual(sigBuf, expectedBuf)) {
                 return null; // Signature mismatch
             }
+        } else if (IS_PRODUCTION) {
+            // Defense-in-depth: never accept an unverifiable token in production.
+            return null;
         }
 
         const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
