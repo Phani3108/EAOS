@@ -1,0 +1,8 @@
+{
+  "extends": "next/core-web-vitals",
+  "plugins": ["@typescript-eslint"],
+  "ignorePatterns": ["**/*.js", "**/*.d.ts", ".next/", "out/", "node_modules/"],
+  "rules": {
+    "react/no-unescaped-entities": "off"
+  }
+}

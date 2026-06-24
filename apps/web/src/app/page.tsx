@@ -190,6 +190,9 @@ export default function Home() {
   // Intent Router shown on skills/marketplace section
   const showIntentBar = false; // Intent router disabled — skills are inside persona hubs
 
+  // Hooks must run unconditionally, before any early return (rules-of-hooks).
+  const gatewayOk = useGatewayReachable();
+
   // Landing page — full-screen, no shell
   if (activeSection === 'landing') {
     return (
@@ -199,8 +202,6 @@ export default function Home() {
       </>
     );
   }
-
-  const gatewayOk = useGatewayReachable();
 
   return (
     <MotionConfig reducedMotion="user">

@@ -11,25 +11,27 @@
     },
     "dependencies": {
         "@agentos/gateway": "workspace:*",
+        "@emotion/react": "^11.11.0",
+        "@emotion/styled": "^11.11.0",
+        "@mui/icons-material": "^5.15.0",
+        "@mui/material": "^5.15.0",
+        "@tanstack/react-query": "^5.28.0",
+        "framer-motion": "^11.0.0",
         "next": "^14.2.0",
         "react": "^18.3.0",
         "react-dom": "^18.3.0",
-        "@mui/material": "^5.15.0",
-        "@mui/icons-material": "^5.15.0",
-        "@emotion/react": "^11.11.0",
-        "@emotion/styled": "^11.11.0",
-        "@tanstack/react-query": "^5.28.0",
         "reactflow": "^11.11.0",
-        "zustand": "^4.5.0",
-        "framer-motion": "^11.0.0"
+        "zustand": "^4.5.0"
     },
     "devDependencies": {
         "@types/node": "^20.11.0",
         "@types/react": "^18.3.0",
         "@types/react-dom": "^18.3.0",
-        "typescript": "^5.4.0",
-        "tailwindcss": "^3.4.0",
+        "autoprefixer": "^10.4.0",
+        "eslint": "^8.57.1",
+        "eslint-config-next": "^14.2.35",
         "postcss": "^8.4.0",
-        "autoprefixer": "^10.4.0"
+        "tailwindcss": "^3.4.0",
+        "typescript": "^5.4.0"
     }
 }
