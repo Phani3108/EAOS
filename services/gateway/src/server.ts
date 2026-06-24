@@ -103,7 +103,7 @@ import {
   listComplianceControls, getComplianceSummary,
   runRedTeamScan,
 } from './governance-v2.js';
-import { getAgentMemory, getAllAgentMemorySnapshots, recordAgentMemory, _exportData as exportAgentMemory, _importData as importAgentMemory } from './agent-memory.js';
+import { getAgentMemory, getAllAgentMemorySnapshots, recordAgentMemory, getAgentMemoryDocument, _exportData as exportAgentMemory, _importData as importAgentMemory } from './agent-memory.js';
 // Workflow engine available as library but not exposed as API routes
 // (all execution flows use persona-api.ts sequential model)
 // import { executeWorkflow, getWorkflowExecution, resumeWorkflow } from './workflow-bridge.js';
@@ -4627,7 +4627,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         if (path.match(/^\/api\/agents\/memory\/[^/]+$/) && method === 'GET') {
             const agentId = decodeURIComponent(path.split('/')[4]!);
-            sendJSON(res, 200, { agentId, entries: getAgentMemory(agentId) });
+            sendJSON(res, 200, { agentId, entries: getAgentMemory(agentId), document: getAgentMemoryDocument(agentId) });
             return;
         }
 

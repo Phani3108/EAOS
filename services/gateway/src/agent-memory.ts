@@ -164,6 +164,44 @@ export function extractAndStoreMemory(
   recordAgentMemory(agentId, 'learning', summary, executionId);
 }
 
+// ---------------------------------------------------------------------------
+// Structured memory document (3-tier: history + facts with confidence)
+// Shape adopted from bytedance/deer-flow — see
+// packages/memory-pipeline/src/agent-memory-schema.ts (third_party/NOTICE).
+// This presents the live per-agent memory through that canonical schema.
+// ---------------------------------------------------------------------------
+
+export interface MemoryFact { content: string; category?: string; confidence?: number; createdAt?: string; }
+export interface AgentMemoryDocument {
+  agentId: string;
+  version: string;
+  lastUpdated: string;
+  history: { recent: string };
+  facts: MemoryFact[];
+}
+
+/** Shape an agent's live memory into the adopted AgentMemory document. */
+export function getAgentMemoryDocument(agentId: string): AgentMemoryDocument {
+  const entries = getAgentMemory(agentId);
+  const facts: MemoryFact[] = entries
+    .filter((e) => e.kind !== 'preference')
+    .map((e) => ({
+      content: e.content,
+      category: e.kind,
+      confidence: Math.round(e.relevance * 100) / 100,
+      createdAt: e.timestamp,
+    }))
+    .slice(0, 50);
+  const execs = new Set(entries.map((e) => e.source)).size;
+  return {
+    agentId,
+    version: '1.0',
+    lastUpdated: entries[0]?.timestamp ?? new Date().toISOString(),
+    history: { recent: `${entries.length} memories across ${execs} executions` },
+    facts,
+  };
+}
+
 /**
  * Decay relevance of old memories. Call periodically.
  */
