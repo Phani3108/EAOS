@@ -230,8 +230,30 @@ ${review.patterns.findings.map((f) => `- 📐 ${f}`).join('\n')}
         return result.output;
     }
 
+    private get githubHeaders(): Record<string, string> {
+        return {
+            'Authorization': `Bearer ${this.config.githubToken}`,
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+            'User-Agent': 'EAOS-Webhook/1.0',
+            'Content-Type': 'application/json',
+        };
+    }
+
     private async postPRComment(repo: string, prNumber: number, body: string): Promise<void> {
-        // TODO: GitHub REST API — POST /repos/{repo}/issues/{prNumber}/comments
+        if (!this.config.githubToken) {
+            throw new Error('GitHub token is required to post PR comments. Set the githubToken config.');
+        }
+        // GitHub REST API — POST /repos/{repo}/issues/{prNumber}/comments
+        const res = await fetch(`https://api.github.com/repos/${repo}/issues/${prNumber}/comments`, {
+            method: 'POST',
+            headers: this.githubHeaders,
+            body: JSON.stringify({ body }),
+        });
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`GitHub API error ${res.status} posting comment on ${repo}#${prNumber}: ${errText}`);
+        }
         console.log(`[GitHub] Posted review on ${repo}#${prNumber} (${body.length} chars)`);
     }
 
@@ -241,7 +263,25 @@ ${review.patterns.findings.map((f) => `- 📐 ${f}`).join('\n')}
         commitSha: string,
         suggestion: { file: string; line: number; suggestion: string }
     ): Promise<void> {
-        // TODO: GitHub REST API — POST /repos/{repo}/pulls/{prNumber}/comments
+        if (!this.config.githubToken) {
+            throw new Error('GitHub token is required to post inline comments. Set the githubToken config.');
+        }
+        // GitHub REST API — POST /repos/{repo}/pulls/{prNumber}/comments
+        const res = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/comments`, {
+            method: 'POST',
+            headers: this.githubHeaders,
+            body: JSON.stringify({
+                body: suggestion.suggestion,
+                commit_id: commitSha,
+                path: suggestion.file,
+                line: suggestion.line,
+                side: 'RIGHT',
+            }),
+        });
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`GitHub API error ${res.status} posting inline comment on ${repo}#${prNumber} ${suggestion.file}:${suggestion.line}: ${errText}`);
+        }
         console.log(`[GitHub] Inline comment on ${repo}#${prNumber} ${suggestion.file}:${suggestion.line}`);
     }
 }

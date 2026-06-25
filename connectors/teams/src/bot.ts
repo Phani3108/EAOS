@@ -24,10 +24,23 @@ class EAOSTeamsBot {
     constructor(private config: TeamsBotConfig) { }
 
     async start(): Promise<void> {
-        console.log('💬 EAOS Teams Bot starting...');
-        // TODO: Initialize Bot Framework adapter
-        // TODO: Register turn handler
-        console.log('💬 EAOS Teams Bot ready');
+        // The Bot Framework adapter / turn handler that delivers Teams activities to
+        // handleMessage() is NOT wired up here. handleMessage() works if you call it
+        // directly, but nothing receives Teams events or sends activities back to the
+        // service URL yet — so this bot does not actually run. Report that honestly
+        // instead of claiming the bot is "ready".
+        //
+        // To make it ready: initialize a BotFrameworkAdapter with appId/appPassword,
+        // register a turn handler that routes message activities to handleMessage(),
+        // and start an HTTP server that forwards /api/messages to the adapter.
+        console.warn(
+            '💬 EAOS Teams Bot: Bot Framework adapter not configured — ' +
+            'no turn handler / HTTP listener wired up.'
+        );
+        throw new Error(
+            'Teams not implemented — wire Bot Framework adapter ' +
+            '(initialize BotFrameworkAdapter + turn handler + /api/messages listener before calling start())'
+        );
     }
 
     /**

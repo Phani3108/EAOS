@@ -354,16 +354,66 @@ Give your kickoff contribution in 2-3 sentences: what you will own and your firs
     }
   }
 
+  // Bidirectional round-trip: now that every member has posted a response back to the
+  // leader's inbox, the leader DRAINS its inbox and synthesizes a final decision that
+  // actually incorporates those member messages. Without this pass the member→leader
+  // responses are stored + counted but never read, leaving the "discussion" one-way.
+  const leaderRt = agentRuntimes.find(r => r.agent_id === leader.agent_id);
+  const leaderInbox = leaderRt ? drainInbox(leaderRt.runtime_id) : [];
+  const memberResponses = leaderInbox.filter(
+    m => (m.payload as { objective?: string })?.objective === 'kickoff-response',
+  );
+
   if (discussion.length > 0) {
     const isReady = (m: string) => /READINESS:\s*READY/i.test(m);
     const ready = discussion.filter(d => isReady(d.message)).length;
     meeting.discussion = discussion;
+
+    // Leader reads the drained member responses and produces a synthesis. Prefer a real
+    // LLM synthesis over the member contributions it just received; degrade gracefully to
+    // a deterministic roll-up if the call fails so the round-trip is always reflected.
+    let synthesis = '';
+    const responseSummaries = memberResponses
+      .map(m => (m.payload as { context?: { summary?: string } })?.context?.summary)
+      .filter((s): s is string => typeof s === 'string' && s.length > 0);
+
+    if (responseSummaries.length > 0) {
+      const synthSystem = `${renderOrchestratorPrompt({ agent_name: leader.name })}
+
+You are ${leader.rank} ${leader.name}, leading a ${template.name}. Your team members have each replied to your kickoff delegation. Synthesize their responses into a single decision.`;
+      const synthUser = `Mission: ${mission}
+
+Member responses received in your A2A inbox (${responseSummaries.length}):
+${responseSummaries.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+
+In 2-3 sentences, synthesize these into the team's plan and confirm whether the swarm is GO or NO-GO.`;
+      try {
+        const synthRes = await callLLM({ systemPrompt: synthSystem, userPrompt: synthUser, maxTokens: 400, temperature: 0.4 });
+        synthesis = synthRes.content.trim();
+      } catch (err) {
+        synthesis = `Synthesis from ${responseSummaries.length} member response(s); ${ready}/${discussion.length} READY. (LLM synthesis unavailable: ${(err as Error).message})`;
+      }
+
+      // Record the leader's synthesis as the closing entry in the discussion so the
+      // bidirectional exchange is visible in the meeting transcript.
+      discussion.push({
+        speaker: leader.name,
+        agent_id: leader.agent_id,
+        message: `Leader synthesis (from ${responseSummaries.length} member response(s)): ${synthesis}`,
+        type: 'decision',
+        timestamp: new Date().toISOString(),
+      });
+      meeting.discussion = discussion;
+    }
+
     meeting.decisions = [{
       topic: 'Mission activation',
       outcome: `${template.name}: ${ready}/${discussion.length} agents READY`,
       votes: Object.fromEntries(discussion.map(d => [d.agent_id, isReady(d.message) ? 'agree' : 'abstain'])) as Record<string, 'agree' | 'disagree' | 'abstain'>,
       confidence: discussion.length ? ready / discussion.length : 0,
-      rationale: 'Derived from real agent kickoff contributions (LLM-driven A2A discussion).',
+      rationale: synthesis
+        ? `Leader synthesis over ${memberResponses.length} drained A2A member response(s): ${synthesis}`
+        : 'Derived from real agent kickoff contributions (LLM-driven A2A discussion).',
     }];
     meeting.completed_at = new Date().toISOString();
     storeMeeting(meeting);

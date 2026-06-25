@@ -562,22 +562,31 @@ export function ProductStakeholdersView() {
 
 export function ProductWorkflowsView() {
   const setActiveSection = useProductStore((s) => s.setActiveSection);
+  const setSelectedSkillId = useProductStore((s) => s.setSelectedSkillId);
+  // `skillSlug` maps each card to a real Product skill (gateway product-skills-data),
+  // so the chosen workflow is carried into the Run view and pre-selects that skill.
+  // Mirrors the Marketing pattern (selectedWorkflowId set on card click, consumed by the run form).
   const workflows = [
-    { id: 'pw-1', icon: '📄', name: 'PRD Generator', description: 'Generate comprehensive PRDs from product brief', cluster: 'Discovery' },
-    { id: 'pw-2', icon: '🔬', name: 'User Research Plan', description: 'Create research plan with methodology selection', cluster: 'Discovery' },
-    { id: 'pw-3', icon: '🎯', name: 'Competitive Analysis', description: 'Deep competitive landscape analysis', cluster: 'Discovery' },
-    { id: 'pw-4', icon: '📦', name: 'Epic Breakdown', description: 'Break features into epics and user stories', cluster: 'Planning' },
-    { id: 'pw-5', icon: '🗺️', name: 'Roadmap Planning', description: 'AI-assisted quarterly roadmap planning', cluster: 'Planning' },
-    { id: 'pw-6', icon: '📊', name: 'Sprint Review Prep', description: 'Prepare sprint review with metrics and demos', cluster: 'Planning' },
-    { id: 'pw-7', icon: '🚀', name: 'Launch Checklist', description: 'Generate comprehensive launch checklist', cluster: 'Launch' },
-    { id: 'pw-8', icon: '📈', name: 'Stakeholder Report', description: 'Generate weekly/quarterly stakeholder updates', cluster: 'Communication' },
-    { id: 'pw-9', icon: '💬', name: 'Release Notes', description: 'Generate user-facing release notes from JIRA', cluster: 'Communication' },
-    { id: 'pw-10', icon: '🎯', name: 'OKR Setting', description: 'AI-assisted OKR creation and alignment', cluster: 'Strategy' },
-    { id: 'pw-11', icon: '📉', name: 'Churn Analysis', description: 'Analyze churn patterns and generate retention strategies', cluster: 'Strategy' },
-    { id: 'pw-12', icon: '💰', name: 'Pricing Analysis', description: 'Competitive pricing analysis and recommendations', cluster: 'Strategy' },
+    { id: 'pw-1', icon: '📄', name: 'PRD Generator', description: 'Generate comprehensive PRDs from product brief', cluster: 'Discovery', skillSlug: 'prd-generator' },
+    { id: 'pw-2', icon: '🔬', name: 'User Research Plan', description: 'Create research plan with methodology selection', cluster: 'Discovery', skillSlug: 'user-story-generator' },
+    { id: 'pw-3', icon: '🎯', name: 'Competitive Analysis', description: 'Deep competitive landscape analysis', cluster: 'Discovery', skillSlug: 'competitor-analysis-brief' },
+    { id: 'pw-4', icon: '📦', name: 'Epic Breakdown', description: 'Break features into epics and user stories', cluster: 'Planning', skillSlug: 'jira-epic-generator' },
+    { id: 'pw-5', icon: '🗺️', name: 'Roadmap Planning', description: 'AI-assisted quarterly roadmap planning', cluster: 'Planning', skillSlug: 'roadmap-builder' },
+    { id: 'pw-6', icon: '📊', name: 'Sprint Review Prep', description: 'Prepare sprint review with metrics and demos', cluster: 'Planning', skillSlug: 'stakeholder-update-generator' },
+    { id: 'pw-7', icon: '🚀', name: 'Launch Checklist', description: 'Generate comprehensive launch checklist', cluster: 'Launch', skillSlug: 'release-notes-generator' },
+    { id: 'pw-8', icon: '📈', name: 'Stakeholder Report', description: 'Generate weekly/quarterly stakeholder updates', cluster: 'Communication', skillSlug: 'stakeholder-update-generator' },
+    { id: 'pw-9', icon: '💬', name: 'Release Notes', description: 'Generate user-facing release notes from JIRA', cluster: 'Communication', skillSlug: 'release-notes-generator' },
+    { id: 'pw-10', icon: '🎯', name: 'OKR Setting', description: 'AI-assisted OKR creation and alignment', cluster: 'Strategy', skillSlug: 'brd-generator' },
+    { id: 'pw-11', icon: '📉', name: 'Churn Analysis', description: 'Analyze churn patterns and generate retention strategies', cluster: 'Strategy', skillSlug: 'customer-feedback-synthesizer' },
+    { id: 'pw-12', icon: '💰', name: 'Pricing Analysis', description: 'Competitive pricing analysis and recommendations', cluster: 'Strategy', skillSlug: 'competitor-analysis-brief' },
   ];
 
   const clusters = Array.from(new Set(workflows.map(w => w.cluster)));
+
+  const handleSelect = (skillSlug: string) => {
+    setSelectedSkillId(skillSlug);
+    setActiveSection('run');
+  };
 
   return (
     <div className="p-6 space-y-6">
@@ -591,7 +600,7 @@ export function ProductWorkflowsView() {
             <h3 className="text-sm font-bold text-slate-800 mb-3">{cluster}</h3>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {workflows.filter(w => w.cluster === cluster).map(wf => (
-                <button key={wf.id} onClick={() => setActiveSection('run')}
+                <button key={wf.id} onClick={() => handleSelect(wf.skillSlug)}
                   className="flex flex-col gap-1.5 p-3 rounded-lg border border-slate-100 bg-violet-50 hover:border-violet-300 hover:bg-white text-left transition-colors">
                   <span className="text-lg">{wf.icon}</span>
                   <span className="text-xs font-semibold text-slate-800">{wf.name}</span>

@@ -80,6 +80,7 @@ import { setBudget, getBudget, listBudgets, deleteBudget, recordSpend, getSpendL
 import { createReview, getReview, listReviews, createPlan, getPlan, listPlans, updatePlanStatus, updateObjective, submitFeedback, listFeedback, getFeedbackSummary, addExemplar, listExemplars, deleteExemplar, getAgentHealthReport, initImprovementStore } from './agent-improvement.js';
 import { registerStore, initGatewayPersistence, flushGatewayPersistence } from './gateway-persistence.js';
 import { approve as approveViaBus, reject as rejectViaBus, listPending as listPendingApprovals, getDecision as getApprovalDecision, getApprovalSlaSummary } from './approval-bus.js';
+import { getTenantId, withTenantContext, setTenantContext } from './tenant-middleware.js';
 import { createPolicy, updatePolicy, deletePolicy, getPolicy, listPolicies, checkPolicy, seedExamplePolicies } from './policy-store.js';
 import { redact as redactPII, containsPII } from './pii-redactor.js';
 import { contributeExecution, getContributionLog, getContributionStats } from './benchmark-ingest.js';
@@ -131,7 +132,7 @@ let pgPool: {
     connect(): Promise<{ query(...args: any[]): Promise<any>; release(): void }>;
 } | undefined;
 if (usePostgres) {
-    import('@agentos/db/postgres-store').then(m => m.getRawPool()).then(p => { pgPool = p as any; }).catch(() => {});
+    import('@agentos/db/postgres-store').then(m => m.getRawPool()).then(p => { pgPool = p as any; restoreAuditFromDb().catch(() => {}); }).catch(() => {});
 }
 const sessions = new SessionRepository(store);
 const executions = new ExecutionRepository(store);
@@ -299,6 +300,10 @@ const connectionStore = new Map<string, ConnectionRecord>();
 interface AuditEntry { id: string; timestamp: string; user: string; action: string; target: string; result: 'success' | 'failed' | 'warning'; detail?: string; prevHash?: string; hash?: string; }
 const auditLog: AuditEntry[] = [];
 const GENESIS_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+// The in-memory audit array is a rolling window; older entries live in the audit_log
+// table (authoritative under Postgres). auditAnchorHash is the hash of the entry just
+// before the window's first entry, so verifyAuditChain stays continuous across the boundary.
+let auditAnchorHash = GENESIS_HASH;
 function computeAuditHash(prevHash: string, entry: Omit<AuditEntry, 'hash'>): string {
     // Deterministic serialization (stable key order) prevents hash drift.
     const canonical = JSON.stringify({
@@ -308,7 +313,7 @@ function computeAuditHash(prevHash: string, entry: Omit<AuditEntry, 'hash'>): st
     return nodeCreateHash('sha256').update(canonical).digest('hex');
 }
 function recordAudit(user: string, action: string, target: string, result: AuditEntry['result'] = 'success', detail?: string): void {
-    const prevHash = auditLog.length > 0 ? (auditLog[auditLog.length - 1]!.hash ?? GENESIS_HASH) : GENESIS_HASH;
+    const prevHash = auditLog.length > 0 ? (auditLog[auditLog.length - 1]!.hash ?? GENESIS_HASH) : auditAnchorHash;
     const entry: AuditEntry = {
         id: `au-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
         timestamp: new Date().toISOString(),
@@ -321,6 +326,8 @@ function recordAudit(user: string, action: string, target: string, result: Audit
     // When in-memory hits 5000, flush oldest 1000 to DB rolling window.
     if (auditLog.length > 5000) {
         const toFlush = auditLog.splice(0, 1000);
+        // Advance the chain anchor so verifyAuditChain stays continuous past the flushed tail.
+        auditAnchorHash = toFlush[toFlush.length - 1]!.hash ?? auditAnchorHash;
         if (pgPool) {
             Promise.all(toFlush.map(e =>
                 pgPool!.query(
@@ -342,7 +349,7 @@ function recordAudit(user: string, action: string, target: string, result: Audit
 }
 /** Verify the entire hash chain. Returns { valid, brokenAt } for CISO inspection. */
 function verifyAuditChain(): { valid: boolean; brokenAt?: number; total: number } {
-    let prevHash = GENESIS_HASH;
+    let prevHash = auditAnchorHash;
     for (let i = 0; i < auditLog.length; i++) {
         const e = auditLog[i]!;
         const expected = computeAuditHash(prevHash, { id: e.id, timestamp: e.timestamp, user: e.user, action: e.action, target: e.target, result: e.result, detail: e.detail, prevHash });
@@ -360,10 +367,57 @@ registerStore('connections',
   () => Array.from(connectionStore.entries()).map(([id, rec]) => ({ id, ...rec })) as unknown as Record<string, unknown>[],
   (rows) => { connectionStore.clear(); for (const r of rows) { const { id, ...rest } = r as any; connectionStore.set(id, rest); } }
 );
+// File-backed fallback persistence (under Postgres, restoreAuditFromDb() below overrides
+// this with the authoritative audit_log table). The first row carries the chain anchor.
 registerStore('audit_log',
-  () => auditLog.map(e => ({ ...e })) as unknown as Record<string, unknown>[],
-  (rows) => { auditLog.length = 0; auditLog.push(...(rows as any[])); }
+  () => [{ __anchor__: auditAnchorHash } as unknown as Record<string, unknown>, ...auditLog.map(e => ({ ...e })) as unknown as Record<string, unknown>[]],
+  (rows) => {
+    auditLog.length = 0;
+    const arr = rows as any[];
+    if (arr.length > 0 && arr[0]!.__anchor__ !== undefined) {
+      auditAnchorHash = arr[0]!.__anchor__ || GENESIS_HASH;
+      auditLog.push(...arr.slice(1));
+    } else {
+      auditLog.push(...arr);
+    }
+  }
 );
+
+/**
+ * Postgres-authoritative audit restore: the audit_log table is the source of truth for the
+ * tamper-evident hash chain. Loads the recent window and sets the anchor from the entry just
+ * before it, so prior evidence stays visible and verifyAuditChain remains continuous after a
+ * restart. No-op (and harmless) when Postgres is not configured.
+ */
+async function restoreAuditFromDb(): Promise<void> {
+  if (!pgPool) return;
+  try {
+    const totalRes = await pgPool.query(`SELECT count(*)::int AS n FROM audit_log`);
+    const total = Number(totalRes.rows?.[0]?.n ?? 0);
+    if (total === 0) return;
+    const WINDOW = 5000;
+    const res = await pgPool.query(
+      `SELECT id, timestamp, user_id, action, resource_id, details, prev_hash, hash, result
+       FROM audit_log ORDER BY timestamp ASC, id ASC OFFSET $1`,
+      [Math.max(0, total - WINDOW)]
+    );
+    const restored: AuditEntry[] = (res.rows ?? []).map((r: any) => ({
+      id: r.id,
+      timestamp: typeof r.timestamp === 'string' ? r.timestamp : new Date(r.timestamp).toISOString(),
+      user: r.user_id, action: r.action, target: r.resource_id,
+      result: (r.result ?? 'success') as AuditEntry['result'],
+      detail: (() => { try { return typeof r.details === 'string' ? JSON.parse(r.details)?.detail : r.details?.detail; } catch { return undefined; } })(),
+      prevHash: r.prev_hash ?? undefined,
+      hash: r.hash ?? undefined,
+    }));
+    auditLog.length = 0;
+    auditLog.push(...restored);
+    auditAnchorHash = restored.length > 0 ? (restored[0]!.prevHash ?? GENESIS_HASH) : GENESIS_HASH;
+    console.log(`[audit] Restored ${restored.length} entries from audit_log table (authoritative source of truth)`);
+  } catch (err) {
+    console.error('[audit] restore from audit_log table failed:', err);
+  }
+}
 
 const courseStats = {
     totalCourses: 24,
@@ -880,12 +934,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 const keyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
                 if (pgPool) {
-                    await pgPool.query(
+                    const tenantId = getTenantId(authUser as any, headers);
+                    await withTenantContext(pgPool as any, tenantId, (client) => client.query(
                         `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, expires_at, created_at, tenant_id)
                          VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7)
                          ON CONFLICT (id) DO NOTHING`,
-                        [keyId, authUser.id, keyHash, keyPrefix, label, expiresAt, authUser.tenantId ?? 'default']
-                    );
+                        [keyId, authUser.id, keyHash, keyPrefix, label, expiresAt, tenantId]
+                    ));
                 }
                 sendJSON(res, 201, { id: keyId, rawKey, keyPrefix, label, expiresAt, warning: 'Save this key — it will not be shown again' });
             } catch (err) {
@@ -899,7 +954,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
             const keyId = path.split('/')[4];
             if (pgPool) {
-                await pgPool.query(`DELETE FROM api_keys WHERE id=$1 AND user_id=$2`, [keyId, authUser.id]);
+                const tenantId = getTenantId(authUser as any, headers);
+                await withTenantContext(pgPool as any, tenantId, (client) =>
+                    client.query(`DELETE FROM api_keys WHERE id=$1 AND user_id=$2`, [keyId, authUser.id]));
             }
             sendJSON(res, 200, { revoked: keyId });
             return;
@@ -918,6 +975,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                     const client = await pgPool.connect();
                     try {
                         await client.query('BEGIN');
+                        await setTenantContext(client as any, getTenantId(authUser as any, headers));
                         const existing = await client.query(`SELECT label, expires_at FROM api_keys WHERE id=$1 AND user_id=$2`, [keyId, authUser.id]);
                         if (existing.rowCount === 0) { await client.query('ROLLBACK'); sendJSON(res, 404, { error: 'Key not found' }); return; }
                         const { label, expires_at } = existing.rows[0];

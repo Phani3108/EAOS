@@ -1,6 +1,9 @@
 /**
- * WorkflowCanvas — Visual workflow builder and flagship workflow launcher.
- * Browse cross-functional workflow templates, visualize DAG steps, and launch executions.
+ * WorkflowCanvas — Read-only workflow templates viewer.
+ * Browse cross-functional workflow templates and visualize their DAG steps.
+ * This is a reference catalog: inputs are illustrative, and there is no
+ * flagship-run backend route, so it does not execute anything. To actually
+ * run a capability, head to the Skill Library.
  *
  * @author Phani Marupaka <https://linkedin.com/in/phani-marupaka>
  * @copyright © 2026 Phani Marupaka. All rights reserved.
@@ -117,18 +120,18 @@ export default function WorkflowCanvas() {
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h1 className="page-title">Workflow Canvas</h1>
-            <p className="page-subtitle">Cross-functional workflow templates — visualize, configure, and launch</p>
+            <h1 className="page-title">Workflow Templates</h1>
+            <p className="page-subtitle">Read-only catalog of cross-functional workflow templates — browse and visualize their step-by-step DAGs</p>
           </div>
-          <button onClick={() => setActiveSection('platform-swarms')} className="btn btn-secondary btn-sm">
-            View Active Swarms
+          <button onClick={() => setActiveSection('platform-skills')} className="btn btn-secondary btn-sm">
+            Open Skill Library
           </button>
         </div>
 
-        {isDemo && <DemoPreviewBanner pageName="Workflow Canvas" steps={[
+        {isDemo && <DemoPreviewBanner pageName="Workflow Templates" steps={[
           'Start the gateway to load live workflow templates from the API',
           'Select a workflow to visualize its step-by-step DAG with agent assignments',
-          'Click "Launch as Swarm" to execute the workflow with real agent collaboration',
+          'Open the Skill Library to actually run an adopted skill',
         ]} />}
 
         {/* Persona filter */}
@@ -185,8 +188,8 @@ export default function WorkflowCanvas() {
                         <p className="text-sm text-slate-500">{selected.description}</p>
                       </div>
                     </div>
-                    <button onClick={() => setActiveSection('platform-swarms')} className="btn btn-primary">
-                      Launch as Swarm
+                    <button onClick={() => setActiveSection('platform-skills')} className="btn btn-primary">
+                      Run in Skill Library
                     </button>
                   </div>
                   <div className="flex items-center gap-4 mt-4 text-xs text-slate-500">
@@ -251,20 +254,42 @@ export default function WorkflowCanvas() {
                   </div>
                 </div>
 
-                {/* Inputs */}
+                {/* Inputs — illustrative only (read-only template, not a live form) */}
                 <div className="card p-6">
-                  <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4">Required Inputs</h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Inputs This Template Expects</h3>
+                    <span className="badge badge-neutral text-[9px]">Illustrative · read-only</span>
+                  </div>
                   <div className="grid grid-cols-2 gap-3">
                     {selected.inputs.map(inp => (
-                      <div key={inp.id} className="p-3 rounded-lg bg-slate-50 border border-slate-200">
-                        <div className="flex items-center gap-2 mb-1">
-                          <span className="text-sm font-medium text-slate-800">{inp.label}</span>
-                          {inp.required && <span className="text-red-500 text-xs">*</span>}
-                        </div>
-                        <p className="text-[10px] text-slate-400">{inp.placeholder || inp.type}</p>
+                      <div key={inp.id} className="opacity-90">
+                        <label className="flex items-center gap-2 mb-1 text-sm font-medium text-slate-600">
+                          {inp.label}
+                          {inp.required && <span className="text-slate-400 text-xs">(required)</span>}
+                        </label>
+                        {inp.type === 'textarea' ? (
+                          <textarea
+                            disabled
+                            readOnly
+                            rows={2}
+                            placeholder={inp.placeholder || inp.type}
+                            className="w-full text-xs rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-slate-400 cursor-not-allowed resize-none"
+                          />
+                        ) : (
+                          <input
+                            disabled
+                            readOnly
+                            type="text"
+                            placeholder={inp.placeholder || inp.type}
+                            className="w-full text-xs rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-slate-400 cursor-not-allowed"
+                          />
+                        )}
                       </div>
                     ))}
                   </div>
+                  <p className="text-[10px] text-slate-400 mt-3">
+                    These fields are a preview of what a run would ask for. This page does not execute workflows — open the Skill Library to run an adopted skill.
+                  </p>
                 </div>
 
                 {/* Outputs */}
@@ -280,8 +305,8 @@ export default function WorkflowCanvas() {
             ) : (
               <div className="card p-12 text-center">
                 <span className="text-4xl block mb-4">🔄</span>
-                <h3 className="text-lg font-semibold text-slate-900 mb-2">Select a Workflow</h3>
-                <p className="text-sm text-slate-500">Choose a cross-functional workflow template to visualize its DAG and launch a swarm.</p>
+                <h3 className="text-lg font-semibold text-slate-900 mb-2">Select a Workflow Template</h3>
+                <p className="text-sm text-slate-500">Choose a cross-functional workflow template to visualize its step-by-step DAG.</p>
               </div>
             )}
           </div>

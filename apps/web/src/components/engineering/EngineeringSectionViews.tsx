@@ -528,22 +528,31 @@ export function EngineeringSecurityView() {
 
 export function EngineeringWorkflowsView() {
   const setActiveSection = useEngineeringStore((s) => s.setActiveSection);
+  const setSelectedSkillId = useEngineeringStore((s) => s.setSelectedSkillId);
+  // `skillSlug` maps each card to a real Engineering skill (gateway engineering-skills-data),
+  // so the chosen workflow is carried into the Run view and pre-selects that skill.
+  // Mirrors the Marketing pattern (selectedWorkflowId set on card click, consumed by the run form).
   const workflows = [
-    { id: 'ew-1', icon: '🔍', name: 'Automated Code Review', description: 'AI-powered PR review with security and style checks', cluster: 'Code Quality' },
-    { id: 'ew-2', icon: '🧪', name: 'Test Generation', description: 'Generate unit and integration tests from code', cluster: 'Code Quality' },
-    { id: 'ew-3', icon: '📝', name: 'API Documentation', description: 'Auto-generate API docs from OpenAPI specs', cluster: 'Code Quality' },
-    { id: 'ew-4', icon: '🚨', name: 'Incident Response', description: 'Automated incident triage and escalation', cluster: 'Operations' },
-    { id: 'ew-5', icon: '📊', name: 'Postmortem Generator', description: 'AI-drafted postmortem from incident data', cluster: 'Operations' },
-    { id: 'ew-6', icon: '🔄', name: 'Dependency Audit', description: 'Scan and update outdated dependencies', cluster: 'Operations' },
-    { id: 'ew-7', icon: '🏗️', name: 'Architecture Review', description: 'AI review of system architecture decisions', cluster: 'Architecture' },
-    { id: 'ew-8', icon: '📋', name: 'Sprint Planning', description: 'AI-assisted sprint planning and estimation', cluster: 'Planning' },
-    { id: 'ew-9', icon: '🎯', name: 'Tech Debt Prioritization', description: 'Score and prioritize tech debt items', cluster: 'Planning' },
-    { id: 'ew-10', icon: '🚀', name: 'Release Notes', description: 'Generate release notes from git history', cluster: 'Release' },
-    { id: 'ew-11', icon: '🛡️', name: 'Security Scan', description: 'SAST/DAST analysis with AI remediation', cluster: 'Security' },
-    { id: 'ew-12', icon: '⚡', name: 'Performance Profiling', description: 'Identify bottlenecks and optimization targets', cluster: 'Performance' },
+    { id: 'ew-1', icon: '🔍', name: 'Automated Code Review', description: 'AI-powered PR review with security and style checks', cluster: 'Code Quality', skillSlug: 'pr-review-assistant' },
+    { id: 'ew-2', icon: '🧪', name: 'Test Generation', description: 'Generate unit and integration tests from code', cluster: 'Code Quality', skillSlug: 'unit-test-generator' },
+    { id: 'ew-3', icon: '📝', name: 'API Documentation', description: 'Auto-generate API docs from OpenAPI specs', cluster: 'Code Quality', skillSlug: 'technical-documentation-generator' },
+    { id: 'ew-4', icon: '🚨', name: 'Incident Response', description: 'Automated incident triage and escalation', cluster: 'Operations', skillSlug: 'incident-rca-draft' },
+    { id: 'ew-5', icon: '📊', name: 'Postmortem Generator', description: 'AI-drafted postmortem from incident data', cluster: 'Operations', skillSlug: 'incident-rca-draft' },
+    { id: 'ew-6', icon: '🔄', name: 'Dependency Audit', description: 'Scan and update outdated dependencies', cluster: 'Operations', skillSlug: 'ci-failure-diagnosis' },
+    { id: 'ew-7', icon: '🏗️', name: 'Architecture Review', description: 'AI review of system architecture decisions', cluster: 'Architecture', skillSlug: 'architecture-summary-generator' },
+    { id: 'ew-8', icon: '📋', name: 'Sprint Planning', description: 'AI-assisted sprint planning and estimation', cluster: 'Planning', skillSlug: 'jira-ticket-breakdown' },
+    { id: 'ew-9', icon: '🎯', name: 'Tech Debt Prioritization', description: 'Score and prioritize tech debt items', cluster: 'Planning', skillSlug: 'codebase-explainer' },
+    { id: 'ew-10', icon: '🚀', name: 'Release Notes', description: 'Generate release notes from git history', cluster: 'Release', skillSlug: 'pr-summary-generator' },
+    { id: 'ew-11', icon: '🛡️', name: 'Security Scan', description: 'SAST/DAST analysis with AI remediation', cluster: 'Security', skillSlug: 'pr-review-assistant' },
+    { id: 'ew-12', icon: '⚡', name: 'Performance Profiling', description: 'Identify bottlenecks and optimization targets', cluster: 'Performance', skillSlug: 'ci-failure-diagnosis' },
   ];
 
   const clusters = Array.from(new Set(workflows.map(w => w.cluster)));
+
+  const handleSelect = (skillSlug: string) => {
+    setSelectedSkillId(skillSlug);
+    setActiveSection('run');
+  };
 
   return (
     <div className="p-6 space-y-6">
@@ -557,7 +566,7 @@ export function EngineeringWorkflowsView() {
             <h3 className="text-sm font-bold text-slate-800 mb-3">{cluster}</h3>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
               {workflows.filter(w => w.cluster === cluster).map(wf => (
-                <button key={wf.id} onClick={() => setActiveSection('run')}
+                <button key={wf.id} onClick={() => handleSelect(wf.skillSlug)}
                   className="flex flex-col gap-1.5 p-3 rounded-lg border border-slate-100 bg-slate-50 hover:border-slate-300 hover:bg-white text-left transition-colors">
                   <span className="text-lg">{wf.icon}</span>
                   <span className="text-xs font-semibold text-slate-800">{wf.name}</span>
