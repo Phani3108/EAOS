@@ -28,6 +28,7 @@ export interface AgentBudget {
   periodEnd: string;
   alertThresholdPct: number;       // alert when spend exceeds this % of allocated (default 80)
   alertFired: boolean;
+  overspendAlertFired: boolean;    // dedupe: overspend (>100%) alert fires once on transition
   createdAt: string;
   updatedAt: string;
 }
@@ -147,6 +148,7 @@ export function setBudget(input: {
     periodEnd,
     alertThresholdPct: input.alertThresholdPct ?? 80,
     alertFired: false,
+    overspendAlertFired: false,
     createdAt: existing?.createdAt ?? periodStart,
     updatedAt: periodStart,
   };
@@ -214,7 +216,9 @@ export function recordSpend(input: {
         message: `Agent ${budget.agentName} has consumed ${Math.round(pct)}% of its ${budget.period} budget ($${budget.spentUsd.toFixed(2)} / $${budget.allocatedUsd.toFixed(2)})`,
       });
     }
-    if (pct >= 100) {
+    if (pct >= 100 && !budget.overspendAlertFired) {
+      budget.overspendAlertFired = true;
+      persist(BUDGETS_TABLE, input.agentId, budget);
       createAlert({
         type: 'overspend',
         severity: 'critical',

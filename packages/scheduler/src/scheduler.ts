@@ -275,9 +275,15 @@ export class TaskScheduler {
     ): Array<{ task: SchedulableTask; score: number }> {
         const tenantCounts = new Map<string, number>();
 
+        // Compute the per-tenant cap ONCE up front from the distinct tenants in
+        // the candidate set. Deriving it from tenantCounts.size inside the loop
+        // would read a map that is mutated mid-iteration, making the cap
+        // meaningless and letting one tenant starve the others.
+        const distinctTenants = new Set(scored.map(s => s.task.tenantId)).size;
+        const maxPerTenant = Math.ceil(this.config.maxConcurrentTasks / Math.max(distinctTenants, 1));
+
         return scored.filter(({ task }) => {
             const count = tenantCounts.get(task.tenantId) ?? 0;
-            const maxPerTenant = Math.ceil(this.config.maxConcurrentTasks / (tenantCounts.size || 1));
 
             if (count >= maxPerTenant) return false;
             tenantCounts.set(task.tenantId, count + 1);

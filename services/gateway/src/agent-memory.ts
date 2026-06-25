@@ -39,6 +39,29 @@ const MAX_ENTRIES_PER_AGENT = 50;   // Keep memory bounded
 const memories = new Map<string, AgentMemoryEntry[]>();
 let backingStore: Store | null = null;
 
+/**
+ * Remove entries from the backing store when they leave the in-memory Map
+ * (eviction over the cap, or decay below threshold). Without this, Postgres
+ * rows accumulate and a restart re-inflates the Map past MAX_ENTRIES_PER_AGENT.
+ * The backing store's delete routes through its async path on Postgres.
+ */
+function deleteFromBackingStore(entries: AgentMemoryEntry[]): void {
+  if (!backingStore || entries.length === 0) return;
+  for (const entry of entries) {
+    try {
+      backingStore.delete(TABLE, entry.id);
+    } catch { /* non-fatal */ }
+  }
+}
+
+/** Cap a list of restored entries per agent: keep the most relevant. */
+function capEntries(entries: AgentMemoryEntry[]): AgentMemoryEntry[] {
+  if (entries.length <= MAX_ENTRIES_PER_AGENT) return entries;
+  return entries
+    .sort((a, b) => b.relevance - a.relevance || b.timestamp.localeCompare(a.timestamp))
+    .slice(0, MAX_ENTRIES_PER_AGENT);
+}
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -55,6 +78,11 @@ export function initAgentMemory(store: Store): void {
       const existing = memories.get(entry.agentId) ?? [];
       existing.push(entry);
       memories.set(entry.agentId, existing);
+    }
+    // Cap restored entries per agent (most relevant kept) so a bloated backing
+    // store can't re-inflate the Map past MAX_ENTRIES_PER_AGENT.
+    for (const [agentId, entries] of memories) {
+      memories.set(agentId, capEntries(entries));
     }
     if (rows.length > 0) {
       console.log(`[agent-memory] Restored ${rows.length} memory entries for ${memories.size} agents`);
@@ -93,7 +121,10 @@ export function recordAgentMemory(
   // Evict oldest low-relevance entries if over limit
   if (entries.length > MAX_ENTRIES_PER_AGENT) {
     entries.sort((a, b) => b.relevance - a.relevance || b.timestamp.localeCompare(a.timestamp));
-    entries.length = MAX_ENTRIES_PER_AGENT;
+    const evicted = entries.splice(MAX_ENTRIES_PER_AGENT);
+    // Drop evicted entries from the backing store too — otherwise Postgres rows
+    // accumulate past the cap and a restore re-inflates the in-memory Map.
+    deleteFromBackingStore(evicted);
   }
 
   memories.set(agentId, entries);
@@ -210,8 +241,13 @@ export function decayMemories(decayFactor: number = 0.95): void {
     for (const entry of entries) {
       entry.relevance *= decayFactor;
     }
-    // Remove entries below threshold
+    // Remove entries below threshold — and delete them from the backing store
+    // too, so decayed rows don't linger in Postgres and get re-restored.
     const filtered = entries.filter(e => e.relevance > 0.1);
+    if (filtered.length !== entries.length) {
+      const dropped = entries.filter(e => e.relevance <= 0.1);
+      deleteFromBackingStore(dropped);
+    }
     memories.set(agentId, filtered);
   }
 }
@@ -250,5 +286,10 @@ export function _importData(rows: Record<string, unknown>[]): void {
     const existing = memories.get(entry.agentId) ?? [];
     existing.push(entry);
     memories.set(entry.agentId, existing);
+  }
+  // Cap restored entries per agent (most relevant kept) so a bloated backing
+  // store can't re-inflate the Map past MAX_ENTRIES_PER_AGENT.
+  for (const [agentId, entries] of memories) {
+    memories.set(agentId, capEntries(entries));
   }
 }

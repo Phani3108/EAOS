@@ -160,10 +160,21 @@ export class PostgresStore implements Store {
     void this.insertAsync(table, id, data);
   }
 
-  get(table: string, id: string): Record<string, unknown> | undefined {
-    // Sync interface — kick off async, return undefined for initial call.
-    // The repositories should use getAsync for real queries.
-    return undefined;
+  /**
+   * Marker the gateway-persistence layer checks to detect that this store
+   * cannot answer reads synchronously and must be routed through the async
+   * methods (getAsync / queryAsync / allAsync). Always true for PostgresStore;
+   * absent on SqliteStore / InMemoryStore / PersistentStore.
+   */
+  readonly isAsync = true as const;
+
+  get(_table: string, _id: string): Record<string, unknown> | undefined {
+    // Sync reads cannot run pg queries. Returning undefined silently would
+    // make callers (e.g. gateway-persistence restore) no-op. Fail loudly so
+    // they switch to getAsync().
+    throw new Error(
+      'PostgresStore.get() is not supported — use getAsync() for async Postgres reads',
+    );
   }
 
   update(table: string, id: string, data: Partial<Record<string, unknown>>): void {
@@ -174,14 +185,21 @@ export class PostgresStore implements Store {
     void this.deleteAsync(table, id);
   }
 
-  query(table: string, filter: (row: Record<string, unknown>) => boolean): Record<string, unknown>[] {
-    // Sync interface — returns empty for initial call.
-    return [];
+  query(_table: string, _filter: (row: Record<string, unknown>) => boolean): Record<string, unknown>[] {
+    // Sync reads cannot run pg queries. Fail loudly rather than returning []
+    // (which silently no-ops callers). Use queryAsync() instead.
+    throw new Error(
+      'PostgresStore.query() is not supported — use queryAsync() for async Postgres reads',
+    );
   }
 
-  all(table: string): Record<string, unknown>[] {
-    // Sync interface — returns empty for initial call.
-    return [];
+  all(_table: string): Record<string, unknown>[] {
+    // Sync reads cannot run pg queries. Returning [] here silently no-ops the
+    // gateway-persistence restore + delete-before-insert path. Fail loudly so
+    // callers route through allAsync() instead.
+    throw new Error(
+      'PostgresStore.all() is not supported — use allAsync() for async Postgres reads',
+    );
   }
 
   // -----------------------------------------------------------------------

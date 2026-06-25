@@ -98,6 +98,9 @@ export class ModelRouter {
             // Check latency constraint
             if (request.maxLatencyMs && m.avgLatencyMs > request.maxLatencyMs) return false;
 
+            // Check per-request cost ceiling
+            if (request.maxCostUsd && this.estimateCost(m, request) > request.maxCostUsd) return false;
+
             return true;
         });
 
@@ -127,6 +130,33 @@ export class ModelRouter {
 
         // Sort by score descending
         scored.sort((a, b) => b.score - a.score);
+
+        // If we're at or over the hourly cost budget, do not pick the
+        // highest-scoring (potentially expensive) model — force the cheapest
+        // eligible model instead. A zero/unset budget disables this guard.
+        if (
+            this.config.costBudgetPerHourUsd > 0 &&
+            this.getHourlyCost() >= this.config.costBudgetPerHourUsd
+        ) {
+            const cheapest = scored.reduce((a, b) => (b.cost < a.cost ? b : a));
+            return {
+                modelId: cheapest.model.id,
+                modelName: cheapest.model.name,
+                provider: cheapest.model.provider,
+                estimatedCostUsd: cheapest.cost,
+                estimatedLatencyMs: cheapest.model.avgLatencyMs,
+                qualityScore: cheapest.model.qualityScore,
+                reason: 'Hourly cost budget reached — selecting cheapest eligible model',
+                alternatives: scored
+                    .filter((s) => s.model.id !== cheapest.model.id)
+                    .slice(0, 3)
+                    .map((s) => ({
+                        modelId: s.model.id,
+                        score: s.score,
+                        reason: `Cost: $${s.cost.toFixed(4)}, Quality: ${s.model.qualityScore}, Latency: ${s.model.avgLatencyMs}ms`,
+                    })),
+            };
+        }
 
         const best = scored[0];
         const alternatives = scored.slice(1, 4).map((s) => ({
