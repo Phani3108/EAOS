@@ -475,6 +475,12 @@ const SKILL_CATALOG = [
 // ---------------------------------------------------------------------------
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    // Vercel mounts this gateway service at routePrefix /_/gateway (see vercel.json).
+    // Strip the prefix from req.url up front so every downstream URL derivation + route
+    // match sees the bare /api/... path — whether or not the platform already stripped it.
+    if (req.url && (req.url === '/_/gateway' || req.url.startsWith('/_/gateway/'))) {
+        req.url = req.url.slice('/_/gateway'.length) || '/';
+    }
     const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
     const path = url.pathname;
     const method = req.method ?? 'GET';

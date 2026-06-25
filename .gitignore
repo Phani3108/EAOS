@@ -12,6 +12,7 @@ build/
 .env
 .env.*
 !.env.example
+!apps/web/.env.production
 
 # IDE
 .vscode/
