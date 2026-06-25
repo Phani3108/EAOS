@@ -118,86 +118,6 @@ docker compose -f deploy/docker-compose.production.yml up -d
 
 ---
 
-## 🌟 Features
-
-### 🔧 Core Platform
-- 🤖 **53 Autonomous Agents** across 5 regiments
-- 🪖 **Military Hierarchy** — General → Field Marshal → Colonel → Captain → Corporal
-- 🛣️ **150+ API Routes** — fully implemented backend with real persistence
-- 🔐 **JWT Authentication** — role-based access with persona gating
-- 📡 **Event Bus** — in-process pub/sub with pattern matching & dispatch
-- 🔄 **WebSocket Streaming** — live execution updates pushed to UI
-- 💾 **Three-Tier Persistence** — File-backed JSON · PostgreSQL · In-Memory
-
-### 👔 C-Suite & Vision Layer
-- 🎯 **C-Suite Command Center** — CEO, CMO, CTO, CPO, CHRO command their regiments
-- 🧠 **Vision & Strategy** — LLM-powered vision decomposition into objectives
-- 📥 **Cascading** — objectives flow C-Suite → regiment → agents
-- 📋 **PMO Dashboard** — cross-regiment status rollups & program management
-
-### 🏢 Persona Hubs
-- 📣 **Marketing** — 30 workflows: Campaign · Content · Creative · Event · Research · Analytics
-- 🛠️ **Engineering** — PR Review · Unit Tests · Incident RCA · Architecture Review · 6 more
-- 📐 **Product** — PRD Generator · Jira Epics · User Stories · Roadmaps · 6 more
-- 🧑‍💼 **HR & Talent** — Recruiting · onboarding · performance reviews · talent analytics
-
-### 🧪 Innovation Labs
-- 🔬 **Experiment Sandbox** — create, activate, evaluate, graduate experiments
-- ⏱️ **Hackathon Mode** — time-boxed innovation sprints
-- 🎓 **Graduation Pipeline** — promote successful experiments to production
-
-### 💰 Budget & Cost Intelligence
-- 🪙 **Per-Agent Budgets** — monthly · quarterly · annual allocation
-- 📊 **Spend Tracking** — every API call logged with cost, tokens, model, latency
-- 🔥 **Burn Rate Analysis** — daily/weekly averages, month-end projections
-- 🚨 **Cost Alerts** — threshold, overspend, spike alerts with severity levels
-- 🧮 **CFO Dashboard** — total spend, by-regiment breakdown, top spenders
-
-### 📈 Agent Training & Continuous Improvement
-- ⭐ **Performance Reviews** — reliability · efficiency · quality · collaboration · cost
-- 🎯 **Improvement Plans** — objective-based with metric tracking & auto-completion
-- 💬 **Feedback Loops** — positive/negative/correction with sentiment trends
-- 📚 **Training Exemplars** — curated executions for agent learning
-- 🩺 **Health Reports** — agents needing attention, outcome distributions
-
-### 🔔 Notifications & Webhooks
-- 📨 **Multi-Channel Dispatch** — Slack · Teams · Email · Webhook
-- 🧠 **Rule Engine** — trigger-based notification routing
-- 🔗 **Webhook Connector** — inbound/outbound with HMAC-SHA256 signatures
-- 📜 **Delivery Logs** — full audit trail of every notification
-
-### 🛠️ Platform Operations
-- 🛒 **Skill Marketplace** — CRUD with voting, comments, analytics, governance
-- ⏰ **Scheduler** — cron · interval · event-driven · one-time jobs
-- 💬 **Discussion Forum** — threaded conversations with voting & answer acceptance
-- ✍️ **Blog Editor** — publish, manage, track engagement
-- 📚 **Prompt Library** — fork, pin, upvote curated prompts
-- 🔌 **Tool Registry** — manage external connections with OAuth & API key auth
-
-### 🤝 Collaboration, Skills & Integration
-- 🧩 **Skill Library** — adopted, file-defined EAOS skills runnable from the UI (`POST /api/skills/fs/execute`)
-- 🏛️ **Regiment Review** — Strategy → Design → Engineering → DevEx review chain over shared context
-- 🔌 **Real MCP Client** — `@modelcontextprotocol/sdk` over stdio + HTTP, dynamic tool discovery, graceful fallback
-- 🐝 **A2A Swarms** — ephemeral agent swarms with a real LLM discussion thread and inbox
-- 🧠 **Adopted Orchestration** — deer-flow Orchestrator prompt (live in the swarm path) + AgentMemory schema
-
-### 🎨 Experience & Onboarding
-- 🎬 **Guided First-Run** — connect LLM → connect tool → run first skill, with a celebration on completion
-- 📖 **Storytelling Home** — animated "How EAOS Works" flow + a real-progress Get-Started checklist
-- 🌗 **Dark Mode** — full light/dark theming that honors `prefers-color-scheme`
-- 🔔 **Toast Notifications** — non-blocking feedback replacing modal alerts, with a persistent bell history
-- 🧭 **Guided Tour** — spotlight walkthrough with resolved anchors across the app
-
-### 🔍 Observability, Governance & Security
-- 🧾 **Audit Trail** — every action, handoff, decision logged immutably
-- 💸 **Cost Attribution** — per-persona · per-agent · per-task breakdown
-- 🔬 **Execution Traces** — token usage, latency, confidence metrics
-- 📑 **After-Action Reports** — auto-generated per workflow execution
-- 🔐 **Production Hardening** — OIDC JWKS id-token verification · mandatory JWT in prod · IDOR-scoped execution reads · CORS allowlist · safe expression evaluator (no `new Function`)
-- 🧪 **Skill-Scan Gate** — SkillSpector-backed scan blocks malicious skills at registration (`POST /api/skills/scan`)
-
----
-
 ## 🧱 Tech Stack
 
 | Layer | Technology |
@@ -235,26 +155,6 @@ EAOS/
 ├── 🔌 mcp.servers.json         # MCP server registry (stdio + HTTP)
 └── 📸 docs/screenshots/        # App screenshots
 ```
-
----
-
-## 🎬 Running the App
-
-Start the Gateway API and Frontend in two terminals:
-
-```bash
-# 🛣️ Terminal 1 — Gateway API (port 3000)
-cd services/gateway
-npx tsx src/server.ts
-
-# 🎨 Terminal 2 — Frontend (port 3010)
-cd apps/web
-pnpm dev
-```
-
-🌐 Open [http://localhost:3010](http://localhost:3010)
-
-> 👋 First time? A storytelling Home greets you with a **Get Started** checklist and a guided **"Run my first skill"** flow (connect an LLM → connect a tool → run a skill → celebrate). Replay it — or the guided tour — anytime from **Settings → Help & Learning**, and toggle **dark mode** in **Settings → Appearance**. ⌨️ Arrow keys navigate · Esc skips · Enter advances.
 
 ---
 
