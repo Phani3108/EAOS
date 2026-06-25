@@ -572,6 +572,19 @@ function EngSkillsContent() {
   const [showAgents, setShowAgents] = useState(true);
   const [pendingSkillSlug, setPendingSkillSlug] = useState<string | null>(null);
   const cmdRef = useRef<HTMLDivElement>(null);
+  const selectedSkillId = useEngineeringStore((s) => s.selectedSkillId);
+  const setSelectedSkillId = useEngineeringStore((s) => s.setSelectedSkillId);
+
+  // A workflow card (e.g. from the Workflows view) requested a specific skill —
+  // seed the CommandCenter with it, then clear the store so re-visiting the Run
+  // tab later doesn't force a re-selection. The store value takes precedence
+  // over the agent-browser "Run skill" flow without breaking it.
+  useEffect(() => {
+    if (selectedSkillId) {
+      setPendingSkillSlug(selectedSkillId);
+      setSelectedSkillId(null);
+    }
+  }, [selectedSkillId, setSelectedSkillId]);
 
   const handleRunSkill = (slug: string) => {
     setPendingSkillSlug(slug);
