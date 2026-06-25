@@ -21,6 +21,7 @@ import { eventBus } from './event-bus.js';
 import { enqueue as taskEnqueue, type PersonaId as QueuePersonaId } from './task-queue.js';
 import { getAgentIdentity, getAgentsByPersona, validateHandoff, type AgentIdentity } from './agent-registry.js';
 import { buildAgentMemoryContext, extractAndStoreMemory, initAgentMemory } from './agent-memory.js';
+import { waitForApproval } from './approval-bus.js';
 import type { Store } from './db.js';
 
 // ---------------------------------------------------------------------------
@@ -32,7 +33,7 @@ export interface PersonaExecutionRecord {
   persona: 'engineering' | 'product' | 'hr' | 'marketing';
   skillId: string;
   skillName: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'paused' | 'completed' | 'failed';
   /** Sequential (default) or DAG-based execution */
   executionMode?: 'sequential' | 'dag';
   provider?: LLMProviderId;
@@ -1345,26 +1346,8 @@ async function executeSingleStep(
       extractAndStoreMemory(agentIdentity.id, exec.id, skillStep.name, output);
     }
 
-    stepRecord.status = skillStep.requiresApproval ? 'approval_required' : 'completed';
-    stepRecord.completedAt = new Date().toISOString();
     stepRecord.outputKey = skillStep.outputKey;
     stepRecord.outputPreview = output.slice(0, 300);
-
-    // ── MCP: Record tool call if step uses a non-LLM tool ──
-    if (skillStep.tool && skillStep.tool !== 'Claude' && !simulate) {
-      try {
-        const mcpAction = createMCPAction({
-          tool_id: skillStep.tool.toLowerCase().replace(/\s+/g, '-'),
-          action: 'execute' as any,
-          resource_type: 'skill-step',
-          params: { stepName: skillStep.name, outputPreview: output.slice(0, 500) },
-          task_ref: exec.utcpTaskId || exec.id,
-          agent_id: resolvedAgentId,
-          step_index: exec.steps.indexOf(stepRecord),
-        });
-        await executeMCPAction(mcpAction);
-      } catch {}
-    }
 
     // ── A2A: Approval request if step requires human approval ──
     if (skillStep.requiresApproval) {
@@ -1380,6 +1363,52 @@ async function executeSingleStep(
         storeMessage(approvalMsg);
       } catch {}
     }
+
+    // ── Human-in-the-loop gate ──
+    // Real executions PAUSE here until a human approves/rejects via
+    // POST /api/executions/:id/{approve,reject}/:stepId (resolved through the
+    // approval bus). The background pipeline blocks, so dependent steps do not
+    // run and the side-effecting tool call below is gated behind approval.
+    // Simulation mode never blocks (no human to approve) — it surfaces the
+    // approval state for the UI and proceeds.
+    if (skillStep.requiresApproval && !simulate) {
+      stepRecord.status = 'approval_required';
+      exec.status = 'paused';
+      persistExec(exec);
+      const decision = await waitForApproval(exec.id, stepRecord.stepId, {
+        stepName: skillStep.name,
+        requesterId: resolvedAgentId,
+      });
+      if (!decision.approved) {
+        stepRecord.status = 'rejected';
+        stepRecord.error = decision.reason ?? 'Rejected by approver';
+        stepRecord.completedAt = new Date().toISOString();
+        exec.status = 'running';
+        persistExec(exec);
+        eventBus.emit('execution.step.completed', { execId: exec.id, stepId: skillStep.id, agent: resolvedAgentId, status: 'rejected' }).catch(() => {});
+        return { tokenCost, latencyMs, qualityScore };
+      }
+      exec.status = 'running';
+    }
+
+    // ── MCP: Record tool call if step uses a non-LLM tool (gated behind approval) ──
+    if (skillStep.tool && skillStep.tool !== 'Claude' && !simulate) {
+      try {
+        const mcpAction = createMCPAction({
+          tool_id: skillStep.tool.toLowerCase().replace(/\s+/g, '-'),
+          action: 'execute' as any,
+          resource_type: 'skill-step',
+          params: { stepName: skillStep.name, outputPreview: output.slice(0, 500) },
+          task_ref: exec.utcpTaskId || exec.id,
+          agent_id: resolvedAgentId,
+          step_index: exec.steps.indexOf(stepRecord),
+        });
+        await executeMCPAction(mcpAction);
+      } catch {}
+    }
+
+    stepRecord.status = skillStep.requiresApproval && simulate ? 'approval_required' : 'completed';
+    stepRecord.completedAt = new Date().toISOString();
 
     // ── Event Bus: Step completed ──
     eventBus.emit('execution.step.completed', { execId: exec.id, stepId: skillStep.id, agent: resolvedAgentId, status: stepRecord.status }).catch(() => {});

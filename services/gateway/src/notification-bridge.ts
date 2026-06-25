@@ -36,12 +36,23 @@ export function wireNotificationBridge(): void {
     );
   });
 
-  // Step approval needed
-  eventBus.on('step.approval_needed', async (event) => {
+  // Step approval needed — the approval bus emits 'approval.requested' when a step
+  // blocks on waitForApproval(); we map it to the 'step.approval_needed' dispatch trigger.
+  eventBus.on('approval.requested', async (event) => {
     await dispatchByTrigger(
       'step.approval_needed',
-      `Approval needed: ${event.data.stepName ?? 'Step'} in ${event.data.skillName ?? 'execution'}`,
-      `Agent ${event.data.agentCallSign ?? event.data.agent ?? 'Unknown'} requires your approval to proceed.`,
+      `Approval needed: ${event.data.stepName ?? 'Step'}`,
+      `Agent ${event.data.requesterId ?? 'an agent'} requires your approval to proceed (execution ${event.data.execId ?? ''}).`,
+      event.data,
+    );
+  });
+
+  // Approval SLA breached — still pending after its SLA window.
+  eventBus.on('approval.sla_breached', async (event) => {
+    await dispatchByTrigger(
+      'step.approval_needed',
+      `Approval SLA breached: ${event.data.stepName ?? 'Step'}`,
+      `An approval for execution ${event.data.execId ?? ''} has been pending beyond its SLA window.`,
       event.data,
     );
   });
