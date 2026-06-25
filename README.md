@@ -1,8 +1,12 @@
 # 🧠 Enterprise Agent OS (EAOS)
 
-> 🚀 **The AI Operating System for Enterprise Teams** — 53 autonomous agents across 5 regiments, orchestrating work through 6 persona workspaces with full governance, observability, and cost control.
+> 🚀 **Envisioning how future enterprises will run — with AI agents doing the work humans do today.**
+>
+> EAOS models a company as an **organization of AI agents**: a C-suite that sets direction, five regiments that execute, and a governance layer that keeps every decision auditable — so work flows from **intent to outcome** without a human driving each step.
 
-EAOS is a **control plane for enterprise work**. Agents think, decide, and orchestrate. Tools execute. Workflows structure. It doesn't replace your tools — it **orchestrates them through intelligent multi-agent collaboration**.
+EAOS is a **control plane for enterprise work**. You describe the outcome in plain language; an organization of agents decomposes it, routes it to the right specialists, executes it through your real tools, and hands back a reviewed, traceable result. It doesn't replace your tools — it **orchestrates** them: agents think and decide, skills and tools execute, workflows give structure, and humans stay in control through approvals and audit.
+
+**Why it matters:** today software waits for a human to operate it. EAOS flips that — describe a goal, not a sequence of clicks; get an organization of agents, not a single chatbot; keep your tools and your governance. It runs in a safe **simulation mode** out of the box, and goes live the moment you add an API key.
 
 > 🧩 *Think: "Kubernetes for Enterprise Workflows"* — Agents = Pods · Skills = Containers · Workflows = Deployments · MCP = Service Mesh · UTCP = API Schema.
 
@@ -34,17 +38,18 @@ EAOS is a **control plane for enterprise work**. Agents think, decide, and orche
 
 ---
 
-## 🧬 Core Loop
+## 🧬 How It Works
 
 ```
-User Intent → Intent Engine → Workflow Selection → Agent Orchestration (A2A)
-   → Tool Execution (MCP) → Output Aggregation → Human Approval → Memory
+You state a goal
+  → Intent Engine selects the workflow
+    → Agents collaborate (A2A) and run skills
+      → Tools execute the work (MCP)
+        → Outputs are aggregated and reviewed
+          → Human approves → Memory + after-action report
 ```
 
-```
-Vision → Decomposition → Cascading → Agent Assignment → Skill Execution
-   → Output Aggregation → Human Review → After-Action Reports → Learning
-```
+Vision-level goals are **decomposed** by the C-suite and **cascaded** down through regiments to individual agents — the same loop scales from a single skill run to a cross-functional swarm.
 
 ---
 
