@@ -1,9 +1,8 @@
 /**
- * WorkflowCanvas — Read-only workflow templates viewer.
- * Browse cross-functional workflow templates and visualize their DAG steps.
- * This is a reference catalog: inputs are illustrative, and there is no
- * flagship-run backend route, so it does not execute anything. To actually
- * run a capability, head to the Skill Library.
+ * WorkflowCanvas — Cross-functional workflow launcher.
+ * Browse flagship workflow templates, visualize their DAG, supply inputs, and
+ * run them via POST /api/workflows/flagship/:id/run. Steps execute in order;
+ * requiresApproval steps pause on the approval bus. Live step progress is shown.
  *
  * @author Phani Marupaka <https://linkedin.com/in/phani-marupaka>
  * @copyright © 2026 Phani Marupaka. All rights reserved.
@@ -97,6 +96,10 @@ export default function WorkflowCanvas() {
   const [selected, setSelected] = useState<WorkflowTemplate | null>(null);
   const [filterPersona, setFilterPersona] = useState<string | null>(null);
   const [isDemo, setIsDemo] = useState(false);
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [running, setRunning] = useState(false);
+  const [runError, setRunError] = useState<string | null>(null);
+  const [exec, setExec] = useState<{ id: string; status: string; steps: { stepName?: string; name?: string; status: string }[] } | null>(null);
 
   useEffect(() => {
     fetch(`${API}/api/workflows/flagship`)
@@ -107,6 +110,34 @@ export default function WorkflowCanvas() {
       })
       .catch(() => { setWorkflows(DEMO_WORKFLOWS); setSelected(DEMO_WORKFLOWS[0]); setIsDemo(true); });
   }, []);
+
+  // Reset the run form/state when a different template is selected.
+  useEffect(() => { setInputs({}); setExec(null); setRunError(null); setRunning(false); }, [selected?.id]);
+
+  const runWorkflow = async () => {
+    if (!selected) return;
+    setRunning(true); setRunError(null); setExec(null);
+    try {
+      const res = await fetch(`${API}/api/workflows/flagship/${selected.id}/run`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ inputs }),
+      });
+      if (!res.ok) throw new Error(`Run failed (${res.status})`);
+      const { execution } = await res.json();
+      const id = execution.id as string;
+      setExec({ id, status: execution.status, steps: execution.steps ?? [] });
+      const poll = setInterval(async () => {
+        try {
+          const e = await fetch(`${API}/api/executions/${id}`).then(r => r.json()).then(d => d.execution);
+          if (!e) return;
+          setExec({ id, status: e.status, steps: e.steps ?? [] });
+          if (['completed', 'failed'].includes(e.status)) { clearInterval(poll); setRunning(false); }
+        } catch { /* keep polling */ }
+      }, 1500);
+    } catch (err) {
+      setRunError(err instanceof Error ? err.message : 'Run failed'); setRunning(false);
+    }
+  };
 
   const filtered = filterPersona
     ? workflows.filter(w => w.personas.includes(filterPersona))
@@ -120,18 +151,18 @@ export default function WorkflowCanvas() {
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h1 className="page-title">Workflow Templates</h1>
-            <p className="page-subtitle">Read-only catalog of cross-functional workflow templates — browse and visualize their step-by-step DAGs</p>
+            <h1 className="page-title">Workflow Canvas</h1>
+            <p className="page-subtitle">Browse cross-functional workflows, visualize their DAG, supply inputs, and run them end-to-end</p>
           </div>
           <button onClick={() => setActiveSection('platform-skills')} className="btn btn-secondary btn-sm">
             Open Skill Library
           </button>
         </div>
 
-        {isDemo && <DemoPreviewBanner pageName="Workflow Templates" steps={[
-          'Start the gateway to load live workflow templates from the API',
+        {isDemo && <DemoPreviewBanner pageName="Workflow Canvas" steps={[
+          'Start the gateway to load live workflows and enable Run',
           'Select a workflow to visualize its step-by-step DAG with agent assignments',
-          'Open the Skill Library to actually run an adopted skill',
+          'Fill the inputs and click Run Workflow to execute it (steps run in order; approval gates pause)',
         ]} />}
 
         {/* Persona filter */}
@@ -188,8 +219,8 @@ export default function WorkflowCanvas() {
                         <p className="text-sm text-slate-500">{selected.description}</p>
                       </div>
                     </div>
-                    <button onClick={() => setActiveSection('platform-skills')} className="btn btn-primary">
-                      Run in Skill Library
+                    <button onClick={() => setActiveSection('platform-skills')} className="btn btn-secondary btn-sm">
+                      Skill Library
                     </button>
                   </div>
                   <div className="flex items-center gap-4 mt-4 text-xs text-slate-500">
@@ -254,42 +285,55 @@ export default function WorkflowCanvas() {
                   </div>
                 </div>
 
-                {/* Inputs — illustrative only (read-only template, not a live form) */}
+                {/* Inputs + Run */}
                 <div className="card p-6">
-                  <div className="flex items-center justify-between mb-4">
-                    <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Inputs This Template Expects</h3>
-                    <span className="badge badge-neutral text-[9px]">Illustrative · read-only</span>
-                  </div>
+                  <h3 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-4">Inputs</h3>
                   <div className="grid grid-cols-2 gap-3">
                     {selected.inputs.map(inp => (
-                      <div key={inp.id} className="opacity-90">
-                        <label className="flex items-center gap-2 mb-1 text-sm font-medium text-slate-600">
+                      <div key={inp.id} className={inp.type === 'textarea' ? 'col-span-2' : ''}>
+                        <label className="flex items-center gap-2 mb-1 text-sm font-medium text-slate-700">
                           {inp.label}
                           {inp.required && <span className="text-slate-400 text-xs">(required)</span>}
                         </label>
                         {inp.type === 'textarea' ? (
                           <textarea
-                            disabled
-                            readOnly
-                            rows={2}
-                            placeholder={inp.placeholder || inp.type}
-                            className="w-full text-xs rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-slate-400 cursor-not-allowed resize-none"
+                            value={inputs[inp.id] ?? ''}
+                            onChange={e => setInputs(v => ({ ...v, [inp.id]: e.target.value }))}
+                            rows={3}
+                            placeholder={inp.placeholder || ''}
+                            className="w-full text-sm rounded-lg bg-white border border-slate-200 px-3 py-2 text-slate-900 outline-none focus:border-blue-400 resize-y"
                           />
                         ) : (
                           <input
-                            disabled
-                            readOnly
+                            value={inputs[inp.id] ?? ''}
+                            onChange={e => setInputs(v => ({ ...v, [inp.id]: e.target.value }))}
                             type="text"
-                            placeholder={inp.placeholder || inp.type}
-                            className="w-full text-xs rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-slate-400 cursor-not-allowed"
+                            placeholder={inp.placeholder || ''}
+                            className="w-full text-sm rounded-lg bg-white border border-slate-200 px-3 py-2 text-slate-900 outline-none focus:border-blue-400"
                           />
                         )}
                       </div>
                     ))}
                   </div>
-                  <p className="text-[10px] text-slate-400 mt-3">
-                    These fields are a preview of what a run would ask for. This page does not execute workflows — open the Skill Library to run an adopted skill.
-                  </p>
+                  <div className="flex items-center gap-3 mt-4 flex-wrap">
+                    <button onClick={runWorkflow} disabled={running || isDemo} className="btn btn-primary disabled:opacity-40">
+                      {running ? 'Running…' : '▶ Run Workflow'}
+                    </button>
+                    {isDemo && <span className="text-xs text-amber-600">Start the gateway to run live workflows.</span>}
+                    {runError && <span className="text-xs text-red-600">{runError}</span>}
+                    {exec && <span className="text-xs text-slate-500">Execution status: <span className="font-medium text-slate-700">{exec.status}</span></span>}
+                  </div>
+                  {exec && exec.steps.length > 0 && (
+                    <div className="mt-4 space-y-1.5 border-t border-slate-100 pt-3">
+                      {exec.steps.map((s, i) => (
+                        <div key={i} className="flex items-center gap-2 text-xs">
+                          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${s.status === 'completed' ? 'bg-emerald-500' : s.status === 'running' ? 'bg-blue-500 animate-pulse' : s.status === 'approval_required' ? 'bg-amber-500' : s.status === 'failed' ? 'bg-red-500' : 'bg-slate-300'}`} />
+                          <span className="text-slate-600">{s.stepName ?? s.name}</span>
+                          <span className="ml-auto text-[10px] text-slate-400 capitalize">{(s.status || '').replace(/_/g, ' ')}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Outputs */}
