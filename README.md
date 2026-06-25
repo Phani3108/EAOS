@@ -79,35 +79,6 @@ docker compose -f deploy/docker-compose.production.yml up -d
 ---
 
 
-### 🌗 Guided Onboarding, Dark Mode & Swarms
-
-A guided **first-run flow** walks new users from connecting an LLM → connecting a tool → running their first skill, with inline guidance and a celebration on completion. The whole app ships a polished **dark mode** alongside the white-background light brand.
-
-<table>
-<tr>
-<td width="50%">
-
-**🌑 Dark Mode** — Full light/dark theming with a toggle in Settings that honors `prefers-color-scheme`.
-
-![Dark Mode](docs/screenshots/35-home-dark-mode.png)
-
-</td>
-<td width="50%">
-
-**🌐 Cross-Functional Swarms** — Spin up a swarm of agents that collaborate over the **A2A protocol** with a live discussion thread.
-
-![Swarms](docs/screenshots/34-swarms.png)
-
-</td>
-</tr>
-</table>
-
-### ⚙️ Operations & Admin
-
-<table>
-<tr>
-<td width="25%">
-
 **🔔 Notification Center** — Multi-channel dispatch (Slack, Teams, Email, Webhook) with rules and delivery logs.
 
 ![Notifications](docs/screenshots/14-notification-center.png)
