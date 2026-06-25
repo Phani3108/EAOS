@@ -1,0 +1,13 @@
+{
+    "experimentalServices": {
+        "web": {
+            "root": "apps/web",
+            "routePrefix": "/",
+            "framework": "nextjs"
+        },
+        "gateway": {
+            "root": "services/gateway",
+            "routePrefix": "/_/gateway"
+        }
+    }
+}
