@@ -23,6 +23,18 @@
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "protobufjs",
+      "unrs-resolver",
+      "@prisma/client",
+      "@prisma/engines",
+      "prisma",
+      "sharp",
+      "@swc/core"
+    ]
+  },
   "scripts": {
     "build": "turbo run build",
     "dev": "turbo run dev",
