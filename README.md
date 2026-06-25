@@ -48,29 +48,6 @@ Vision → Decomposition → Cascading → Agent Assignment → Skill Execution
 
 ---
 
-## 🏗️ Platform Capabilities
-
-| Layer | What It Does |
-|---|---|
-| 🪟 **6 Persona Workspaces** | Engineering · Marketing · Product · HR · Talent · Program Management |
-| 🧩 **60+ Skills** | Pre-built execution primitives across all personas |
-| 🤖 **53 Agents** | 5 regiments with Colonel → Captain → Corporal hierarchy |
-| 📦 **UTCP Protocol** | Universal Task Context Protocol — standardized execution packets |
-| 🔄 **A2A Protocol** | Delegate · query · review · approve · critique · escalate |
-| 🔌 **MCP Tool Layer** | 8 tool adapters with auth & capability registry |
-| 🗣️ **Agent Meetings** | Standup · sprint planning · retrospective · design review · war room |
-| 🌐 **Cross-Functional Swarms** | Product launch · incident response · hiring sprint · campaign pods |
-| 🎯 **Model Router** | Cost-aware Haiku → Sonnet → Opus routing with circuit breakers |
-| 🎨 **Workflow Canvas** | Visual DAG builder for cross-functional templates |
-| 📡 **Protocol Monitor** | Real-time UTCP, A2A, MCP, Runtime, Cost dashboards |
-| 🧩 **Skill Library** | Adopted EAOS skills loaded from `skills/<persona>/<slug>/SKILL.md`, runnable in-app |
-| 🏛️ **Regiment Review** | Collaborative Strategy → Design → Engineering → DevEx review chain |
-| 🔌 **Real MCP Client** | stdio + HTTP transports · dynamic tool discovery · graceful degradation |
-| 🎨 **Guided Onboarding & Theming** | Storytelling home · first-run flow · light/dark mode · toast notifications |
-| 🛡️ **Governance & Security** | RBAC · audit trails · OIDC JWKS · IDOR scoping · CORS allowlist · skill-scan gate |
-
----
-
 ## ⚡ Quick Start
 
 ```bash
@@ -131,13 +108,7 @@ docker compose -f deploy/docker-compose.production.yml up -d
 </tr>
 </table>
 
-### 👥 Persona Hubs
 
-Each persona hub provides a unified workspace with **Skills → Outputs → Programs → Memory** tabs, a skill configuration form with simulation mode, and a full execution pipeline.
-
-<table>
-<tr>
-<td width="25%">
 
 **📣 Marketing Hub** — 30 workflows across Campaign, Content, Creative, Event, Research, and Analytics.
 
