@@ -669,6 +669,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
 
         if (path === '/api/skills/fs/reload' && method === 'POST') {
+            if (IS_PRODUCTION && guardRole('operator')) return;
             const body = await readBody(req);
             const persona = (body.persona as string) ?? undefined;
             const result = reloadFsSkills(persona);
@@ -726,6 +727,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
         // POST /api/mcp/servers/:id/call — call a tool on an MCP server: { tool, arguments }
         if (path.match(/^\/api\/mcp\/servers\/[^/]+\/call$/) && method === 'POST') {
+            if (IS_PRODUCTION && guardRole('operator')) return;
             const id = decodeURIComponent(path.split('/')[4]!);
             const body = await readBody(req);
             const toolName = String((body.tool as string) ?? (body.name as string) ?? '');
@@ -3654,9 +3656,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // Inbound webhook receiver (no auth — uses HMAC signature verification)
         if (path.match(/^\/api\/webhooks\/receive\/[^/]+$/) && method === 'POST') {
             const endpointId = path.split('/')[4]!;
-            const rawBody = await readBody(req);
+            // Capture the RAW body string so the HMAC signature is computed over the
+            // exact bytes the sender signed (re-serializing parsed JSON would break it).
+            const rawBody = await readBodyRaw(req);
             const signature = (req.headers['x-webhook-signature'] ?? req.headers['x-hub-signature-256'] ?? '') as string;
-            const result = await receiveWebhook(endpointId, JSON.stringify(rawBody), signature);
+            const result = await receiveWebhook(endpointId, rawBody, signature);
             if (!result.accepted) { sendJSON(res, 401, { error: 'Signature verification failed' }); return; }
             sendJSON(res, 200, { accepted: true, eventId: result.eventId });
             return;
@@ -4970,7 +4974,8 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         sendJSON(res, 404, { error: 'Not found', path });
     } catch (error) {
         const message = error instanceof Error ? error.message : 'Internal server error';
-        sendJSON(res, 500, { error: message });
+        const status = (error as { statusCode?: number } | undefined)?.statusCode ?? 500;
+        sendJSON(res, status, { error: message });
     }
 }
 
@@ -5013,16 +5018,36 @@ function readDocsFile(name: string): string | null {
   return null;
 }
 
-async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+// Max accumulated request body size (5 MB) — guards against memory-exhaustion DoS.
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
+
+async function readBodyRaw(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
         let body = '';
-        req.on('data', chunk => { body += chunk; });
-        req.on('end', () => {
-            try { resolve(JSON.parse(body || '{}')); }
-            catch { reject(new Error('Invalid JSON')); }
+        let size = 0;
+        let aborted = false;
+        req.on('data', chunk => {
+            if (aborted) return;
+            size += (chunk as Buffer).length ?? Buffer.byteLength(chunk);
+            if (size > MAX_BODY_BYTES) {
+                aborted = true;
+                const err = new Error('Request body too large') as Error & { statusCode?: number };
+                err.statusCode = 413;
+                req.destroy();
+                reject(err);
+                return;
+            }
+            body += chunk;
         });
-        req.on('error', reject);
+        req.on('end', () => { if (!aborted) resolve(body); });
+        req.on('error', err => { if (!aborted) reject(err); });
     });
+}
+
+async function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+    const body = await readBodyRaw(req);
+    try { return JSON.parse(body || '{}'); }
+    catch { throw new Error('Invalid JSON'); }
 }
 
 // ---------------------------------------------------------------------------

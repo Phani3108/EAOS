@@ -376,11 +376,12 @@ async function sendTeams(config: TeamsChannelConfig, delivery: DeliveryRecord): 
 }
 
 async function sendEmail(config: EmailChannelConfig, delivery: DeliveryRecord): Promise<void> {
-  // SMTP via raw socket is complex — in production, use nodemailer or SES.
-  // For now, log the email dispatch as a placeholder.
-  console.log(`[notification-dispatch] 📧 Email: to=${delivery.recipient}, subject="${delivery.subject}", from=${config.fromAddress}, host=${config.smtpHost}`);
-  // Mark as delivered for demo purposes when SMTP is configured
-  if (!config.smtpHost) throw new Error('SMTP not configured');
+  // The email channel is NOT implemented: there is no SMTP client wired up here,
+  // so no message is ever actually sent. Rather than falsely report 'delivered',
+  // fail honestly so getDeliveryStats() and the UI reflect reality. To implement,
+  // wire a real SMTP transport (e.g. nodemailer or SES) using `config`.
+  console.warn(`[notification-dispatch] ✉️ Email channel not implemented — would send to=${delivery.recipient}, subject="${delivery.subject}", from=${config.fromAddress}, host=${config.smtpHost}`);
+  throw new Error('email channel not implemented (configure SMTP / wire a mail transport)');
 }
 
 async function sendWebhook(config: WebhookChannelConfig, delivery: DeliveryRecord): Promise<void> {

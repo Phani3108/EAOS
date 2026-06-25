@@ -49,6 +49,8 @@ import { SkillLibraryHub } from '../components/SkillLibraryHub';
 import { MotionConfig } from 'framer-motion';
 import { ToastViewport } from '../components/ui';
 import FirstRunFlow from '../components/firstrun/FirstRunFlow';
+import { PromptLibrary } from '../components/PromptLibrary';
+import AboutPage from '../components/AboutPage';
 import { hasCompletedOnboarding } from '../lib/storage';
 
 function MainContent({ section }: { section: string }) {
@@ -105,6 +107,9 @@ function MainContent({ section }: { section: string }) {
     case 'platform-review':         return <RegimentReview />;
     case 'platform-skills':         return <SkillLibraryHub />;
 
+    // Content / Library
+    case 'prompts':                 return <PromptLibrary />;
+
     // Operations
     case 'ops-integrations':        return <ToolsRegistry />;
     case 'ops-notifications':       return <NotificationCenter />;
@@ -117,6 +122,9 @@ function MainContent({ section }: { section: string }) {
     case 'admin-evals':             return <AgentEvalsPanel />;
     case 'admin-usage':             return <AdminUsageView />;
     case 'admin-settings':          return <SettingsPanel />;
+
+    // About / Platform info (reached from Settings → About → View)
+    case 'about':                   return <AboutPage />;
 
     default:                        return <HomeCommandCenter />;
   }
@@ -150,6 +158,7 @@ export default function Home() {
       'conn-devtools','conn-cms','conn-messaging','conn-data',
       'ops-executions','ops-notifications','ops-integrations','ops-discussions','ops-blog',
       'admin-governance','admin-evals','admin-usage','admin-settings',
+      'prompts','about',
     ];
     // Allow connector-detail-{id} dynamic sections to round-trip through URL
     const isKnown = knownSections.includes(path) || path.startsWith('connector-detail-');

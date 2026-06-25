@@ -11,7 +11,7 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { callLLM, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider } from './llm-provider.js';
+import { callLLM, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -38,6 +38,28 @@ export interface RoutingDecision {
   reason: string;
   estimatedCostUsd: number;
   complexity: TaskComplexity;
+}
+
+/** Thrown when the hourly cost cap is hit and a real provider call would exceed budget. */
+export class BudgetExceededError extends Error {
+  readonly hourlySpend: number;
+  readonly maxCostPerHour: number;
+  constructor(hourlySpend: number, maxCostPerHour: number) {
+    super(`Hourly budget exceeded: ${hourlySpend.toFixed(2)}/${maxCostPerHour} USD — call blocked`);
+    this.name = 'BudgetExceededError';
+    this.hourlySpend = hourlySpend;
+    this.maxCostPerHour = maxCostPerHour;
+  }
+}
+
+/** Thrown when a provider's circuit breaker is open and a real call is short-circuited. */
+export class CircuitOpenError extends Error {
+  readonly provider: LLMProviderId;
+  constructor(provider: LLMProviderId) {
+    super(`Circuit open for provider "${provider}" — call blocked (failing fast)`);
+    this.name = 'CircuitOpenError';
+    this.provider = provider;
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -160,16 +182,53 @@ export async function routedLLMCall(
   config: Partial<ModelRouterConfig> = {},
   skillComplexity?: string,
 ): Promise<LLMResponse & { routing: RoutingDecision }> {
+  const cfg = { ...DEFAULT_CONFIG, ...config };
   const routing = routeModel(userPrompt, config, skillComplexity);
 
-  const response = await callLLM({
+  // Whether this call will actually hit a real provider. In simulation mode
+  // (no LLM key) callLLM returns deterministic sandbox output at zero cost and
+  // never makes a network request, so the budget cap and circuit breaker are
+  // inert — dev/demo behaviour is unchanged.
+  const realCall = hasAnyLLMKey();
+
+  if (realCall) {
+    // (2) Hard hourly budget cap — block real spend once the cap is reached.
+    // The softer 80% downgrade already happened inside routeModel().
+    resetHourlyCostIfNeeded();
+    if (hourlySpend >= cfg.maxCostPerHour) {
+      throw new BudgetExceededError(hourlySpend, cfg.maxCostPerHour);
+    }
+
+    // (1) Circuit breaker — fail fast if this provider's circuit is open.
+    // Keyed by provider, consistent with getAllCircuitStates().
+    if (isCircuitOpen(routing.provider)) {
+      throw new CircuitOpenError(routing.provider);
+    }
+  }
+
+  const callArgs: LLMRequest = {
     provider: routing.provider,
     model: routing.model,
     systemPrompt,
     userPrompt,
     maxTokens: routing.complexity === 'simple' ? 2048 : routing.complexity === 'critical' ? 8192 : 4096,
     temperature: routing.complexity === 'critical' ? 0.3 : 0.7,
-  });
+  };
+
+  let response: LLMResponse;
+  if (realCall) {
+    // Wrap the real provider call so the circuit breaker observes outcomes.
+    try {
+      response = await callLLM(callArgs);
+    } catch (err) {
+      recordCircuitFailure(routing.provider);
+      throw err;
+    }
+    recordCircuitSuccess(routing.provider);
+  } else {
+    // Simulation mode: no breaker, no real failures, no real spend.
+    response = await callLLM(callArgs);
+  }
 
   // Track cost
   hourlySpend += response.cost;

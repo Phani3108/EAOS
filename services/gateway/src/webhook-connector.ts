@@ -72,6 +72,82 @@ let persistentStore: Store | null = null;
 const ENDPOINTS_TABLE = 'webhook_endpoints';
 const SUBS_TABLE = 'webhook_subscriptions';
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// ---------------------------------------------------------------------------
+// SSRF Guard — validate outbound target URLs
+// ---------------------------------------------------------------------------
+
+/** Cloud-metadata endpoint — ALWAYS blocked, in any mode. */
+const CLOUD_METADATA_IP = '169.254.169.254';
+
+/**
+ * Validate an outbound webhook target URL to prevent SSRF.
+ *
+ * Always (any mode):
+ *   - require an http(s) scheme
+ *   - reject the cloud-metadata IP 169.254.169.254
+ *
+ * In production additionally rejects loopback / RFC1918 private / link-local /
+ * IPv6 loopback / IPv6 ULA hosts so an attacker cannot pivot to internal
+ * services. In dev these are allowed so local webhook testing still works.
+ *
+ * @returns null if allowed, otherwise a human-readable rejection reason.
+ */
+function validateTargetUrl(targetUrl: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(targetUrl);
+  } catch {
+    return 'targetUrl is not a valid URL';
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return `targetUrl scheme must be http or https (got '${url.protocol}')`;
+  }
+
+  // Strip IPv6 brackets if present.
+  const host = url.hostname.replace(/^\[/, '').replace(/\]$/, '').toLowerCase();
+
+  // ALWAYS block the cloud-metadata IP, in any mode.
+  if (host === CLOUD_METADATA_IP) {
+    return 'targetUrl host 169.254.169.254 (cloud metadata) is not allowed';
+  }
+
+  if (IS_PRODUCTION && isPrivateHost(host)) {
+    return `targetUrl host '${host}' is private/loopback and not allowed in production`;
+  }
+
+  return null;
+}
+
+/**
+ * True if the host is loopback / RFC1918 private / link-local / IPv6 loopback
+ * or IPv6 ULA: 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, ::1, fd00::/8,
+ * 169.254/16, plus the 'localhost' name.
+ */
+function isPrivateHost(host: string): boolean {
+  if (host === 'localhost' || host === '::1' || host === '0.0.0.0') return true;
+
+  // IPv6 unique-local addresses (fc00::/7, commonly fd00::/8).
+  if (host.includes(':')) {
+    return host.startsWith('fc') || host.startsWith('fd');
+  }
+
+  // IPv4 octets.
+  const octets = host.split('.');
+  if (octets.length === 4 && octets.every(o => /^\d{1,3}$/.test(o))) {
+    const [a, b] = octets.map(Number);
+    if (a === 127) return true;                        // 127.0.0.0/8 loopback
+    if (a === 10) return true;                         // 10.0.0.0/8 private
+    if (a === 172 && b >= 16 && b <= 31) return true;  // 172.16.0.0/12 private
+    if (a === 192 && b === 168) return true;           // 192.168.0.0/16 private
+    if (a === 169 && b === 254) return true;           // 169.254.0.0/16 link-local
+  }
+
+  return false;
+}
+
 export function initWebhookStore(store: Store): void {
   persistentStore = store;
   try {
@@ -140,6 +216,10 @@ export function createSubscription(
   targetUrl: string,
   options?: { headers?: Record<string, string> },
 ): WebhookSubscription {
+  // SSRF guard: validate the target before persisting the subscription.
+  const rejection = validateTargetUrl(targetUrl);
+  if (rejection) throw new Error(`Invalid webhook target: ${rejection}`);
+
   const id = `wsub-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
   const sub: WebhookSubscription = {
     id, name, eventPattern, targetUrl,
@@ -181,12 +261,25 @@ export function deleteSubscription(id: string): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Process an inbound webhook. Verifies HMAC signature if provided.
- * Routes the event into the gateway event bus.
+ * Process an inbound webhook. Verifies the HMAC-SHA256 signature.
+ *
+ * IMPORTANT: `rawBody` MUST be the exact raw request body bytes as received on
+ * the wire (the string read from the HTTP request stream), NOT a re-serialized
+ * parsed object — re-serialization changes key order / whitespace and breaks
+ * HMAC verification. server.ts is responsible for passing the raw body here.
+ *
+ * Fail-closed: if the endpoint has a secret configured and the signature header
+ * is absent OR verification fails, the event is rejected and NOT emitted.
+ * Endpoints with no secret continue to work unverified (dev/demo flow).
+ *
+ * @param endpointId      the inbound endpoint id
+ * @param rawBody         the RAW request body string (used both for HMAC and JSON parse)
+ * @param signatureHeader the incoming signature header value (e.g. 'sha256=...')
+ * @param eventTypeHeader optional event-type override header
  */
 export async function receiveWebhook(
   endpointId: string,
-  body: string,
+  rawBody: string,
   signatureHeader?: string,
   eventTypeHeader?: string,
 ): Promise<{ accepted: boolean; eventId?: string; error?: string }> {
@@ -194,23 +287,26 @@ export async function receiveWebhook(
   if (!ep) return { accepted: false, error: 'Endpoint not found' };
   if (!ep.enabled) return { accepted: false, error: 'Endpoint disabled' };
 
-  // Verify signature
+  // Verify signature over the RAW body bytes.
   let verified = false;
   if (signatureHeader) {
-    const computed = createHmac('sha256', ep.secret).update(body).digest('hex');
+    const computed = createHmac('sha256', ep.secret).update(rawBody).digest('hex');
     const expected = signatureHeader.replace(/^sha256=/, '');
     // Constant-time comparison
     verified = computed.length === expected.length &&
       createHmac('sha256', 'compare').update(computed).digest('hex') ===
       createHmac('sha256', 'compare').update(expected).digest('hex');
-  } else {
-    // No signature header — accept but mark as unverified
-    verified = false;
+  }
+
+  // FAIL CLOSED: an endpoint with a secret requires a present, valid signature.
+  // Endpoints with NO secret stay open (dev/demo unaffected).
+  if (ep.secret && !verified) {
+    return { accepted: false, error: 'signature required/invalid' };
   }
 
   let payload: Record<string, unknown>;
   try {
-    payload = JSON.parse(body);
+    payload = JSON.parse(rawBody);
   } catch {
     return { accepted: false, error: 'Invalid JSON body' };
   }
@@ -259,6 +355,15 @@ async function deliverOutbound(sub: WebhookSubscription, event: GatewayEvent): P
 
   // Re-check subscription still exists (may have been deleted)
   if (!subscriptions.has(sub.id)) return;
+
+  // SSRF guard (defense in depth): re-validate the target before fetching, in
+  // case a subscription was persisted before this check existed.
+  const rejection = validateTargetUrl(sub.targetUrl);
+  if (rejection) {
+    sub.failedCount++;
+    console.warn(`[webhook-connector] Outbound blocked for ${sub.id}: ${rejection}`);
+    return;
+  }
 
   const payload = JSON.stringify({
     id: event.id,

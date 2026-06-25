@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { getObservabilityExecutions, getObservabilityAgents, getObservabilityMetrics } from '../lib/api';
+import { useGatewayReachable } from './DemoModeBanner';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -384,7 +385,7 @@ function WorkflowExecutionsTab() {
 // Agent Activity Tab
 // ---------------------------------------------------------------------------
 
-function AgentActivityTab() {
+function AgentActivityTab({ simulated }: { simulated: boolean }) {
   const [agents, setAgents] = useState<AgentActivity[]>(SAMPLE_AGENTS);
 
   useEffect(() => {
@@ -402,6 +403,8 @@ function AgentActivityTab() {
           if (d.agents?.length) setAgents(d.agents as unknown as AgentActivity[]);
         })
         .catch(() => {
+          // Only fabricate progress when running in simulated/demo mode.
+          if (!simulated) return;
           setAgents((prev) => prev.map((a) =>
             a.status === 'active'
               ? { ...a, durationMs: a.durationMs + 5000, tokensIn: a.tokensIn + Math.floor(Math.random() * 100) }
@@ -410,7 +413,7 @@ function AgentActivityTab() {
         });
     }, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [simulated]);
 
   const active = agents.filter((a) => a.status === 'active').length;
   const idle = agents.filter((a) => a.status === 'idle').length;
@@ -490,10 +493,12 @@ function AgentActivityTab() {
 // API Logs Tab
 // ---------------------------------------------------------------------------
 
-function ApiLogsTab() {
+function ApiLogsTab({ simulated }: { simulated: boolean }) {
   const [logs, setLogs] = useState<ApiLog[]>(SAMPLE_API_LOGS);
   const [filter, setFilter] = useState<'all' | 'errors'>('all');
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  // Random log generation only makes sense as demo data — default the toggle on
+  // when simulated, off when a real observability API would supply logs.
+  const [autoRefresh, setAutoRefresh] = useState(simulated);
   const intervalRef = useRef<ReturnType<typeof setInterval>>();
 
   const addRandomLog = useCallback(() => {
@@ -517,18 +522,24 @@ function ApiLogsTab() {
   }, []);
 
   useEffect(() => {
-    if (autoRefresh) {
+    // Fabricated log entries are demo-only; never generate them against a live API.
+    if (autoRefresh && simulated) {
       intervalRef.current = setInterval(addRandomLog, 3000);
     }
     return () => clearInterval(intervalRef.current);
-  }, [autoRefresh, addRandomLog]);
+  }, [autoRefresh, addRandomLog, simulated]);
 
   const filtered = filter === 'errors' ? logs.filter((l) => l.status >= 400) : logs;
 
   const totalReqs = logs.length;
   const errors = logs.filter((l) => l.status >= 400).length;
   const avgLatency = Math.round(logs.reduce((s, l) => s + l.durationMs, 0) / logs.length);
-  const p99 = [...logs].sort((a, b) => b.durationMs - a.durationMs)[Math.floor(logs.length * 0.01)]?.durationMs ?? 0;
+  // P99: nearest-rank on an ascending-sorted copy. The previous descending-sort
+  // approach returned the max for lists shorter than 100 entries.
+  const sortedLatencies = [...logs].map((l) => l.durationMs).sort((a, b) => a - b);
+  const p99 = sortedLatencies.length
+    ? sortedLatencies[Math.floor(0.99 * (sortedLatencies.length - 1))]
+    : 0;
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
@@ -559,9 +570,12 @@ function ApiLogsTab() {
         </div>
         <label className="ml-auto flex items-center gap-1.5 cursor-pointer">
           <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)}
-            className="w-3.5 h-3.5 accent-gray-900" />
-          <span className="text-[11px] text-slate-500">Live</span>
-          {autoRefresh && <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />}
+            disabled={!simulated}
+            className="w-3.5 h-3.5 accent-gray-900 disabled:opacity-40" />
+          <span className="text-[11px] text-slate-500">{simulated ? 'Simulated' : 'Live'}</span>
+          {autoRefresh && simulated && (
+            <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse" />
+          )}
         </label>
       </div>
 
@@ -609,7 +623,7 @@ function ApiLogsTab() {
 // System Metrics Tab
 // ---------------------------------------------------------------------------
 
-function SystemMetricsTab() {
+function SystemMetricsTab({ simulated }: { simulated: boolean }) {
   const [metrics, setMetrics] = useState<SystemMetric[]>(generateMetrics);
 
   useEffect(() => {
@@ -624,6 +638,9 @@ function SystemMetricsTab() {
   }, []);
 
   useEffect(() => {
+    // Random metric points are demo-only — don't fabricate a moving chart when a
+    // real observability API is supplying data.
+    if (!simulated) return;
     const interval = setInterval(() => {
       setMetrics((prev) => {
         const newPoint: SystemMetric = {
@@ -638,7 +655,7 @@ function SystemMetricsTab() {
       });
     }, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [simulated]);
 
   const last = metrics[metrics.length - 1];
   const maxVal = (arr: number[]) => Math.max(...arr, 1);
@@ -733,6 +750,11 @@ function SystemMetricsTab() {
 
 export function ObservabilityPanel() {
   const [tab, setTab] = useState<Tab>('executions');
+  // When the gateway is unreachable the panel falls back to client-side
+  // Math.random() telemetry. In that case the data is simulated/demo, not live —
+  // gate the random-update intervals on this flag and label the badge honestly.
+  const gatewayOk = useGatewayReachable();
+  const simulated = !gatewayOk;
 
   const TABS: { id: Tab; label: string; icon: string }[] = [
     { id: 'executions', label: 'Workflow Executions', icon: '⚡' },
@@ -747,13 +769,24 @@ export function ObservabilityPanel() {
       <div className="flex items-center justify-between px-6 py-3 border-b border-slate-100 flex-shrink-0">
         <div>
           <h2 className="text-sm font-semibold text-slate-900">Observability</h2>
-          <p className="text-xs text-slate-400 mt-0.5">Real-time platform monitoring and execution traces</p>
+          <p className="text-xs text-slate-400 mt-0.5">
+            {simulated
+              ? 'Simulated telemetry — gateway unreachable, showing demo data'
+              : 'Real-time platform monitoring and execution traces'}
+          </p>
         </div>
         <div className="flex items-center gap-2">
-          <span className="flex items-center gap-1.5 text-[11px] text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full">
-            <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
-            Live
-          </span>
+          {simulated ? (
+            <span className="flex items-center gap-1.5 text-[11px] text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full">
+              <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-pulse" />
+              Simulated
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[11px] text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full">
+              <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse" />
+              Live
+            </span>
+          )}
         </div>
       </div>
 
@@ -778,9 +811,9 @@ export function ObservabilityPanel() {
       {/* Content */}
       <div className="flex-1 overflow-hidden flex flex-col">
         {tab === 'executions' && <WorkflowExecutionsTab />}
-        {tab === 'agents' && <AgentActivityTab />}
-        {tab === 'api' && <ApiLogsTab />}
-        {tab === 'metrics' && <SystemMetricsTab />}
+        {tab === 'agents' && <AgentActivityTab simulated={simulated} />}
+        {tab === 'api' && <ApiLogsTab simulated={simulated} />}
+        {tab === 'metrics' && <SystemMetricsTab simulated={simulated} />}
       </div>
     </div>
   );

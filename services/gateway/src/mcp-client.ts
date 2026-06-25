@@ -122,12 +122,22 @@ export class McpClientManager {
     }
 
     await client.connect(transport);
-    const listed = await client.listTools();
-    const tools: McpToolDescriptor[] = (listed?.tools ?? []).map((t: any) => ({
-      server: cfg.id, name: t.name, description: t.description, inputSchema: t.inputSchema,
-    }));
-    this.servers.set(cfg.id, { id: cfg.id, transport: cfg.transport, client, tools, status: 'connected' });
-    console.log(`[mcp] connected "${cfg.id}" (${cfg.transport}) — ${tools.length} tools`);
+    // Once connect() succeeds a subprocess (stdio) / connection (http) is live. If
+    // anything below throws before we store the ConnectedServer entry, that process
+    // would be orphaned (zombie subprocess). Close the client/transport on failure
+    // before rethrowing so the spawned process is reaped.
+    try {
+      const listed = await client.listTools();
+      const tools: McpToolDescriptor[] = (listed?.tools ?? []).map((t: any) => ({
+        server: cfg.id, name: t.name, description: t.description, inputSchema: t.inputSchema,
+      }));
+      this.servers.set(cfg.id, { id: cfg.id, transport: cfg.transport, client, tools, status: 'connected' });
+      console.log(`[mcp] connected "${cfg.id}" (${cfg.transport}) — ${tools.length} tools`);
+    } catch (err) {
+      try { await client.close?.(); } catch { /* ignore */ }
+      try { await transport.close?.(); } catch { /* ignore */ }
+      throw err;
+    }
   }
 
   getServerStatus(): Array<{ id: string; transport: string; connected: boolean; toolCount: number; tools: string[]; error?: string }> {

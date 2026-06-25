@@ -100,13 +100,23 @@ class EAOSSlackBot {
     }
 
     async start(): Promise<void> {
-        console.log('🤖 EAOS Slack Bot starting...');
-
-        // TODO: Initialize Slack Bolt app
-        // TODO: Register event listeners
-        // TODO: Start socket mode or HTTP server
-
-        console.log('🤖 EAOS Slack Bot ready');
+        // Inbound event handling (Slack Bolt app / socket mode / HTTP server) is NOT
+        // wired up here. The outbound helpers (sendMessage/updateMessage/sendReaction)
+        // and the handleMention/handleSlashCommand handlers work, but nothing delivers
+        // Slack events to them yet — so this bot is outbound-only. Report that honestly
+        // instead of claiming the bot is "ready" to receive mentions.
+        //
+        // To make it inbound-ready: initialize a Slack Bolt app, register event
+        // listeners that call handleMention/handleSlashCommand, and start socket mode
+        // or an HTTP server.
+        console.warn(
+            '🤖 EAOS Slack Bot: inbound events not configured — outbound only ' +
+            '(no Bolt app / socket mode / HTTP listener wired up).'
+        );
+        throw new Error(
+            'Slack bot inbound events not configured — outbound only ' +
+            '(wire up a Slack Bolt app / socket mode / HTTP listener before calling start())'
+        );
     }
 
     /**
