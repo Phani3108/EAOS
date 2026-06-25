@@ -2018,6 +2018,36 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
+        // POST /api/workflows/flagship/:idOrSlug/run — actually execute a flagship workflow
+        if (path.match(/^\/api\/workflows\/flagship\/[^/]+\/run$/) && method === 'POST') {
+            const idOrSlug = decodeURIComponent(path.split('/')[4]!);
+            const tmpl = getFlagshipWorkflow(idOrSlug);
+            if (!tmpl) { sendJSON(res, 404, { error: 'Workflow not found' }); return; }
+            const body = await readBody(req).catch(() => ({})) as { inputs?: Record<string, unknown>; simulate?: boolean };
+            const inputs = body.inputs ?? {};
+            const shouldSimulate = body.simulate !== undefined ? body.simulate : !hasAnyLLMKey();
+            // Cross-functional templates span personas; the execution persona is the first
+            // recognized one (each step carries its own agent). Steps are topologically ordered,
+            // so the sequential runner satisfies dependsOn; requiresApproval steps pause on the
+            // approval bus (POST .../approve/:stepId), and side-effecting tool calls are gated.
+            const persona = (['engineering', 'product', 'hr', 'marketing'].find((p) => tmpl.personas.includes(p)) ?? 'engineering') as 'engineering' | 'product' | 'hr' | 'marketing';
+            const skill = {
+                id: tmpl.id,
+                name: tmpl.name,
+                description: (tmpl as { description?: string }).description ?? '',
+                category: 'flagship',
+                requiredTools: Array.from(new Set(tmpl.steps.map((s) => s.tool).filter((t) => t && t !== 'Claude'))),
+                steps: tmpl.steps.map((s) => ({
+                    id: s.id, name: s.name, agent: s.agent, tool: s.tool,
+                    outputKey: s.outputKey, requiresApproval: s.requiresApproval, dependsOn: s.dependsOn,
+                })),
+            };
+            const exec = createPersonaExecution(persona, skill as any, inputs, userId, shouldSimulate);
+            recordAudit(userId, 'workflow.flagship.run', `${tmpl.name} (${tmpl.steps.length} steps)`);
+            sendJSON(res, 201, { execution: exec });
+            return;
+        }
+
         if (path.startsWith('/api/workflows/flagship/') && method === 'GET') {
             const idOrSlug = path.replace('/api/workflows/flagship/', '');
             const wf = getFlagshipWorkflow(idOrSlug);
