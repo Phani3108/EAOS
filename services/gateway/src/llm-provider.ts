@@ -44,6 +44,65 @@ export interface ProviderConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Errors
+//
+// `callLLM` throws. It used to swallow every provider failure and return
+// placeholder prose, which made an outage indistinguishable from a successful
+// run: the step was marked completed, KPIs and the After-Action Report ingested
+// the placeholder, and the circuit breaker in model-router.ts could never open
+// because its catch block was unreachable.
+// ---------------------------------------------------------------------------
+
+/** A single provider attempt failed. Carries the HTTP status when there was one. */
+export class ProviderCallError extends Error {
+  readonly name = 'ProviderCallError';
+  constructor(
+    readonly providerId: LLMProviderId,
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+/** One attempt in a fallback chain, as reported to the caller. */
+export interface ProviderAttempt {
+  id: LLMProviderId;
+  status?: number;
+  message: string;
+}
+
+/**
+ * No provider has credentials configured. This is an operator error, not a
+ * runtime failure — it is not retryable and must not be billed.
+ */
+export class LLMNotConfiguredError extends Error {
+  readonly name = 'LLMNotConfiguredError';
+  constructor() {
+    super(
+      'No LLM provider configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, ' +
+        'GEMINI_API_KEY, AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_KEY, or OLLAMA_BASE_URL.',
+    );
+  }
+}
+
+/**
+ * Every configured provider was attempted and every one failed. Retryable.
+ * `providersTried` is what the run surface renders and what the operator needs.
+ */
+export class LLMUnavailableError extends Error {
+  readonly name = 'LLMUnavailableError';
+  constructor(readonly providersTried: ProviderAttempt[]) {
+    super(
+      `All ${providersTried.length} configured LLM provider(s) failed: ` +
+        providersTried
+          .map(a => `${a.id}${a.status ? ` (${a.status})` : ''}: ${a.message}`)
+          .join('; '),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Cost estimates per 1M tokens (input / output)
 // ---------------------------------------------------------------------------
 
@@ -83,7 +142,7 @@ function estimateCost(model: string, inputTokens: number, outputTokens: number):
 
 async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('anthropic', 'ANTHROPIC_API_KEY not set');
 
   const model = req.model || 'claude-sonnet-4-6';
   const start = Date.now();
@@ -106,7 +165,7 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('anthropic', `Anthropic API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -130,7 +189,7 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
 async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('openai', 'OPENAI_API_KEY not set');
 
   const model = req.model || 'gpt-4o';
   const start = Date.now();
@@ -154,7 +213,7 @@ async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('openai', `OpenAI API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -180,7 +239,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_KEY;
   const deployment = req.model || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4o';
-  if (!endpoint || !apiKey) throw new Error('AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY required');
+  if (!endpoint || !apiKey) throw new ProviderCallError('azure-openai', 'AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY required');
 
   const start = Date.now();
   const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`;
@@ -203,7 +262,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Azure OpenAI error ${res.status}: ${errText}`);
+    throw new ProviderCallError('azure-openai', `Azure OpenAI error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -227,7 +286,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
 async function callGemini(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('gemini', 'GEMINI_API_KEY not set');
 
   const model = req.model || 'gemini-1.5-pro';
   const start = Date.now();
@@ -248,7 +307,7 @@ async function callGemini(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('gemini', `Gemini API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -294,7 +353,7 @@ async function callOllama(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Ollama error ${res.status}: ${errText}`);
+    throw new ProviderCallError('ollama', `Ollama error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -401,62 +460,58 @@ const PROVIDER_DISPATCH: Record<LLMProviderId, (req: LLMRequest) => Promise<LLMR
  *
  * 1. Try the requested provider (or default)
  * 2. If it fails, try each remaining available provider in priority order
- * 3. If ALL providers fail, return sandbox placeholder
+ * 3. If ALL providers fail, THROW
+ *
+ * This function throws. It does not return placeholder content under any
+ * circumstances. Callers that want simulated output must ask for it explicitly
+ * via the `simulate` flag on the execution request, which routes to
+ * `generateSandboxOutput()` in persona-api.ts and stamps the result as
+ * synthetic — so a simulated run is never mistaken for a measured one.
+ *
+ * @throws {LLMNotConfiguredError} no provider has credentials — not retryable
+ * @throws {LLMUnavailableError}   every configured provider failed — retryable
  */
 export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
   const providers = getAvailableProviders();
-  const anyAvailable = providers.some(p => p.available);
+  const availableIds = providers.filter(p => p.available).map(p => p.id);
 
-  if (!anyAvailable) {
-    return {
-      content: generatePlaceholder(req.userPrompt),
-      provider: req.provider ?? 'anthropic',
-      model: 'sandbox',
-      inputTokens: 0,
-      outputTokens: 0,
-      latencyMs: 0,
-      cost: 0,
-    };
+  if (availableIds.length === 0) {
+    throw new LLMNotConfiguredError();
   }
 
   // Build ordered fallback chain: requested provider first, then others by priority
   const requestedId = req.provider ?? getDefaultProvider();
-  const availableIds = providers.filter(p => p.available).map(p => p.id);
 
-  // Put requested provider first, then others
-  const chain = [requestedId, ...availableIds.filter(id => id !== requestedId)];
+  // The requested provider only leads the chain if it is actually available;
+  // otherwise it would be skipped mid-loop and never reported as an attempt.
+  const chain = availableIds.includes(requestedId)
+    ? [requestedId, ...availableIds.filter(id => id !== requestedId)]
+    : availableIds;
+
+  const attempts: ProviderAttempt[] = [];
 
   for (const providerId of chain) {
     const handler = PROVIDER_DISPATCH[providerId];
     if (!handler) continue;
-
-    // Check if this provider is actually available
-    const providerConfig = providers.find(p => p.id === providerId);
-    if (!providerConfig?.available) continue;
 
     try {
       // For fallback providers, clear the model so they use their default
       const callReq = providerId === requestedId ? req : { ...req, provider: providerId, model: undefined };
       return await handler(callReq);
     } catch (err) {
-      console.warn(`[llm-provider] ${providerId} failed: ${(err as Error).message}${chain.indexOf(providerId) < chain.length - 1 ? ' — trying next provider' : ''}`);
+      const status = err instanceof ProviderCallError ? err.status : undefined;
+      const message = (err as Error).message;
+      attempts.push({ id: providerId, status, message });
+      const isLast = providerId === chain[chain.length - 1];
+      console.warn(
+        `[llm-provider] ${providerId} failed: ${message}${isLast ? '' : ' — trying next provider'}`,
+      );
     }
   }
 
-  // All providers failed — return sandbox placeholder
-  console.error('[llm-provider] All providers failed. Returning sandbox output.');
-  return {
-    content: generatePlaceholder(req.userPrompt),
-    provider: requestedId,
-    model: 'sandbox-fallback',
-    inputTokens: 0,
-    outputTokens: 0,
-    latencyMs: 0,
-    cost: 0,
-  };
-}
-
-function generatePlaceholder(prompt: string): string {
-  const topic = prompt.slice(0, 120).trim();
-  return `# AI-Generated Output\n\n*No LLM provider configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, AZURE_OPENAI_ENDPOINT+KEY, or OLLAMA_BASE_URL.*\n\n**Task:** ${topic}\n\n> This is sandbox output. Configure an LLM provider to get real AI-generated content.\n\n*Generated by AgentOS LLM Provider*`;
+  // Every configured provider failed. Throwing here is what allows
+  // recordCircuitFailure() in model-router.ts to fire, the step to be marked
+  // failed instead of completed, and the run to be excluded from KPIs.
+  console.error(`[llm-provider] All ${attempts.length} provider(s) failed.`);
+  throw new LLMUnavailableError(attempts);
 }

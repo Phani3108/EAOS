@@ -11,7 +11,7 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { callLLM, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
+import { callLLM, LLMNotConfiguredError, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider } from './llm-provider.js';
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -185,25 +185,23 @@ export async function routedLLMCall(
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const routing = routeModel(userPrompt, config, skillComplexity);
 
-  // Whether this call will actually hit a real provider. In simulation mode
-  // (no LLM key) callLLM returns deterministic sandbox output at zero cost and
-  // never makes a network request, so the budget cap and circuit breaker are
-  // inert — dev/demo behaviour is unchanged.
-  const realCall = hasAnyLLMKey();
+  // Every call through this function is a real provider call. Simulation is an
+  // explicit decision made by the caller BEFORE it gets here (see
+  // `shouldSimulate` in server.ts and `generateSandboxOutput` in persona-api.ts)
+  // — it is never an implicit fallback, because a silent fallback is what let a
+  // provider outage register as a successful, billable run.
 
-  if (realCall) {
-    // (2) Hard hourly budget cap — block real spend once the cap is reached.
-    // The softer 80% downgrade already happened inside routeModel().
-    resetHourlyCostIfNeeded();
-    if (hourlySpend >= cfg.maxCostPerHour) {
-      throw new BudgetExceededError(hourlySpend, cfg.maxCostPerHour);
-    }
+  // (2) Hard hourly budget cap — block real spend once the cap is reached.
+  // The softer 80% downgrade already happened inside routeModel().
+  resetHourlyCostIfNeeded();
+  if (hourlySpend >= cfg.maxCostPerHour) {
+    throw new BudgetExceededError(hourlySpend, cfg.maxCostPerHour);
+  }
 
-    // (1) Circuit breaker — fail fast if this provider's circuit is open.
-    // Keyed by provider, consistent with getAllCircuitStates().
-    if (isCircuitOpen(routing.provider)) {
-      throw new CircuitOpenError(routing.provider);
-    }
+  // (1) Circuit breaker — fail fast if this provider's circuit is open.
+  // Keyed by provider, consistent with getAllCircuitStates().
+  if (isCircuitOpen(routing.provider)) {
+    throw new CircuitOpenError(routing.provider);
   }
 
   const callArgs: LLMRequest = {
@@ -216,19 +214,17 @@ export async function routedLLMCall(
   };
 
   let response: LLMResponse;
-  if (realCall) {
-    // Wrap the real provider call so the circuit breaker observes outcomes.
-    try {
-      response = await callLLM(callArgs);
-    } catch (err) {
-      recordCircuitFailure(routing.provider);
-      throw err;
-    }
-    recordCircuitSuccess(routing.provider);
-  } else {
-    // Simulation mode: no breaker, no real failures, no real spend.
+  try {
     response = await callLLM(callArgs);
+  } catch (err) {
+    // A missing credential is an operator error, not a provider fault. Tripping
+    // the breaker on it would hold the circuit open against a healthy provider.
+    if (!(err instanceof LLMNotConfiguredError)) {
+      recordCircuitFailure(routing.provider);
+    }
+    throw err;
   }
+  recordCircuitSuccess(routing.provider);
 
   // Track cost
   hourlySpend += response.cost;

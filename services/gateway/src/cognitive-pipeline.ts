@@ -38,9 +38,14 @@ export interface StageResult {
 export interface CognitiveResult {
   requestId: string;
   output: string;
-  confidence: number;
-  grounded: boolean;
-  groundingScore: number;
+  /**
+   * Undefined when the producing stage was skipped or returned an unreadable
+   * verdict. Previously defaulted to `1.0` / `true`, so a pipeline configured to
+   * skip grounding still reported perfect grounding.
+   */
+  confidence?: number;
+  grounded?: boolean;
+  groundingScore?: number;
   stages: StageResult[];
   totalDurationMs: number;
 }
@@ -91,31 +96,35 @@ export async function plan(goal: string, subtasks: string[], provider?: LLMProvi
   return parseJSON(raw, { plan: raw });
 }
 
-export async function reason(goal: string, planText: string, provider?: LLMProviderId, modelId?: string): Promise<{ reasoning: string; confidence: number }> {
+export async function reason(goal: string, planText: string, provider?: LLMProviderId, modelId?: string): Promise<{ reasoning: string; confidence?: number; parseFailed?: boolean }> {
   const raw = await llmCall(
     'You are a reasoning engine. Analyze the plan, identify risks and optimizations. Return JSON: {"reasoning": "...", "confidence": 0.0-1.0}',
     `Goal: ${goal}\nPlan: ${planText}`,
     provider, modelId,
   );
-  return parseJSON(raw, { reasoning: raw, confidence: 0.7 });
+  // No invented confidence: 0.7 was ours, not the model's.
+  return parseJSON(raw, { reasoning: raw, parseFailed: true });
 }
 
-export async function reflect(output: string, goal: string, provider?: LLMProviderId, modelId?: string): Promise<{ score: number; feedback: string }> {
+export async function reflect(output: string, goal: string, provider?: LLMProviderId, modelId?: string): Promise<{ score?: number; feedback: string; parseFailed?: boolean }> {
   const raw = await llmCall(
     'You are a quality reflection engine. Evaluate the output quality. Return JSON: {"score": 0.0-1.0, "feedback": "..."}',
     `Goal: ${goal}\n\nOutput to evaluate:\n${output.slice(0, 2000)}`,
     provider, modelId,
   );
-  return parseJSON(raw, { score: 0.8, feedback: raw });
+  // A made-up quality score is worse than none — callers cannot tell them apart.
+  return parseJSON(raw, { feedback: raw, parseFailed: true });
 }
 
-export async function groundCheck(output: string, context: Record<string, unknown>, provider?: LLMProviderId, modelId?: string): Promise<{ grounded: boolean; score: number }> {
+export async function groundCheck(output: string, context: Record<string, unknown>, provider?: LLMProviderId, modelId?: string): Promise<{ grounded?: boolean; score?: number; parseFailed?: boolean }> {
   const raw = await llmCall(
     'You are a hallucination checker. Evaluate if the output is grounded in the provided context. Return JSON: {"grounded": true/false, "score": 0.0-1.0}',
     `Context: ${JSON.stringify(context).slice(0, 1500)}\n\nOutput to check:\n${output.slice(0, 2000)}`,
     provider, modelId,
   );
-  return parseJSON(raw, { grounded: true, score: 0.85 });
+  // A hallucination checker that fails open is worse than no checker. On an
+  // unreadable verdict the answer is "unknown", never "grounded".
+  return parseJSON(raw, { parseFailed: true });
 }
 
 // ---------------------------------------------------------------------------
@@ -160,9 +169,9 @@ export async function processCognitivePipeline(request: CognitiveRequest): Promi
     stages.push({ stage: 'reflect', durationMs: Date.now() - t5, result: { score, feedback } });
   }
 
-  // 6. Ground
-  let grounded = true;
-  let groundingScore = 1.0;
+  // 6. Ground — undefined until the check runs and returns a readable verdict.
+  let grounded: boolean | undefined;
+  let groundingScore: number | undefined;
   if (!skipGrounding) {
     const t6 = Date.now();
     const check = await groundCheck(output, request.context, provider, modelId);

@@ -9,10 +9,17 @@
  */
 
 import type { PersonaSkillDef, SkillStep } from './engineering-skills-data.js';
-import { callLLM as callLLMProvider, type LLMProviderId, type LLMResponse } from './llm-provider.js';
+import {
+  callLLM as callLLMProvider,
+  LLMNotConfiguredError,
+  LLMUnavailableError,
+  type LLMProviderId,
+  type LLMResponse,
+  type ProviderAttempt,
+} from './llm-provider.js';
 import { tracedLLMCall } from './llm-tracer.js';
 import { containsPII, redact as redactPII } from './pii-redactor.js';
-import { routedLLMCall, recordCostEntry, detectComplexity } from './model-router.js';
+import { routedLLMCall, recordCostEntry, detectComplexity, BudgetExceededError, CircuitOpenError } from './model-router.js';
 import { createUTCPPacket, storePacket, getPacket, updatePacketStatus } from './utcp-protocol.js';
 import { createA2AMessage, storeMessage } from './a2a-protocol.js';
 import { createMCPAction, executeMCPAction } from './mcp-executor.js';
@@ -23,13 +30,54 @@ import { getAgentIdentity, getAgentsByPersona, validateHandoff, type AgentIdenti
 import { buildAgentMemoryContext, extractAndStoreMemory, initAgentMemory } from './agent-memory.js';
 import { waitForApproval } from './approval-bus.js';
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Why a step failed, in a form code can branch on.
+ *
+ * `retryable` semantics (consumed by the durable queue in Phase 6):
+ *   provider_unavailable  → yes, a different provider or a later attempt may work
+ *   circuit_open          → yes, once the breaker half-opens
+ *   provider_not_configured → NO, an operator must set a key
+ *   budget_exceeded       → NO, retrying spends money that was capped on purpose
+ *   step_error            → NO by default, the failure is in our own logic
+ */
+export type StepErrorClass =
+  | 'provider_unavailable'
+  | 'provider_not_configured'
+  | 'budget_exceeded'
+  | 'circuit_open'
+  | 'step_error';
+
+/** Classify a thrown error into a StepErrorClass plus any provider attempt detail. */
+export function classifyStepError(err: unknown): {
+  errorClass: StepErrorClass;
+  providersTried?: ProviderAttempt[];
+} {
+  if (err instanceof LLMUnavailableError) {
+    return { errorClass: 'provider_unavailable', providersTried: err.providersTried };
+  }
+  if (err instanceof LLMNotConfiguredError) return { errorClass: 'provider_not_configured' };
+  if (err instanceof BudgetExceededError) return { errorClass: 'budget_exceeded' };
+  if (err instanceof CircuitOpenError) return { errorClass: 'circuit_open' };
+  return { errorClass: 'step_error' };
+}
+
 export interface PersonaExecutionRecord {
   id: string;
+  /**
+   * Owning tenant. Required, not optional — an execution with no tenant cannot
+   * be isolated, billed, or audited, and this record is what agent memory,
+   * KPIs and the benchmark corpus are all attributed from.
+   *
+   * Defaults to 'default' only at the boundary where a request's principal is
+   * resolved, never silently in the middle of the pipeline.
+   */
+  tenantId: string;
   persona: 'engineering' | 'product' | 'hr' | 'marketing';
   skillId: string;
   skillName: string;
@@ -51,6 +99,14 @@ export interface PersonaExecutionRecord {
     outputKey?: string;
     outputPreview?: string;
     error?: string;
+    /**
+     * Machine-readable failure category. Drives retry eligibility (Phase 6) and
+     * lets the run surface tell an operator error apart from a provider outage
+     * instead of showing one opaque message string.
+     */
+    errorClass?: StepErrorClass;
+    /** Per-provider attempt detail when errorClass is 'provider_unavailable'. */
+    providersTried?: ProviderAttempt[];
     /** DAG: step IDs this step depends on */
     dependsOn?: string[];
     // KPI tracking
@@ -114,7 +170,13 @@ export interface AfterActionReport {
     stepName: string;
     status: string;
     durationMs: number;
-    qualityScore: number;
+    /**
+     * Undefined when the step produced no output to score (e.g. it failed).
+     * Deliberately not defaulted to 0 — a rendered "0/10" claims a measurement
+     * that says the agent performed terribly, when the truth is that nothing
+     * was measured. Renderers show an em-dash for undefined.
+     */
+    qualityScore?: number;
     tokenCost: number;
     handoffValid: boolean;
     handoffWarnings: string[];
@@ -158,28 +220,28 @@ export interface RetrainingFlag {
 }
 
 /** Initialize persistence — call from server.ts with the gateway store */
-export function initPersonaStore(store: Store): void {
+export async function initPersonaStore(store: Store): Promise<void> {
   backingStore = store;
   // Restore executions from persistent store
-  const saved = store.all(EXEC_TABLE);
+  const saved = await readAll(store, EXEC_TABLE);
   for (const row of saved) {
     const rec = row as unknown as PersonaExecutionRecord;
     if (rec.id) executions.set(rec.id, rec);
   }
   // Restore KPIs from persistent store
-  const savedKPIs = store.all(KPI_TABLE);
+  const savedKPIs = await readAll(store, KPI_TABLE);
   for (const row of savedKPIs) {
     const kpi = row as unknown as AgentKPI;
     if (kpi.agentId) agentKPIs.set(kpi.agentId, kpi);
   }
   // Restore after-action reports
-  const savedAARs = store.all(AAR_TABLE);
+  const savedAARs = await readAll(store, AAR_TABLE);
   for (const row of savedAARs) {
     const aar = row as unknown as AfterActionReport;
     if (aar.id) afterActionReports.set(aar.id, aar);
   }
   // Restore retraining flags
-  const savedFlags = store.all(RETRAIN_TABLE);
+  const savedFlags = await readAll(store, RETRAIN_TABLE);
   for (const row of savedFlags) {
     const flag = row as unknown as RetrainingFlag;
     if (flag.agentId) retrainingFlags.set(flag.agentId, flag);
@@ -192,7 +254,7 @@ export function initPersonaStore(store: Store): void {
   }
 
   // Wire agent memory persistence
-  initAgentMemory(store);
+  await initAgentMemory(store);
 }
 
 /** Persist an execution record to backing store */
@@ -872,6 +934,7 @@ ${inputSummary ? `## Inputs Received\n${inputSummary}` : ''}
 // ---------------------------------------------------------------------------
 
 function buildStepPrompt(
+  tenantId: string,
   persona: 'engineering' | 'product' | 'hr' | 'marketing',
   skillName: string,
   step: SkillStep,
@@ -906,7 +969,7 @@ function buildStepPrompt(
     const outputSection = agentIdentity.handoffOutputSchema.length > 0
       ? `\n\nExpected Output Sections:\n${agentIdentity.handoffOutputSchema.map(s => `- ${s}`).join('\n')}`
       : '';
-    const memoryContext = buildAgentMemoryContext(agentIdentity.id);
+    const memoryContext = buildAgentMemoryContext(tenantId, agentIdentity.id);
 
     system = `${agentIdentity.systemPrompt}
 
@@ -1133,8 +1196,11 @@ async function processSkillSteps(
     if (exec.utcpTaskId) {
       const packet = getPacket(exec.utcpTaskId);
       if (packet) {
+        // Confidence is reported only when it was measured. The previous `: 0.8`
+        // stamped a failed run with 80% confidence, which is exactly the kind of
+        // invented number that makes an outage look like a success downstream.
         const updated = updatePacketStatus(packet, anyFailed ? 'failed' : 'completed', {
-          confidence: exec.avgQualityScore ? exec.avgQualityScore / 10 : 0.8,
+          ...(exec.avgQualityScore !== undefined ? { confidence: exec.avgQualityScore / 10 } : {}),
           progress: 100,
         } as any);
         storePacket(updated);
@@ -1144,12 +1210,24 @@ async function processSkillSteps(
 
   // ── Memory Graph: Record execution + agent performance + entity graph ──
   try {
+    // Did this run fail because of our infrastructure rather than the skill?
+    const INFRA_CLASSES: StepErrorClass[] = [
+      'provider_unavailable',
+      'provider_not_configured',
+      'budget_exceeded',
+      'circuit_open',
+    ];
+    const infraFailure = exec.steps.some(
+      s => s.status === 'failed' && s.errorClass !== undefined && INFRA_CLASSES.includes(s.errorClass),
+    );
+
     const execRecord = {
       userId: exec.userId || 'system',
       skillId: exec.skillId,
       skillName: exec.skillName,
       personaId: exec.persona,
       success: !anyFailed,
+      infraFailure,
       runtimeSec: (exec.totalLatencyMs || 0) / 1000,
       cost: exec.totalTokenCost || 0,
       agentsUsed: exec.steps.map(s => s.agent),
@@ -1160,16 +1238,20 @@ async function processSkillSteps(
     memoryGraph.buildGraphFromExecution({ ...execRecord, id: exec.id, ts: new Date().toISOString() });
 
     for (const step of exec.steps) {
-      if (step.status === 'completed' || step.status === 'approval_required') {
-        memoryGraph.updateAgentPerformance(step.agent, step.agentCallSign || step.agent, '', {
-          success: true,
-          confidence: (step.qualityScore || 5) / 10,
-          latencyMs: step.latencyMs || 0,
-          costUsd: step.tokenCost || 0,
-          tokens: 0,
-          skillId: exec.skillId,
-        });
-      }
+      if (step.status !== 'completed' && step.status !== 'approval_required') continue;
+      // `avgConfidence` is a measured aggregate. The previous `|| 5` seeded it
+      // with an invented 0.5 whenever a score was missing — and also swallowed a
+      // legitimate score of 0. A step with no measured quality contributes
+      // nothing rather than a guess.
+      if (step.qualityScore === undefined) continue;
+      memoryGraph.updateAgentPerformance(step.agent, step.agentCallSign || step.agent, '', {
+        success: true,
+        confidence: step.qualityScore / 10,
+        latencyMs: step.latencyMs || 0,
+        costUsd: step.tokenCost || 0,
+        tokens: 0,
+        skillId: exec.skillId,
+      });
     }
   } catch {}
 
@@ -1321,7 +1403,7 @@ async function executeSingleStep(
       await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
       output = generateSandboxOutput(persona, skillName, skillStep as any, inputs, previousOutputs);
     } else {
-      const { system, user } = buildStepPrompt(persona, skillName, skillStep as any, inputs, previousOutputs, customPrompt, agentIdentity);
+      const { system, user } = buildStepPrompt(exec.tenantId, persona, skillName, skillStep as any, inputs, previousOutputs, customPrompt, agentIdentity);
       llmResponse = await callLLMUnified(system, user, provider, modelId, persona);
       output = llmResponse.content;
     }
@@ -1343,7 +1425,7 @@ async function executeSingleStep(
     stepRecord.qualityScore = qualityScore;
 
     if (agentIdentity) {
-      extractAndStoreMemory(agentIdentity.id, exec.id, skillStep.name, output);
+      extractAndStoreMemory(exec.tenantId, agentIdentity.id, exec.id, skillStep.name, output);
     }
 
     stepRecord.outputKey = skillStep.outputKey;
@@ -1416,11 +1498,29 @@ async function executeSingleStep(
     return { tokenCost, latencyMs, qualityScore };
 
   } catch (err) {
+    // This path became reachable when callLLM stopped swallowing provider
+    // failures. A failed step records no output, no outputPreview and —
+    // deliberately — no qualityScore: absence is not zero, and a returned
+    // qualityScore would flow into avgQualityScore, KPIs and the AAR as if it
+    // had been measured.
+    const { errorClass, providersTried } = classifyStepError(err);
     stepRecord.status = 'failed';
     stepRecord.completedAt = new Date().toISOString();
     stepRecord.latencyMs = Date.now() - stepStart;
     stepRecord.error = err instanceof Error ? err.message : 'Step failed';
-    console.error(`[persona-api] Step ${skillStep.id} failed:`, err);
+    stepRecord.errorClass = errorClass;
+    if (providersTried) stepRecord.providersTried = providersTried;
+    console.error(`[persona-api] Step ${skillStep.id} failed (${errorClass}):`, err);
+
+    eventBus
+      .emit('execution.step.failed', {
+        execId: exec.id,
+        stepId: skillStep.id,
+        agent: resolvedAgentId,
+        errorClass,
+      })
+      .catch(() => {});
+
     return { tokenCost: 0, latencyMs: Date.now() - stepStart };
   }
 }
@@ -1503,7 +1603,7 @@ function generateAfterActionReport(exec: PersonaExecutionRecord, routedAgents: S
     stepName: step.stepName,
     status: step.status,
     durationMs: step.latencyMs ?? 0,
-    qualityScore: step.qualityScore ?? 0,
+    qualityScore: step.qualityScore,
     tokenCost: step.tokenCost ?? 0,
     handoffValid: step.handoffValid !== false,
     handoffWarnings: step.handoffWarnings ?? [],
@@ -1702,6 +1802,14 @@ interface AgentKPI {
   avgTokenCost: number;
   handoffSuccessRate: number;
   lastExecutedAt: string;
+  /**
+   * How many executions actually contributed a measured quality score.
+   * `avgQualityScore` is an average over THIS count, not over totalExecutions —
+   * otherwise an unmeasured step would have to be assigned a made-up score to
+   * keep the running average moving. It is also the sample size a caller needs
+   * in order to decide whether the average means anything yet.
+   */
+  qualitySampleCount?: number;
 }
 
 const agentKPIs = new Map<string, AgentKPI>();
@@ -1714,13 +1822,19 @@ function recordExecutionMetrics(exec: PersonaExecutionRecord): void {
     const existing = agentKPIs.get(agentId);
     const callSign = step.agentCallSign ?? agentId;
 
+    // A quality score is only folded in when it was actually measured. The
+    // previous `?? 5` invented a mid-range score for unmeasured steps, which is
+    // indistinguishable from a real 5 once averaged.
+    const measuredQuality = step.qualityScore;
+
     if (!existing) {
       const kpi: AgentKPI = {
         agentId,
         callSign,
         totalExecutions: 1,
         avgLatencyMs: step.latencyMs ?? 0,
-        avgQualityScore: step.qualityScore ?? 5,
+        avgQualityScore: measuredQuality ?? 0,
+        qualitySampleCount: measuredQuality === undefined ? 0 : 1,
         avgTokenCost: step.tokenCost ?? 0,
         handoffSuccessRate: step.handoffValid !== false ? 100 : 0,
         lastExecutedAt: step.completedAt ?? new Date().toISOString(),
@@ -1730,10 +1844,16 @@ function recordExecutionMetrics(exec: PersonaExecutionRecord): void {
       const n = existing.totalExecutions;
       existing.totalExecutions = n + 1;
       existing.avgLatencyMs = (existing.avgLatencyMs * n + (step.latencyMs ?? 0)) / (n + 1);
-      existing.avgQualityScore = (existing.avgQualityScore * n + (step.qualityScore ?? 5)) / (n + 1);
       existing.avgTokenCost = (existing.avgTokenCost * n + (step.tokenCost ?? 0)) / (n + 1);
       existing.handoffSuccessRate = (existing.handoffSuccessRate * n + (step.handoffValid !== false ? 100 : 0)) / (n + 1);
       existing.lastExecutedAt = step.completedAt ?? new Date().toISOString();
+
+      if (measuredQuality !== undefined) {
+        // Average over quality samples, not over executions.
+        const q = existing.qualitySampleCount ?? n;
+        existing.avgQualityScore = (existing.avgQualityScore * q + measuredQuality) / (q + 1);
+        existing.qualitySampleCount = q + 1;
+      }
       persistKPI(agentId, existing);
     }
   }
@@ -1754,6 +1874,12 @@ export function getAgentKPI(agentId: string): AgentKPI | undefined {
 // ---------------------------------------------------------------------------
 
 export function createPersonaExecution(
+  /**
+   * Owning tenant, resolved from the verified principal by the caller.
+   * Required and positional so it cannot be forgotten — everything this record
+   * feeds (agent memory, KPIs, benchmark contributions) is attributed by it.
+   */
+  tenantId: string,
   persona: 'engineering' | 'product' | 'hr' | 'marketing',
   skill: PersonaSkillDef,
   inputs: Record<string, unknown>,
@@ -1781,6 +1907,7 @@ export function createPersonaExecution(
 
   const exec: PersonaExecutionRecord = {
     id,
+    tenantId,
     persona,
     skillId: skill.id,
     skillName: skill.name,

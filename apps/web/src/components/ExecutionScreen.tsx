@@ -857,10 +857,17 @@ function ExecutionView({ execution, onBack, onRerun }: {
                       </td>
                       <td className="py-2 text-slate-600">{ap.stepName}</td>
                       <td className="py-2 text-center">
-                        <span className={`font-medium ${
-                          ap.qualityScore >= 7 ? 'text-emerald-600' :
-                          ap.qualityScore >= 5 ? 'text-amber-600' : 'text-red-600'
-                        }`}>{ap.qualityScore.toFixed(1)}</span>
+                        {/* Absence is not zero. A step that failed produced no
+                            output to score, so it renders as an em-dash rather
+                            than a red 0.0 that claims the agent scored badly. */}
+                        {ap.qualityScore === undefined ? (
+                          <span className="text-slate-400" title="Not measured — this step produced no output to score">—</span>
+                        ) : (
+                          <span className={`font-medium ${
+                            ap.qualityScore >= 7 ? 'text-emerald-600' :
+                            ap.qualityScore >= 5 ? 'text-amber-600' : 'text-red-600'
+                          }`}>{ap.qualityScore.toFixed(1)}</span>
+                        )}
                       </td>
                       <td className="py-2 text-center text-slate-500">{(ap.durationMs / 1000).toFixed(1)}s</td>
                       <td className="py-2 text-center">
