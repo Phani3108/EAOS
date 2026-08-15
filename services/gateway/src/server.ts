@@ -13,7 +13,10 @@
 
 import { InMemoryStore, SessionRepository, ExecutionRepository, executeQuery, classifyIntent } from './core.js';
 import { PersistentStore, PostgresStore } from './db.js';
-import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT } from './auth.js';
+import { createStore } from '@agentos/db/create-store';
+import { loadEnvOrExit } from '@agentos/config';
+import { isPublicPath } from './public-paths.js';
+import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, hashApiKey } from './auth.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
 import { CapabilityGraph } from './capability-graph.js';
@@ -118,10 +121,58 @@ import { createHash as nodeCreateHash } from 'node:crypto';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 
-// Store selection: DATABASE_URL → Postgres, PERSIST=false → In-memory, default → File-backed
-const usePostgres = !!process.env.DATABASE_URL;
-const useInMemory = process.env.PERSIST === 'false';
-const store = usePostgres ? new PostgresStore() : useInMemory ? new InMemoryStore() : new PersistentStore();
+// ── Configuration ────────────────────────────────────────────────────────────
+// Validated first, and BEFORE any module that could fail on a missing value.
+// Prints a set/missing table and exits 78 (EX_CONFIG) on a real problem instead
+// of throwing during module evaluation, which produced no log line and an
+// invisible container restart loop.
+const env = loadEnvOrExit();
+
+// ── Process-level failure handlers ───────────────────────────────────────────
+// There were none. Node's default for an unhandled rejection is to print the
+// reason and exit, so a single floating promise anywhere — and there are many,
+// e.g. `void this.insertAsync(...)` in PostgresStore — took the whole gateway
+// down with no context about which request or subsystem caused it.
+//
+// These log with context and keep serving. That is the right trade for a
+// long-lived server: one dropped background task must not end every in-flight
+// request. A crash-only policy would be defensible if the queue were durable and
+// work resumed on restart — it is not yet (Phase 5/6), so exiting loses work.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error(`[server] UNHANDLED REJECTION: ${err.message}\n${err.stack ?? ''}`);
+});
+
+process.on('uncaughtException', (err) => {
+  // An uncaught exception means an unknown amount of state is now inconsistent.
+  // Log it fully, then let the supervisor restart us rather than continuing in a
+  // state we cannot reason about.
+  console.error(`[server] UNCAUGHT EXCEPTION — exiting: ${err.message}\n${err.stack ?? ''}`);
+  process.exit(1);
+});
+
+// ── Store selection ──────────────────────────────────────────────────────────
+// `createStore()` never throws. It degrades — Postgres → file → ephemeral — and
+// reports why, so an unwritable data directory or an unreachable database yields
+// a running process that can be diagnosed rather than a boot crash.
+//
+// `PERSIST` is gone: it only ever compared against the literal string 'false',
+// so `PERSIST=true` was a no-op and docker-compose.production.yml set exactly
+// that. Storage is now chosen by DATABASE_URL and DATA_DIR.
+const storeResult = createStore({
+  databaseUrl: env.DATABASE_URL,
+  dataDir: env.DATA_DIR,
+  postgresFactory: () => new PostgresStore(),
+});
+const store = storeResult.store;
+const usePostgres = storeResult.mode === 'postgres';
+
+console.log(
+  `[server] persistence: ${storeResult.mode}${storeResult.path ? ` (${storeResult.path})` : ''}`,
+);
+if (storeResult.degradedReason) {
+  console.warn(`[server] PERSISTENCE DEGRADED: ${storeResult.degradedReason}`);
+}
 
 // Raw pg.Pool for direct queries (API keys, tenant GUC, audit persistence).
 // Only available when DATABASE_URL is set; undefined otherwise.
@@ -134,22 +185,108 @@ let pgPool: {
 if (usePostgres) {
     import('@agentos/db/postgres-store').then(m => m.getRawPool()).then(p => { pgPool = p as any; restoreAuditFromDb().catch(() => {}); }).catch(() => {});
 }
+// ── API key resolution ───────────────────────────────────────────────────────
+// `resolveApiKey` in @agentos/auth previously returned undefined unconditionally
+// in production — its own comment said "no API key can authenticate in
+// production". Combined with the anonymous fallback being off and the token
+// endpoint sitting behind the auth gate, production had no way to mint or use a
+// credential at all.
+//
+// The resolver is injected so @agentos/auth keeps no database dependency: it is
+// imported very early and must not be able to fail on a driver or a connection.
+setApiKeyResolver(async (rawKey: string) => {
+  if (!pgPool) return undefined; // No relational store → no key store.
+  try {
+    const keyHash = hashApiKey(rawKey);
+    // Look up by hash (UNIQUE, indexed). Comparing hashes rather than raw keys
+    // means a database dump does not contain usable credentials.
+    const { rows } = await pgPool.query(
+      `SELECT k.user_id, k.scopes, k.expires_at, k.tenant_id,
+              u.email, u.name, u.role
+         FROM api_keys k
+         JOIN users u ON u.id = k.user_id
+        WHERE k.key_hash = $1
+        LIMIT 1`,
+      [keyHash],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return undefined;
+
+    // Best-effort last-used stamp; never block auth on it.
+    void pgPool
+      .query(`UPDATE api_keys SET last_used_at = now() WHERE key_hash = $1`, [keyHash])
+      .catch(() => {});
+
+    return {
+      id: row.user_id,
+      email: row.email ?? '',
+      name: row.name ?? '',
+      role: (row.role ?? 'user') as 'user' | 'operator' | 'admin',
+      teams: [],
+      personaScopes: Array.isArray(row.scopes) ? row.scopes : ['*'],
+      tenantId: row.tenant_id ?? 'default',
+    };
+  } catch (err) {
+    // A lookup failure must deny, never fall through to a weaker check.
+    console.error('[auth] API key lookup failed:', (err as Error).message);
+    return undefined;
+  }
+});
+
 const sessions = new SessionRepository(store);
 const executions = new ExecutionRepository(store);
-initPersonaStore(store); // Wire persona executions & KPIs to persistent backing store
-initVisionStore(store); // Wire vision statements, programs & OKRs to persistent store
-initNotificationStore(store); // Wire notification channels, rules & delivery log
-initWebhookStore(store); // Wire webhook endpoints & subscriptions (also re-wires outbound subscriptions to event bus)
+// ── Store rehydration ────────────────────────────────────────────────────────
+// These are AWAITED. They were synchronous calls into `store.all()`, which
+// `PostgresStore` throws from by design — so setting DATABASE_URL, the documented
+// production configuration, crashed the gateway during module evaluation. They
+// now read through `readAll()`, which handles both store shapes.
+//
+// Awaited in parallel because they touch disjoint tables, and awaited at all
+// because an un-awaited restore races the first request: the gateway would serve
+// an empty execution list and then quietly fill it in.
+//
+// Top-level await is available here (ESM + NodeNext), so this needs no wrapper.
+//
+// Failures are caught. An unreachable database at boot is transient and does not
+// warrant refusing to start — a process that is up can report why it is unhealthy,
+// whereas one that exits before opening a port cannot be diagnosed at all. But it
+// must never be silent, so the reason is recorded and reported.
+let rehydrationError: string | undefined;
+try {
+  await Promise.all([
+    initPersonaStore(store),      // persona executions, KPIs, AARs, retraining flags, agent memory
+    initVisionStore(store),       // vision statements, programs & OKRs
+    initNotificationStore(store), // notification channels, rules & delivery log
+    initWebhookStore(store),      // webhook endpoints & subscriptions
+  ]);
+} catch (err) {
+  rehydrationError = (err as Error).message;
+  console.error(
+    `[server] REHYDRATION FAILED: ${rehydrationError}\n` +
+      '[server] The gateway is running but started with EMPTY state. Existing executions, ' +
+      'KPIs and webhooks were not restored. Do not treat this instance as healthy.',
+  );
+}
 wireNotificationBridge(); // Wire event bus patterns → notification dispatch
-initInnovationStore(store); // Wire innovation labs experiments, hackathons & graduations
-initBudgetStore(store); // Wire agent budgets, spend log & cost alerts
-initImprovementStore(store); // Wire performance reviews, improvement plans & feedback
+try {
+  await Promise.all([
+    initInnovationStore(store),  // innovation labs experiments, hackathons & graduations
+    initBudgetStore(store),      // agent budgets, spend log & cost alerts
+    initImprovementStore(store), // performance reviews, improvement plans & feedback
+  ]);
+} catch (err) {
+  rehydrationError ??= (err as Error).message;
+  console.error(`[server] REHYDRATION FAILED (secondary stores): ${(err as Error).message}`);
+}
 initAgentStatusReconciler(); // Wire agent status reconciler (subscribes to execution events + 5s ground-truth sweep)
 initSlackNotifier();          // Post execution.completed summaries to SLACK_WEBHOOK_URL for hero workflows
 
 // Seed a consistent demo scenario so first-run dashboards show realistic data.
-// Skipped when real executions already exist, or when SEED_DEMO=false is set.
-if (process.env.SEED_DEMO !== 'false') {
+// Skipped when real executions already exist. Opt-IN via SEED_DEMO=true: it used
+// to be opt-out, so any deployment that did not explicitly disable it served demo
+// data as if it were the tenant's own.
+if (env.SEED_DEMO) {
   try { seedDemoScenario(); } catch (err) { console.warn('[server] demo seed failed:', (err as Error).message); }
   try { seedExamplePolicies(); } catch (err) { console.warn('[server] policy seed failed:', (err as Error).message); }
 }
@@ -293,6 +430,53 @@ registerStore('agent_memory',
 // Generic connection store for ConnectionsHub
 interface ConnectionRecord { connectorId: string; status: string; connectedAt?: string; lastTestedAt?: string; credentials?: Record<string, string>; error?: string; }
 const connectionStore = new Map<string, ConnectionRecord>();
+
+/** What a connection looks like over the wire. Structurally cannot carry a secret. */
+interface RedactedConnection {
+    connectorId: string;
+    status: string;
+    connectedAt?: string;
+    lastTestedAt?: string;
+    error?: string;
+    /** Names of the credential fields that are set. Never their values. */
+    credentialFields: string[];
+    /** Last 4 characters of the primary credential, for "is this the key I think it is?". */
+    maskedHint?: string;
+}
+
+/**
+ * Strip credentials from a connection record.
+ *
+ * `GET /api/connections` previously returned `Object.fromEntries(connectionStore)`
+ * — every stored token in plaintext, with no role check, no tenant filter and no
+ * redaction. With the anonymous fallback enabled (its old default) that was an
+ * unauthenticated credential dump for GitHub, Jira, Slack, HubSpot and the rest.
+ *
+ * Returning a redacted shape rather than deleting the field is deliberate: the
+ * operator still needs to know a credential is present and roughly which one it
+ * is, and a separate DTO means a future field added to ConnectionRecord cannot
+ * leak by being spread into a response.
+ */
+function redactConnection(rec: ConnectionRecord): RedactedConnection {
+    const fields = Object.entries(rec.credentials ?? {})
+        .filter(([, v]) => typeof v === 'string' && v.trim().length > 0)
+        .map(([k]) => k);
+
+    const primary = rec.credentials?.[fields[0] ?? ''] ?? '';
+    // Only hint when there is enough material that 4 characters are not the whole
+    // secret.
+    const maskedHint = primary.length >= 12 ? `…${primary.slice(-4)}` : undefined;
+
+    return {
+        connectorId: rec.connectorId,
+        status: rec.status,
+        connectedAt: rec.connectedAt,
+        lastTestedAt: rec.lastTestedAt,
+        error: rec.error,
+        credentialFields: fields,
+        maskedHint,
+    };
+}
 
 // Real audit log — records actual gateway operations.
 // Tamper-evident via hash-chain: each entry includes SHA-256(prev_hash || entry_json),
@@ -451,7 +635,17 @@ registerStore('agent_evals',
 );
 
 initGatewayPersistence(store); // Restore all ephemeral stores from backing store
-initWorkflowStore();           // Rehydrate pipeline executions from file-backed workflow store
+// Share the one Store. Previously called with no argument, which built a SECOND
+// PersistentStore over the same store.json and silently clobbered this one's
+// tables on every debounced save.
+// Rehydrate pipeline executions from the shared store. Same policy as the other
+// restore paths: report the failure, keep serving, do not exit.
+try {
+  await initWorkflowStore(store);
+} catch (err) {
+  rehydrationError ??= (err as Error).message;
+  console.error(`[server] REHYDRATION FAILED (pipeline executions): ${(err as Error).message}`);
+}
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 
@@ -486,12 +680,19 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     const method = req.method ?? 'GET';
 
     // CORS
-    // Allowlist read from CORS_ALLOWED_ORIGINS (comma-separated). When UNSET,
-    // fall back to '*' to preserve the dev/demo flow. When set, reflect the
-    // request Origin only if it is in the allowlist (otherwise omit the header).
-    const corsAllowedRaw = process.env.CORS_ALLOWED_ORIGINS;
+    // Allowlist read from CORS_ALLOWED_ORIGINS (comma-separated). When set,
+    // reflect the request Origin only if it is in the allowlist.
+    //
+    // When UNSET the old behaviour was `Access-Control-Allow-Origin: *` in EVERY
+    // environment, production included, which let any site on the internet make
+    // credentialed calls on a user's behalf. It now falls back to '*' only
+    // outside production, and sends no header at all in production — fail closed.
+    // @agentos/config warns at boot when it is unset in production.
+    const corsAllowedRaw = env.CORS_ALLOWED_ORIGINS;
     if (corsAllowedRaw === undefined) {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        if (env.NODE_ENV !== 'production') {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+        }
     } else {
         const allowed = corsAllowedRaw.split(',').map(o => o.trim()).filter(Boolean);
         const origin = req.headers.origin;
@@ -509,14 +710,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     for (const [key, val] of Object.entries(req.headers)) {
         headers[key.toLowerCase()] = Array.isArray(val) ? val[0] : val;
     }
-    const auth = authenticateRequest(headers);
-    if (!auth.authenticated) {
-        sendJSON(res, 401, { error: auth.error ?? 'Unauthorized' });
-        return;
+    // ── Public paths ─────────────────────────────────────────────────────────
+    // Checked BEFORE authentication. Without this the gateway was unreachable in
+    // production by construction: the auth gate ran ahead of every route, so
+    // liveness/readiness probes 401'd (containers never became healthy), and the
+    // only two ways to obtain a credential — /api/auth/token and the OIDC
+    // handshake — sat behind the very gate they were supposed to open. There was
+    // no bootstrap path at all.
+    //
+    // Exact method+path matches only. No prefixes, so this cannot accidentally
+    // widen to a subtree.
+    let auth: Awaited<ReturnType<typeof authenticateRequest>> | undefined;
+    if (!isPublicPath(method, path)) {
+        auth = await authenticateRequest(headers);
+        if (!auth.authenticated) {
+            sendJSON(res, 401, { error: auth.error ?? 'Unauthorized' });
+            return;
+        }
     }
 
-    const userId = auth.user?.id ?? 'anonymous';
-    const authUser = auth.user;
+    const userId = auth?.user?.id ?? 'anonymous';
+    const authUser = auth?.user;
 
     // Rate limiting — apply before any route processing
     {
@@ -572,13 +786,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
     try {
         // Health — liveness check
+        // Liveness: is this process running? No dependency checks, no auth, no
+        // tenant data. Separated from /api/health so a container healthcheck
+        // cannot be failed by a degraded dependency — restarting the process does
+        // not fix an unreachable database, it just adds an outage.
+        if (path === '/api/live' && method === 'GET') {
+            sendJSON(res, 200, { status: 'alive', pid: process.pid, uptimeSec: Math.floor(process.uptime()) });
+            return;
+        }
+
         if (path === '/api/health' && method === 'GET') {
             sendJSON(res, 200, {
                 ...getHealth(),
+                // FIXME(phase-8): these four are hardcoded 'up' and are checked by
+                // nothing. Replaced by measured checks when /api/ready lands.
                 services: { gateway: 'up', skills: 'up', workers: 'up', orchestrator: 'up' },
                 llmConfigured: !!process.env.ANTHROPIC_API_KEY,
                 githubConfigured: !!process.env.GITHUB_TOKEN,
-                persistenceEnabled: usePostgres ? 'postgres' : useInMemory ? 'in-memory' : 'file-backed',
+                persistence: storeResult.mode,
+                // Present only when we are NOT on the storage that was asked for.
+                // Silent degradation to ephemeral is how state "disappears".
+                persistenceDegradedReason: storeResult.degradedReason,
                 wsClients: getWSClientCount(),
                 storeStats: 'stats' in store ? (store as PersistentStore).stats() : { tables: 0, totalRows: 0 },
             });
@@ -766,7 +994,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
             const skill = synthesizeAdoptedSkill(fsSkill);
             const shouldSimulate = simulate !== undefined ? simulate : !hasAnyLLMKey();
-            const exec = createPersonaExecution(persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${fsSkill.name} (adopted)`);
             broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate: shouldSimulate, adopted: true });
             sendJSON(res, 201, { execution: exec });
@@ -1100,7 +1328,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const effectiveCustomPrompt = adoptedBody
                 ? (customPrompt ? `${adoptedBody}\n\n---\n${customPrompt}` : adoptedBody)
                 : customPrompt;
-            const exec = createPersonaExecution(persona as any, skill, inputs ?? {}, userId, shouldSimulate, effectiveCustomPrompt, provider as any, modelId);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', persona as any, skill, inputs ?? {}, userId, shouldSimulate, effectiveCustomPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate, provider });
             sendJSON(res, 201, { execution: exec });
@@ -2048,7 +2276,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                     outputKey: s.outputKey, requiresApproval: s.requiresApproval, dependsOn: s.dependsOn,
                 })),
             };
-            const exec = createPersonaExecution(persona, skill as any, inputs, userId, shouldSimulate);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', persona, skill as any, inputs, userId, shouldSimulate);
             recordAudit(userId, 'workflow.flagship.run', `${tmpl.name} (${tmpl.steps.length} steps)`);
             sendJSON(res, 201, { execution: exec });
             return;
@@ -4180,7 +4408,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // GET /api/connections — list all connection states
         if (path === '/api/connections' && method === 'GET') {
-            sendJSON(res, 200, { connections: Object.fromEntries(connectionStore) });
+            // Listing which integrations are wired is an administrative view.
+            if (guardRole('admin')) return;
+            // TODO(phase-9): filter by tenant. `connectionStore` is keyed by bare
+            // connectorId, so tenant B's connect currently overwrites tenant A's
+            // credentials — fixed when connections move to PK (tenant_id, connector_id).
+            const redacted: Record<string, RedactedConnection> = {};
+            for (const [key, rec] of connectionStore) redacted[key] = redactConnection(rec);
+            sendJSON(res, 200, { connections: redacted });
             return;
         }
 
@@ -4224,15 +4459,23 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 sendJSON(res, 400, { ok: false, error: 'Not connected. Add credentials first.' });
                 return;
             }
-            // Simulate a lightweight test (real validation would call the provider's health endpoint)
-            const simulatedOk = Math.random() > 0.05; // 95% pass rate in sim
-            if (simulatedOk) {
-                connectionStore.set(connectorId, { ...state, status: 'connected', lastTestedAt: new Date().toISOString() });
-                sendJSON(res, 200, { ok: true, message: 'Connection validated successfully.' });
-            } else {
-                connectionStore.set(connectorId, { ...state, status: 'error', error: 'Credentials rejected by provider.' });
-                sendJSON(res, 400, { ok: false, error: 'Test failed — credentials may be expired.' });
-            }
+            // This was `Math.random() > 0.05` — a coin flip reported to the user as
+            // "Connection validated successfully", and it WROTE that verdict into
+            // the connection status. So a broken credential could be marked
+            // healthy, and a working one marked rejected, at random.
+            //
+            // A real test means calling each provider's identity endpoint (GitHub
+            // /user, Slack auth.test, Jira /myself …). Until those are wired per
+            // connector, saying so is the only honest answer: 501 leaves the stored
+            // status untouched rather than overwriting it with a guess.
+            sendJSON(res, 501, {
+                ok: false,
+                error: 'Connection testing is not implemented for this connector yet.',
+                detail:
+                    'This endpoint used to return a random pass/fail and record it as the connection status. ' +
+                    'It now reports honestly instead. Credential validity is still proven the real way: ' +
+                    'run a skill that uses this connector and inspect the run.',
+            });
             return;
         }
 
@@ -4240,7 +4483,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path.match(/^\/api\/connections\/[^/]+\/status$/) && method === 'GET') {
             const connectorId = path.split('/')[3]!;
             const state = connectionStore.get(connectorId) ?? { connectorId, status: 'not-connected' };
-            sendJSON(res, 200, { connection: state });
+            // Redacted, same as the list route. This handler returned the raw
+            // record, so a single connector's credentials leaked here too — and
+            // unlike the list route it had no role check at all.
+            sendJSON(res, 200, { connection: redactConnection(state) });
             return;
         }
 
@@ -4273,7 +4519,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getEngineeringSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('engineering', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', 'engineering', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `Engineering / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'engineering', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4335,7 +4581,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getProductSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('product', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', 'product', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `Product / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'product', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4397,7 +4643,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getHRSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('hr', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = createPersonaExecution(authUser?.tenantId ?? 'default', 'hr', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `HR / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'hr', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4454,7 +4700,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getTASkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = createPersonaExecution('ta' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = createPersonaExecution(authUser?.tenantId ?? 'default', 'ta' as any, skill as any, inputs || {}, userId, simulate ?? false);
             sendJSON(res, 201, { execution });
             return;
         }
@@ -4497,7 +4743,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getProgramSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = createPersonaExecution('program' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = createPersonaExecution(authUser?.tenantId ?? 'default', 'program' as any, skill as any, inputs || {}, userId, simulate ?? false);
             sendJSON(res, 201, { execution });
             return;
         }
@@ -4767,21 +5013,40 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // Agent Memory — per-agent accumulated context
         if (path === '/api/agents/memory' && method === 'GET') {
-            sendJSON(res, 200, { snapshots: getAllAgentMemorySnapshots() });
+            sendJSON(res, 200, { snapshots: getAllAgentMemorySnapshots(authUser?.tenantId ?? 'default') });
             return;
         }
 
         if (path.match(/^\/api\/agents\/memory\/[^/]+$/) && method === 'GET') {
             const agentId = decodeURIComponent(path.split('/')[4]!);
-            sendJSON(res, 200, { agentId, entries: getAgentMemory(agentId), document: getAgentMemoryDocument(agentId) });
+            // Scoped to the caller's own tenant. Reading another tenant's agent
+            // memory would expose their operational learnings verbatim.
+            const tenantId = authUser?.tenantId ?? 'default';
+            sendJSON(res, 200, {
+                agentId,
+                entries: getAgentMemory(tenantId, agentId),
+                document: getAgentMemoryDocument(tenantId, agentId),
+            });
             return;
         }
 
         if (path.match(/^\/api\/agents\/memory\/[^/]+$/) && method === 'POST') {
+            // Whatever is written here is spliced verbatim into this agent's system
+            // prompt on every later run in this tenant. That makes it a prompt
+            // injection primitive, so it is operator-only — it previously had no
+            // role check and no tenant scope at all, meaning any caller could
+            // implant instructions into every tenant's agents permanently.
+            if (guardRole('operator')) return;
             const agentId = decodeURIComponent(path.split('/')[4]!);
             const body = await readBody(req);
             if (!body.kind || !body.content) { sendJSON(res, 400, { error: 'kind and content required' }); return; }
-            const entry = recordAgentMemory(agentId, body.kind as 'learning' | 'correction' | 'pattern' | 'preference', body.content as string, (body.source as string) ?? 'manual');
+            const entry = recordAgentMemory(
+                authUser?.tenantId ?? 'default',
+                agentId,
+                body.kind as 'learning' | 'correction' | 'pattern' | 'preference',
+                body.content as string,
+                (body.source as string) ?? 'manual',
+            );
             sendJSON(res, 201, { entry });
             return;
         }
@@ -5193,7 +5458,7 @@ server.listen(PORT, () => {
     console.log(`    WS   /ws                            — Live execution streaming`);
     console.log(`\n  LLM: ${process.env.ANTHROPIC_API_KEY ? '✅ ANTHROPIC_API_KEY configured — real AI calls enabled' : '⚠️  ANTHROPIC_API_KEY not set — using fallback responses'}`);
     console.log(`  GitHub: ${process.env.GITHUB_TOKEN ? '✅ GITHUB_TOKEN configured' : '⚠️  GITHUB_TOKEN not set'}`);
-    console.log(`  Persistence: ${usePostgres ? '✅ PostgreSQL (DATABASE_URL)' : useInMemory ? '📝 In-memory store (PERSIST=false)' : '✅ File-backed persistent store (default)'}`);
+    console.log(`  Persistence: ${storeResult.mode === 'postgres' ? '✅ PostgreSQL (DATABASE_URL)' : storeResult.mode === 'file' ? `✅ File-backed (${storeResult.path})` : '⚠️  EPHEMERAL — in-memory only, all state lost on restart'}`);
     console.log(`  OpenTelemetry: ${process.env.OTEL_EXPORTER_OTLP_ENDPOINT ? '✅ Exporting to ' + process.env.OTEL_EXPORTER_OTLP_ENDPOINT : '📝 Set OTEL_EXPORTER_OTLP_ENDPOINT to enable'}\n`);
 });
 

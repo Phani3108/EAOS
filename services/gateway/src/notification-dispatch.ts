@@ -10,6 +10,7 @@
  */
 
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -108,15 +109,15 @@ let persistentStore: Store | null = null;
 const CHANNELS_TABLE = 'notification_channels';
 const RULES_TABLE = 'notification_rules';
 
-export function initNotificationStore(store: Store): void {
+export async function initNotificationStore(store: Store): Promise<void> {
   persistentStore = store;
   try {
-    const storedChannels = store.all(CHANNELS_TABLE);
+    const storedChannels = await readAll(store, CHANNELS_TABLE);
     for (const row of storedChannels) {
       const c = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as ChannelConfig;
       if (c.id) channels.set(c.id, c);
     }
-    const storedRules = store.all(RULES_TABLE);
+    const storedRules = await readAll(store, RULES_TABLE);
     for (const row of storedRules) {
       const r = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as NotificationRule;
       if (r.id) rules.set(r.id, r);

@@ -27,6 +27,7 @@ import {
   type OKR,
 } from './agent-registry.js';
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -102,12 +103,12 @@ const PROGRAM_TABLE = 'program_records';
 export async function initVisionStore(store: Store): Promise<void> {
   persistentStore = store;
   try {
-    const storedVisions = store.all(VISION_TABLE);
+    const storedVisions = await readAll(store, VISION_TABLE);
     for (const row of storedVisions) {
       const v = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as VisionStatement;
       if (v.id) visionStatements.set(v.id, v);
     }
-    const storedPrograms = store.all(PROGRAM_TABLE);
+    const storedPrograms = await readAll(store, PROGRAM_TABLE);
     for (const row of storedPrograms) {
       const p = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as ProgramRecord;
       if (p.id) programRecords.set(p.id, p);

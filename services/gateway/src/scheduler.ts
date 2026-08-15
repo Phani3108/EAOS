@@ -21,6 +21,15 @@ export type JobStatus = 'active' | 'paused' | 'failed' | 'completed' | 'pending'
 
 export interface ScheduledJob {
     id: string;
+    /**
+     * Owning tenant, captured from the creating principal.
+     *
+     * Optional only for backward compatibility with jobs persisted before this
+     * field existed; those fall back to 'default'. A scheduled run produces a
+     * real execution, so without this the run — and everything attributed from
+     * it — would be tenant-less.
+     */
+    tenantId?: string;
     name: string;
     skillId: string;
     skillName: string;
@@ -306,6 +315,9 @@ export class Scheduler {
                 // accurate success/failure in the job log.
                 const persona = this.resolvePersonaForJob(job);
                 const exec = createPersonaExecution(
+                    // Pre-existing jobs have no tenant recorded; 'default' matches
+                    // the single-tenant behaviour they were created under.
+                    job.tenantId ?? 'default',
                     persona,
                     skill,
                     job.inputs ?? {},
