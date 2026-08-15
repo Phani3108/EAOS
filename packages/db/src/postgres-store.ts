@@ -72,8 +72,38 @@ CREATE INDEX IF NOT EXISTS idx_kv_store_table ON kv_store(_table);
 export class PostgresStore implements Store {
   private ready: Promise<void>;
 
+  /** Set when schema bootstrap failed. While set, this store is unusable. */
+  private bootstrapError: string | undefined;
+
   constructor() {
-    this.ready = this.bootstrap();
+    // The rejection MUST be attended here. `this.ready = this.bootstrap()` left an
+    // unattended promise, so an unreachable database at construction surfaced as
+    // an uncaughtException and took the whole gateway down — before any logger or
+    // health endpoint could report why.
+    //
+    // Catching does not hide the failure: it is recorded, logged once, and exposed
+    // via `unavailableReason` so readiness can fail honestly while liveness stays
+    // up. Restarting the process does not fix an unreachable database; it just
+    // adds an outage on top of one.
+    this.ready = this.bootstrap().catch((err: unknown) => {
+      this.bootstrapError = (err as Error).message;
+      console.error(
+        `[postgres-store] schema bootstrap failed: ${this.bootstrapError}\n` +
+          '[postgres-store] This store is unusable. Every read will report the failure ' +
+          'rather than returning empty results, which would look like data loss.',
+      );
+    });
+  }
+
+  /**
+   * Why this store cannot be used, or undefined when healthy.
+   *
+   * Callers should surface this on readiness. A store that returns `[]` because it
+   * cannot reach the database is indistinguishable from an empty database, and
+   * that ambiguity is how "our data vanished" incidents start.
+   */
+  get unavailableReason(): string | undefined {
+    return this.bootstrapError;
   }
 
   private async bootstrap(): Promise<void> {

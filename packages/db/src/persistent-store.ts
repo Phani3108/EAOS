@@ -17,6 +17,18 @@ import type { Store } from './connection.js';
 // Persistent Store
 // ---------------------------------------------------------------------------
 
+/**
+ * Every store.json path an instance currently owns, in this process.
+ *
+ * Two PersistentStore instances over one file is silent data loss, not a
+ * conflict: each keeps a private table map and `save()` serialises only its own
+ * tables over the whole file, so the last debounce to fire deletes the other's
+ * data. This is not hypothetical — server.ts and initWorkflowStore() both
+ * defaulted to `<cwd>/.agentos-data/store.json`, and the on-disk file ended up
+ * with no `pipeline_executions` table at all. Fail loudly instead.
+ */
+const openStorePaths = new Set<string>();
+
 export class PersistentStore implements Store {
     private tables: Map<string, Map<string, Record<string, unknown>>> = new Map();
     private filePath: string;
@@ -29,7 +41,22 @@ export class PersistentStore implements Store {
             mkdirSync(dir, { recursive: true });
         }
         this.filePath = join(dir, 'store.json');
+        if (openStorePaths.has(this.filePath)) {
+            throw new Error(
+                `[persistent-store] A PersistentStore is already open on ${this.filePath}. ` +
+                    'Two instances over one file silently lose writes — inject the existing ' +
+                    'Store instead of constructing a second one.',
+            );
+        }
+        openStorePaths.add(this.filePath);
         this.load();
+    }
+
+    /** Release this instance's claim on its file (tests, shutdown). */
+    close(): void {
+        if (this.saveTimer) clearTimeout(this.saveTimer);
+        if (this.dirty) this.save();
+        openStorePaths.delete(this.filePath);
     }
 
     // -----------------------------------------------------------------------

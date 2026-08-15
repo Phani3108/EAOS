@@ -2,7 +2,7 @@
     "name": "@agentos/db",
     "version": "0.1.0",
     "private": true,
-    "description": "Database persistence layer — in-memory dev store + Postgres migrations",
+    "description": "Database persistence layer \u2014 in-memory dev store + Postgres migrations",
     "license": "MIT",
     "type": "module",
     "main": "dist/connection.js",
@@ -26,6 +26,10 @@
         "./workflow-store": {
             "types": "./dist/workflow-store.d.ts",
             "import": "./dist/workflow-store.js"
+        },
+        "./create-store": {
+            "types": "./dist/create-store.d.ts",
+            "import": "./dist/create-store.js"
         }
     },
     "scripts": {
