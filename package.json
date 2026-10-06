@@ -39,13 +39,16 @@
       "@hono/node-server": "1.19.15",
       "protobufjs@^7.0.0": "7.6.5",
       "@protobufjs/utf8": "1.1.1",
-      "@grpc/grpc-js": "1.14.4",
+      "@grpc/grpc-js": "1.14.5",
       "postcss@^8.0.0": "8.5.23",
-      "fast-uri": "3.1.6",
+      "fast-uri": "3.1.8",
       "nanoid@^3.0.0": "3.3.18",
       "ip-address": "10.3.1",
       "qs": "6.16.0",
-      "yaml@^1.0.0": "1.10.3"
+      "yaml@^1.0.0": "1.10.3",
+      "source-map-js": "1.2.2",
+      "proxy-addr": "2.0.8",
+      "sharp@^0.35.0": "0.35.5"
     }
   },
   "scripts": {

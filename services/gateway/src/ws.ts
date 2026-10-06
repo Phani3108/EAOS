@@ -26,7 +26,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type http from 'node:http';
 import type { Duplex } from 'node:stream';
-import { getRedis } from './redis-client.js';
+import { connectRedis, getRedis, redisUrl } from './redis-client.js';
 import type { AuthUser } from './auth.js';
 import { consumeStreamTicket, isAllowedBrowserOrigin, revokeStreamTickets } from './stream-access.js';
 
@@ -37,14 +37,11 @@ const INSTANCE_ID = randomUUID();
 (async () => {
     try {
         const redis = await getRedis();
-        if (!redis) return;
+        const url = redisUrl();
+        if (!redis || !url) return;
 
         // Subscriber uses a dedicated connection
-        const { default: Redis } = await import('ioredis') as any;
-        const sub = new Redis((process.env.REDIS_URL ?? 'redis://localhost:6379'), {
-            lazyConnect: true, connectTimeout: 3000, maxRetriesPerRequest: 1, enableOfflineQueue: false,
-        });
-        await sub.connect();
+        const sub = await connectRedis(url);
         await sub.subscribe(WS_CHANNEL);
         sub.on('message', (_ch: string, msg: string) => {
             try { if (JSON.parse(msg).instanceId === INSTANCE_ID) return; } catch { return; }

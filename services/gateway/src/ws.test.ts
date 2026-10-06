@@ -3,7 +3,14 @@ import net from 'node:net';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AuthUser } from './auth.js';
 const bridge = vi.hoisted(() => ({ receive: undefined as ((channel: string, payload: string) => void) | undefined }));
-vi.mock('./redis-client.js', () => ({ getRedis: async () => ({ publish: async () => 0 }) }));
+vi.mock('./redis-client.js', async () => {
+  const { default: Redis } = await import('ioredis') as any;
+  return {
+    getRedis: async () => ({ publish: async () => 0 }),
+    redisUrl: () => 'redis://test',
+    connectRedis: async () => { const client = new Redis(); await client.connect(); return client; },
+  };
+});
 vi.mock('ioredis', () => ({ default: class {
   async connect() {}
   async subscribe() {}
