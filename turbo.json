@@ -8,11 +8,15 @@
             "dependsOn": [
                 "^build"
             ],
+            "env": ["GATEWAY_INTERNAL_URL", "NEXT_TELEMETRY_DISABLED"],
             "outputs": [
-                "dist/**"
+                "dist/**",
+                ".next/**",
+                "!.next/cache/**"
             ]
         },
         "dev": {
+            "dependsOn": ["^build"],
             "cache": false,
             "persistent": true
         },

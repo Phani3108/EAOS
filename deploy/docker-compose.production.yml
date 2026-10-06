@@ -14,10 +14,24 @@ version: '3.9'
 
 services:
   # ── Gateway API Server ────────────────────────────────────────
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ['node', 'packages/db/dist/migrate.js']
+    environment:
+      - DATABASE_URL=${MIGRATION_DATABASE_URL:?Set MIGRATION_DATABASE_URL for the migration owner}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
   gateway:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.gateway
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: gateway
     ports:
       - '3000:3000'
     environment:
@@ -28,10 +42,25 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       # Database
-      - DATABASE_URL=postgresql://eaos:${POSTGRES_PASSWORD}@postgres:5432/eaos
-      - PERSIST=true
+      - DATABASE_URL=${DATABASE_URL:?Set DATABASE_URL for a non-owner application role}
+      - REDIS_URL=redis://redis:6379
+      - SEED_DEMO=false
       # Auth
-      - JWT_SECRET=${JWT_SECRET:-agentos-production-secret-change-me}
+      - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET}
+      - EAOS_SETUP_TOKEN=${EAOS_SETUP_TOKEN:-}
+      - EAOS_TENANT_ID=${EAOS_TENANT_ID:-default}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3010}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3010}
+      - GATEWAY_URL=${GATEWAY_URL:-http://localhost:3010/_/gateway}
+      - API_KEY_HASH_SECRET=${API_KEY_HASH_SECRET:-}
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - VAULT_KV_MOUNT=${VAULT_KV_MOUNT:-secret}
+      - OIDC_ISSUER_URL=${OIDC_ISSUER_URL:-}
+      - OIDC_CLIENT_ID=${OIDC_CLIENT_ID:-}
+      - OIDC_CLIENT_SECRET=${OIDC_CLIENT_SECRET:-}
+      - OIDC_REDIRECT_URI=${OIDC_REDIRECT_URI:-}
+      - OIDC_DEFAULT_TENANT=${EAOS_TENANT_ID:-default}
       # Cost Controls
       - COST_BUDGET_HOURLY_USD=${COST_BUDGET_HOURLY_USD:-50}
       # Connectors
@@ -41,14 +70,16 @@ services:
       - JIRA_API_TOKEN=${JIRA_API_TOKEN:-}
       - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
       # Observability
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ['CMD', 'curl', '-f', 'http://localhost:3000/health']
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/api/live').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -64,12 +95,14 @@ services:
   web:
     build:
       context: ..
-      dockerfile: deploy/Dockerfile.web
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: web
     ports:
       - '3010:3010'
     environment:
       - NODE_ENV=production
-      - NEXT_PUBLIC_GATEWAY_URL=http://gateway:3000
+      - GATEWAY_INTERNAL_URL=http://gateway:3000
     depends_on:
       - gateway
     restart: unless-stopped
@@ -156,7 +189,7 @@ services:
     ports:
       - '3001:3000'
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?Set GRAFANA_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafanadata:/var/lib/grafana

@@ -28,6 +28,8 @@ Thumbs.db
 # Test & Coverage
 coverage/
 .vitest/
+test-results/
+playwright-report/
 
 # Docker
 docker-volumes/
