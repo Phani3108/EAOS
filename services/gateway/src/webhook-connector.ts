@@ -191,6 +191,36 @@ export function createEndpoint(name: string, source: string, eventPrefix?: strin
   return ep;
 }
 
+export function redactEndpoint(endpoint: WebhookEndpoint) {
+  return {
+    id: endpoint.id,
+    name: endpoint.name,
+    source: endpoint.source,
+    eventPrefix: endpoint.eventPrefix,
+    enabled: endpoint.enabled,
+    receivedCount: endpoint.receivedCount,
+    lastReceivedAt: endpoint.lastReceivedAt,
+    createdAt: endpoint.createdAt,
+  };
+}
+
+export function redactSubscription(subscription: WebhookSubscription) {
+  let targetOrigin: string | undefined;
+  try { targetOrigin = new URL(subscription.targetUrl).origin; } catch {}
+  return {
+    id: subscription.id,
+    name: subscription.name,
+    eventPattern: subscription.eventPattern,
+    targetOrigin,
+    headerNames: Object.keys(subscription.headers ?? {}),
+    enabled: subscription.enabled,
+    deliveredCount: subscription.deliveredCount,
+    failedCount: subscription.failedCount,
+    lastDeliveredAt: subscription.lastDeliveredAt,
+    createdAt: subscription.createdAt,
+  };
+}
+
 export function getEndpoint(id: string): WebhookEndpoint | undefined {
   return endpoints.get(id);
 }

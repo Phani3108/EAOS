@@ -20,16 +20,17 @@ const toolSandbox = new ToolSandbox();
 
 export type MCPAction = 'search' | 'read' | 'create' | 'update' | 'delete' | 'comment' | 'trigger' | 'fetch_metadata' | 'subscribe' | 'list' | 'execute';
 
-export type MCPStatus = 'success' | 'error' | 'timeout' | 'rate_limited' | 'auth_failed' | 'not_connected';
+export type MCPStatus = 'success' | 'error' | 'timeout' | 'rate_limited' | 'auth_failed' | 'not_connected' | 'unsupported' | 'simulated' | 'inconclusive';
 
 export interface MCPToolAction {
+  mode?: 'live' | 'simulation';
   action_id: string;
   tool_id: string;
   action: MCPAction;
   resource_type: string;         // e.g., 'issue', 'pull_request', 'campaign', 'candidate'
   params: Record<string, unknown>;
   auth: {
-    type: 'api_key' | 'oauth' | 'bearer' | 'basic' | 'sandbox';
+    type: 'api_key' | 'oauth' | 'bearer' | 'basic' | 'sandbox' | 'runtime';
     credentials_ref: string;     // Reference to stored credentials
   };
   timeout_ms: number;
@@ -46,6 +47,8 @@ export interface MCPToolAction {
 }
 
 export interface MCPToolResponse {
+  provenance: 'live' | 'simulated' | 'none';
+  task_ref: string;
   action_id: string;
   tool_id: string;
   action: MCPAction;
@@ -190,27 +193,37 @@ export function setMcpResolver(fn: McpResolver | null): void { mcpResolver = fn;
 // Execution log
 const executionLog: MCPToolResponse[] = [];
 
+class ToolExecutionError extends Error {
+  constructor(readonly status: MCPStatus, message: string) { super(message); }
+}
+
 export async function executeMCPAction(action: MCPToolAction): Promise<MCPToolResponse> {
   const startTime = Date.now();
   const capability = TOOL_CAPABILITIES.find(t => t.tool_id === action.tool_id);
 
   // Validate tool exists
   if (!capability) {
-    const response = buildResponse(action, 'error', {}, `Unknown tool: ${action.tool_id}`, startTime);
+    const response = buildResponse(action, 'unsupported', {}, `Unknown tool: ${action.tool_id}`, startTime);
     executionLog.push(response);
     return response;
   }
 
   // Validate action supported
   if (!capability.supported_actions.includes(action.action)) {
-    const response = buildResponse(action, 'error', {}, `Action '${action.action}' not supported by ${action.tool_id}`, startTime);
+    const response = buildResponse(action, 'unsupported', {}, `Action '${action.action}' not supported by ${action.tool_id}`, startTime);
+    executionLog.push(response);
+    return response;
+  }
+
+  if (action.mode === 'simulation' || (action.mode === undefined && action.auth.type === 'sandbox')) {
+    const response = buildResponse(action, 'simulated', { simulated: true, tool: action.tool_id, action: action.action, resource_type: action.resource_type }, undefined, startTime);
     executionLog.push(response);
     return response;
   }
 
   // Check credentials
   const creds = credentials.get(action.auth.credentials_ref);
-  if (!creds && action.auth.type !== 'sandbox') {
+  if (!creds && action.auth.type !== 'runtime') {
     const response = buildResponse(action, 'auth_failed', {}, `No credentials found for ref: ${action.auth.credentials_ref}`, startTime);
     executionLog.push(response);
     return response;
@@ -242,6 +255,11 @@ export async function executeMCPAction(action: MCPToolAction): Promise<MCPToolRe
       return response;
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
+      if (err instanceof ToolExecutionError || !['read', 'search', 'list', 'fetch_metadata'].includes(action.action)) {
+        const response = buildResponse(action, err instanceof ToolExecutionError ? err.status : 'inconclusive', {}, lastError, startTime, attempt);
+        executionLog.push(response);
+        return response;
+      }
       if (attempt < action.retry_policy.max_retries) {
         const delay = action.retry_policy.backoff === 'exponential'
           ? action.retry_policy.base_delay_ms * Math.pow(2, attempt)
@@ -298,34 +316,8 @@ async function executeToolCall(
     throw err;
   }
 
-  // No real connector available — simulate
-  await new Promise(r => setTimeout(r, 50 + Math.random() * 200));
-
-  const simulated: Record<string, unknown> = {
-    tool: action.tool_id,
-    action: action.action,
-    resource_type: action.resource_type,
-    simulated: true,
-  };
-
-  switch (action.action) {
-    case 'create':
-      return { ...simulated, id: `${action.tool_id}-${randomUUID().slice(0, 8)}`, created: true, url: `https://${action.tool_id}.example.com/item/${randomUUID().slice(0, 8)}` };
-    case 'read':
-      return { ...simulated, found: true, data: { id: action.params.id, title: 'Sample Item', status: 'active' } };
-    case 'search':
-      return { ...simulated, results: [{ id: '1', title: 'Result 1' }, { id: '2', title: 'Result 2' }], total: 2 };
-    case 'update':
-      return { ...simulated, updated: true, id: action.params.id };
-    case 'list':
-      return { ...simulated, items: [], total: 0, page: 1 };
-    case 'comment':
-      return { ...simulated, comment_id: `comment-${randomUUID().slice(0, 8)}`, posted: true };
-    case 'trigger':
-      return { ...simulated, triggered: true, run_id: `run-${randomUUID().slice(0, 8)}` };
-    default:
-      return simulated;
-  }
+  // No real connector available — fail closed
+  throw new ToolExecutionError('not_connected', `No live adapter or credentials for ${action.tool_id}/${action.action}`);
 }
 
 function buildResponse(
@@ -338,6 +330,8 @@ function buildResponse(
 ): MCPToolResponse {
   const now = new Date().toISOString();
   return {
+    provenance: status === 'simulated' ? 'simulated' : status === 'success' || status === 'inconclusive' ? 'live' : 'none',
+    task_ref: action.context.task_ref,
     action_id: action.action_id,
     tool_id: action.tool_id,
     action: action.action,
@@ -367,15 +361,17 @@ export function createMCPAction(params: {
   agent_id: string;
   step_index?: number;
   credentials_ref?: string;
+  mode?: 'live' | 'simulation';
 }): MCPToolAction {
   return {
+    mode: params.mode ?? 'live',
     action_id: `mcp-${randomUUID()}`,
     tool_id: params.tool_id,
     action: params.action,
     resource_type: params.resource_type,
     params: params.params,
     auth: {
-      type: 'sandbox',
+      type: params.mode === 'simulation' ? 'sandbox' : params.credentials_ref ? 'api_key' : 'runtime',
       credentials_ref: params.credentials_ref || `cred-${params.tool_id}`,
     },
     timeout_ms: 30000,
@@ -406,7 +402,7 @@ export function getExecutionLog(limit = 100): MCPToolResponse[] {
 
 export function getExecutionLogByTask(taskRef: string): MCPToolResponse[] {
   // Match by action_id prefix or filter stored context
-  return executionLog.filter(r => r.action_id.includes(taskRef));
+  return executionLog.filter(r => r.task_ref === taskRef);
 }
 
 export function getToolStats(): Record<string, { calls: number; success: number; errors: number; avg_latency_ms: number }> {

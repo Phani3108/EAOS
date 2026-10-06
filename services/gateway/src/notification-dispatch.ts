@@ -151,6 +151,23 @@ export function createChannel(
   return entry;
 }
 
+export function redactChannel(channel: ChannelConfig) {
+  const config = channel.config;
+  return {
+    id: channel.id,
+    channel: channel.channel,
+    name: channel.name,
+    enabled: channel.enabled,
+    createdAt: channel.createdAt,
+    config: config.type === 'slack'
+      ? { type: config.type, defaultChannel: config.defaultChannel }
+      : config.type === 'email'
+        ? { type: config.type, smtpHost: config.smtpHost, smtpPort: config.smtpPort, smtpUser: config.smtpUser, fromAddress: config.fromAddress, useTLS: config.useTLS }
+        : { type: config.type },
+    configuredFields: Object.keys(config).filter(key => key !== 'type'),
+  };
+}
+
 export function getChannel(id: string): ChannelConfig | undefined {
   return channels.get(id);
 }
