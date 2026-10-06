@@ -410,7 +410,27 @@ export interface UnifiedStepDef {
     tool?: string;
     outputKey: string;
     requiresApproval?: boolean;
+    approvalFields?: string[];
+    approvalApprovers?: string[];
+    approvalTimeoutMs?: number;
     description?: string;
+    agentLabel?: string;
+    agentPersona?: PersonaId;
+    toolId?: string;
+    toolLabel?: string;
+    kind?: StepKind;
+    inputBindings?: Record<string, unknown>;
+    condition?: { expression: string; trueStep: string; falseStep: string };
+    transform?: Record<string, unknown>;
+    transformExpression?: string;
+    waitMs?: number;
+    subworkflow?: { definition: UnifiedSkillDef };
+    planCandidates?: UnifiedSkillDef[];
+    taskPrompt?: string;
+    retry?: { maxAttempts: number; backoffMs: number; strategy?: 'fixed' | 'linear' | 'exponential' };
+    timeoutMs?: number;
+    outputRequirements?: { sections?: string[]; minCitations?: number };
+    toolAction?: { action: string; resourceType: string; inputBindings: Record<string, string> };
     /** Capability identifier for capability-based routing */
     capability?: string;
     /** DAG mode: IDs of steps this step depends on */
@@ -424,7 +444,7 @@ export interface UnifiedSkillDef {
     description: string;
     icon: string;
     /** The persona this belongs to */
-    persona: 'engineering' | 'marketing' | 'product' | 'leadership' | 'learning' | 'hr';
+    persona: PersonaId | 'leadership';
     /** Visual grouping label */
     cluster: string;
     /** Whether this is an atomic skill or a composed workflow template */
@@ -443,4 +463,148 @@ export interface UnifiedSkillDef {
     composedSkillIds?: string[];
     /** For workflows: DAG edges (if non-sequential) */
     edges?: { from: string; to: string; condition?: string }[];
+    executionMode?: 'sequential' | 'dag';
+    maxConcurrency?: number;
+    schemaVersion?: 1;
+    version?: string;
+    definitionHash?: string;
+}
+
+export { MARKETING_INPUT_FIELDS } from './marketing-inputs.js';
+
+export const WORKFLOW_PERSONAS = ['engineering', 'product', 'marketing', 'hr', 'ta', 'program'] as const;
+export type WorkflowPersona = typeof WORKFLOW_PERSONAS[number];
+export type PersonaId = WorkflowPersona | 'executive' | 'design' | 'learning';
+export type RunMode = 'live' | 'simulation';
+export type Provenance = 'live' | 'simulated' | 'none';
+export const EXECUTION_STATUSES = ['queued', 'running', 'paused', 'completed', 'failed', 'rejected', 'cancelled', 'unsupported', 'inconclusive', 'simulated'] as const;
+export type ExecutionStatus = typeof EXECUTION_STATUSES[number];
+export const STEP_STATUSES = ['pending', 'running', 'approval_required', 'completed', 'failed', 'rejected', 'cancelled', 'unsupported', 'inconclusive', 'simulated', 'skipped'] as const;
+export type StepStatus = typeof STEP_STATUSES[number];
+export type StepKind = 'llm' | 'tool_read' | 'tool_effect' | 'transform' | 'condition' | 'join' | 'approval' | 'subworkflow' | 'planner' | 'wait';
+
+export interface ExecutionError {
+    code: string;
+    message: string;
+    retryable: boolean;
+    stepId?: string;
+}
+
+export interface ExecutionAttempt {
+    id: string;
+    tenantId: string;
+    runId: string;
+    stepId: string;
+    number: number;
+    fencingToken: number;
+    status: 'running' | 'completed' | 'failed' | 'cancelled';
+    startedAt: string;
+    finishedAt?: string;
+    error?: ExecutionError;
+}
+
+export interface ExecutionArtifact {
+    id: string;
+    tenantId: string;
+    runId: string;
+    stepId: string;
+    outputKey: string;
+    mediaType: string;
+    provenance: Provenance;
+    schemaVersion: number;
+    content: unknown;
+    parentArtifactIds: string[];
+    createdAt: string;
+}
+
+export interface ExecutionApproval {
+    id: string;
+    tenantId: string;
+    runId: string;
+    stepId: string;
+    attempt: number;
+    artifactIds: string[];
+    status: 'pending' | 'approved' | 'rejected' | 'expired';
+    requestedBy: string;
+    decidedBy?: string;
+    reason?: string;
+    createdAt: string;
+    decidedAt?: string;
+}
+
+export interface ExecutionEvent {
+    id: string;
+    tenantId: string;
+    runId: string;
+    stepId?: string;
+    type: string;
+    provenance: Provenance;
+    data: Record<string, unknown>;
+    createdAt: string;
+}
+
+export interface ExecutionStep {
+    stepId: string;
+    stepName: string;
+    agentId: string;
+    toolId: string;
+    kind: StepKind;
+    status: StepStatus;
+    provenance: Provenance;
+    outputKey: string;
+    dependsOn: string[];
+    attempts: ExecutionAttempt[];
+    artifactIds: string[];
+    error?: ExecutionError;
+}
+
+export interface ExecutionContract {
+    schemaVersion: 1;
+    definitionHash: string;
+    definitionVersion: string;
+    id: string;
+    tenantId: string;
+    userId: string;
+    parentRunId?: string;
+    persona: WorkflowPersona;
+    skillId: string;
+    skillName: string;
+    mode: RunMode;
+    status: ExecutionStatus;
+    inputs: Record<string, unknown>;
+    steps: ExecutionStep[];
+    artifacts: ExecutionArtifact[];
+    createdAt: string;
+    updatedAt: string;
+    completedAt?: string;
+    error?: ExecutionError;
+}
+
+export function canonicalPersona(value: string): PersonaId | undefined {
+    const normalized = value.trim().toLowerCase();
+    const aliases: Record<string, PersonaId> = { 'talent-acquisition': 'ta', 'program-management': 'program', leadership: 'executive' };
+    return Object.hasOwn(aliases, normalized) ? aliases[normalized] : [...WORKFLOW_PERSONAS, 'executive', 'design', 'learning'].includes(normalized) ? normalized as PersonaId : undefined;
+}
+
+export function aggregateExecutionStatus(steps: readonly StepStatus[], mode: RunMode): ExecutionStatus {
+    for (const status of ['cancelled', 'rejected', 'failed', 'unsupported', 'inconclusive'] as const) if (steps.includes(status)) return status;
+    if (steps.includes('approval_required')) return 'paused';
+    if (steps.includes('running')) return 'running';
+    if (!steps.length || steps.includes('pending') || steps.every(status => status === 'skipped')) return 'inconclusive';
+    if (mode === 'simulation') return steps.every(status => status === 'simulated' || status === 'skipped') ? 'simulated' : 'inconclusive';
+    return steps.every(status => status === 'completed' || status === 'skipped') ? 'completed' : 'inconclusive';
+}
+
+export function isTerminalExecutionStatus(status: string): boolean {
+    return ['completed', 'failed', 'rejected', 'cancelled', 'unsupported', 'inconclusive', 'simulated'].includes(status);
+}
+
+export function assertExecutionTransition(from: ExecutionStatus, to: ExecutionStatus): void {
+    if (from === to) return;
+    const transitions: Partial<Record<ExecutionStatus, readonly ExecutionStatus[]>> = {
+        queued: ['running', 'cancelled', 'failed', 'unsupported'],
+        running: ['paused', 'completed', 'failed', 'rejected', 'cancelled', 'unsupported', 'inconclusive', 'simulated'],
+        paused: ['running', 'rejected', 'cancelled', 'failed'],
+    };
+    if (!transitions[from]?.includes(to)) throw new Error(`Invalid execution transition: ${from} -> ${to}`);
 }

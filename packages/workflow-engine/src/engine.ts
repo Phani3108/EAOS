@@ -11,7 +11,9 @@
 // Types
 // ---------------------------------------------------------------------------
 
-export type StepStatus = 'pending' | 'ready' | 'running' | 'complete' | 'failed' | 'skipped' | 'waiting_approval';
+import { planGraph, validateGraph } from '@agentos/sdk';
+
+export type StepStatus = 'pending' | 'ready' | 'running' | 'complete' | 'failed' | 'skipped' | 'waiting_approval' | 'rejected' | 'cancelled' | 'inconclusive' | 'simulated' | 'unsupported';
 
 export interface Workflow {
     id: string;
@@ -94,7 +96,9 @@ export interface WorkflowTrigger {
 export interface WorkflowExecution {
     id: string;
     workflowId: string;
-    status: 'running' | 'complete' | 'failed' | 'paused';
+    workflowVersion?: string;
+    workflowSignature?: string;
+    status: 'queued' | 'running' | 'complete' | 'simulated' | 'failed' | 'paused' | 'rejected' | 'cancelled' | 'inconclusive' | 'unsupported';
     startedAt: Date;
     completedAt?: Date;
     stepStates: Map<string, StepState>;
@@ -123,6 +127,20 @@ interface Checkpoint { stepId: string; state: Record<string, unknown>; timestamp
 export class WorkflowEngine {
     private executions: Map<string, WorkflowExecution> = new Map();
     private stepExecutors: Map<string, StepExecutor> = new Map();
+    private workflows = new Map<string, Workflow>();
+    private controllers = new Map<string, AbortController>();
+    private processing = new Map<string, Promise<void>>();
+    private checkpointTails = new Map<string, Promise<void>>();
+
+    private checkpoint(execution: WorkflowExecution): Promise<void> {
+        const next = (this.checkpointTails.get(execution.id) ?? Promise.resolve()).then(async () => { await this.options.checkpoint?.(structuredClone(execution)); });
+        this.checkpointTails.set(execution.id, next);
+        return next;
+    }
+
+    constructor(private readonly options: { maxConcurrency?: number; checkpoint?: (execution: WorkflowExecution) => Promise<void> } = {}) {
+        if (options.maxConcurrency !== undefined && (!Number.isInteger(options.maxConcurrency) || options.maxConcurrency < 1 || options.maxConcurrency > 100)) throw new Error('Invalid workflow concurrency');
+    }
 
     /**
      * Register a step executor for a step type.
@@ -141,6 +159,8 @@ export class WorkflowEngine {
         const execution: WorkflowExecution = {
             id: `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             workflowId: workflow.id,
+            workflowVersion: workflow.version,
+            workflowSignature: JSON.stringify({ steps: workflow.steps, edges: workflow.edges, variables: workflow.variables }),
             status: 'running',
             startedAt: new Date(),
             stepStates: new Map(),
@@ -159,6 +179,9 @@ export class WorkflowEngine {
         }
 
         this.executions.set(execution.id, execution);
+        this.workflows.set(execution.id, structuredClone(workflow));
+        this.controllers.set(execution.id, new AbortController());
+        await this.checkpoint(execution);
 
         // Find and execute ready steps (no dependencies)
         await this.processReadySteps(workflow, execution);
@@ -173,15 +196,24 @@ export class WorkflowEngine {
         const execution = this.executions.get(executionId);
         if (!execution) throw new Error(`Execution ${executionId} not found`);
 
+        await this.processing.get(executionId);
         const state = execution.stepStates.get(stepId);
-        if (!state || state.status !== 'waiting_approval') throw new Error(`Step ${stepId} not waiting for approval`);
-
-        state.status = 'complete';
+        if (execution.status !== 'paused' || !state || state.status !== 'waiting_approval') throw new Error(`Step ${stepId} not waiting for approval`);
+        const approved = typeof result === 'boolean' ? result : (result as { approved?: unknown })?.approved;
+        if (typeof approved !== 'boolean') throw new Error('Approval requires an explicit boolean decision');
+        state.status = approved ? 'complete' : 'rejected';
         state.completedAt = new Date();
         state.output = result;
+        execution.variables[`${stepId}_output`] = result;
+        execution.status = approved ? 'running' : 'rejected';
+        if (!approved) execution.completedAt = new Date();
+        await this.checkpoint(execution);
 
         // Find workflow and continue
         // In production: retrieve workflow from persistence
+        const workflow = this.workflows.get(executionId);
+        if (!workflow) throw new Error('Workflow definition is unavailable');
+        if (approved) await this.processReadySteps(workflow, execution);
     }
 
     /**
@@ -191,58 +223,98 @@ export class WorkflowEngine {
         return this.executions.get(executionId);
     }
 
+    async restore(workflow: Workflow, snapshot: WorkflowExecution): Promise<WorkflowExecution> {
+        this.validateDAG(workflow);
+        if (snapshot.workflowId !== workflow.id || snapshot.workflowVersion !== workflow.version || snapshot.workflowSignature !== JSON.stringify({ steps: workflow.steps, edges: workflow.edges, variables: workflow.variables }) || snapshot.stepStates.size !== workflow.steps.length || workflow.steps.some(step => !snapshot.stepStates.has(step.id))) throw new Error('Checkpoint does not match the workflow definition');
+        const execution = structuredClone(snapshot);
+        for (const step of workflow.steps) {
+            const state = execution.stepStates.get(step.id)!;
+            if (state.status === 'running' && step.type === 'tool') { state.status = 'inconclusive'; execution.status = 'inconclusive'; state.error = 'Interrupted effect requires reconciliation'; }
+            else if (state.status === 'running' || state.status === 'ready') state.status = 'pending';
+        }
+        this.workflows.set(execution.id, structuredClone(workflow));
+        this.executions.set(execution.id, execution);
+        this.controllers.set(execution.id, new AbortController());
+        await this.checkpoint(execution);
+        if (execution.status === 'running') await this.processReadySteps(workflow, execution);
+        return execution;
+    }
+
+    async cancel(executionId: string): Promise<void> {
+        const execution = this.executions.get(executionId);
+        if (!execution || !['running','paused'].includes(execution.status)) return;
+        execution.status = 'cancelled';
+        execution.completedAt = new Date();
+        this.controllers.get(executionId)?.abort(new Error('Workflow cancelled'));
+        for (const state of execution.stepStates.values()) if (['pending','ready','running','waiting_approval'].includes(state.status)) state.status = 'cancelled';
+        await this.checkpoint(execution);
+    }
+
     // -------------------------------------------------------------------------
     // DAG processing
     // -------------------------------------------------------------------------
 
     private async processReadySteps(workflow: Workflow, execution: WorkflowExecution): Promise<void> {
-        const readySteps = this.findReadySteps(workflow, execution);
+        const active = this.processing.get(execution.id);
+        if (active) return active;
+        const work = this.drainReadySteps(workflow, execution);
+        this.processing.set(execution.id, work);
+        try { await work; } finally { this.processing.delete(execution.id); }
+    }
 
-        if (readySteps.length === 0) {
-            // Check if all steps are complete
-            const allDone = [...execution.stepStates.values()].every(
-                s => s.status === 'complete' || s.status === 'skipped' || s.status === 'failed'
-            );
-            if (allDone) {
-                execution.status = execution.errors.length > 0 ? 'failed' : 'complete';
+    private async drainReadySteps(workflow: Workflow, execution: WorkflowExecution): Promise<void> {
+        while (execution.status === 'running') {
+            const readySteps = this.findReadySteps(workflow, execution).slice(0, this.options.maxConcurrency ?? 4);
+            const states = [...execution.stepStates.values()];
+            if (states.some(state => ['failed','rejected','cancelled','inconclusive'].includes(state.status))) {
+                execution.status = states.some(state => state.status === 'inconclusive') ? 'inconclusive' : 'failed';
                 execution.completedAt = new Date();
+                await this.checkpoint(execution);
+                return;
             }
-            return;
+            if (!readySteps.length) {
+                // Check if all steps are complete
+                const allDone = states.every(state => state.status === 'complete' || state.status === 'skipped');
+                execution.status = allDone ? 'complete' : states.some(state => state.status === 'waiting_approval') ? 'paused' : 'failed';
+                if (execution.status !== 'paused') execution.completedAt = new Date();
+                await this.checkpoint(execution);
+                return;
+            }
+            for (const step of readySteps) execution.stepStates.get(step.id)!.status = 'ready';
+            await this.checkpoint(execution);
+            // Execute ready steps in parallel
+            await Promise.all(readySteps.map(step => this.executeStep(workflow, execution, step)));
         }
-
-        // Execute ready steps in parallel
-        await Promise.all(readySteps.map(step => this.executeStep(workflow, execution, step)));
+        await this.checkpoint(execution);
     }
 
     private findReadySteps(workflow: Workflow, execution: WorkflowExecution): WorkflowStep[] {
-        return workflow.steps.filter(step => {
-            const state = execution.stepStates.get(step.id);
-            if (!state || state.status !== 'pending') return false;
-
-            // Check all incoming edges are satisfied
-            const incomingEdges = workflow.edges.filter(e => e.to === step.id);
-
-            // If no incoming edges, this is a root step → ready
-            if (incomingEdges.length === 0) return true;
-
-            return incomingEdges.some(edge => {
-                const fromState = execution.stepStates.get(edge.from);
-                if (!fromState || fromState.status !== 'complete') return false;
-
+        // Check all incoming edges are satisfied
+        const edges = workflow.edges.map(edge => {
+            const from = workflow.steps.find(step => step.id === edge.from)!;
+            const state = execution.stepStates.get(edge.from)!;
+            let enabled = true;
+            if (state.status === 'complete') {
+                if (from.config.type === 'condition') enabled = edge.to === (state.output ? from.config.trueEdge : from.config.falseEdge);
                 // Check edge condition if any
-                if (edge.condition) {
-                    return this.evaluateExpression(edge.condition, execution.variables);
-                }
-                return true;
-            });
+                if (edge.condition) enabled = enabled && this.evaluateExpression(edge.condition, execution.variables);
+            }
+            return { ...edge, enabled };
         });
+        // If no incoming edges, this is a root step → ready
+        const plan = planGraph(workflow.steps.map(step => ({ id: step.id, status: execution.stepStates.get(step.id)!.status })), edges);
+        for (const id of plan.skipped) Object.assign(execution.stepStates.get(id)!, { status: 'skipped', completedAt: new Date() });
+        for (const id of plan.blocked) Object.assign(execution.stepStates.get(id)!, { status: 'failed', error: 'Required dependency failed', completedAt: new Date() });
+        return plan.ready.map(id => workflow.steps.find(step => step.id === id)!);
     }
 
     private async executeStep(workflow: Workflow, execution: WorkflowExecution, step: WorkflowStep): Promise<void> {
         const state = execution.stepStates.get(step.id)!;
+        if (this.controllers.get(execution.id)?.signal.aborted || !['ready','pending'].includes(state.status)) return;
         state.status = 'running';
         state.startedAt = new Date();
         state.attempts++;
+        await this.checkpoint(execution);
 
         try {
             // Handle special step types
@@ -261,7 +333,8 @@ export class WorkflowEngine {
                     .map(id => workflow.steps.find(s => s.id === id))
                     .filter((s): s is WorkflowStep => s !== undefined);
 
-                await Promise.all(parallelSteps.map(s => this.executeStep(workflow, execution, s)));
+                if (parallelSteps.some(child => !['complete','skipped'].includes(execution.stepStates.get(child.id)!.status))) throw new Error('Parallel join has unresolved work');
+                state.output = Object.fromEntries(parallelSteps.filter(child => execution.stepStates.get(child.id)!.status === 'complete').map(child => [child.id, execution.stepStates.get(child.id)!.output]));
                 state.status = 'complete';
                 state.completedAt = new Date();
             } else {
@@ -269,14 +342,11 @@ export class WorkflowEngine {
                 const executor = this.stepExecutors.get(step.config.type);
                 if (!executor) throw new Error(`No executor for step type: ${step.config.type}`);
 
-                const timeoutPromise = new Promise<never>((_, reject) =>
-                    setTimeout(() => reject(new Error('Step timeout')), step.timeoutMs)
-                );
-
-                const result = await Promise.race([
-                    executor.execute(step.config, execution.variables),
-                    timeoutPromise,
-                ]);
+                const result = await this.invokeExecutor(executor, step, execution, state.attempts);
+                if (this.controllers.get(execution.id)?.signal.aborted) return;
+                const outcome = result && typeof result === 'object' ? (result as { status?: string; error?: unknown }).status : undefined;
+                if (outcome && ['failed','failure','error','unsupported','inconclusive'].includes(outcome)) throw Object.assign(new Error(`Executor reported ${outcome}`), { retryable: false, inconclusive: outcome === 'inconclusive' });
+                if (outcome === 'waiting_approval') { state.status = 'waiting_approval'; execution.status = 'paused'; return; }
 
                 state.output = result;
                 state.status = 'complete';
@@ -286,6 +356,7 @@ export class WorkflowEngine {
                 execution.variables[`${step.id}_output`] = result;
             }
 
+            execution.variables[`${step.id}_output`] = state.output;
             // Create checkpoint
             execution.checkpoints.push({
                 stepId: step.id,
@@ -294,20 +365,21 @@ export class WorkflowEngine {
             });
 
             // Continue to next steps
-            await this.processReadySteps(workflow, execution);
+            await this.checkpoint(execution);
 
         } catch (error) {
+            if (this.controllers.get(execution.id)?.signal.aborted) return;
             const errMsg = error instanceof Error ? error.message : String(error);
             execution.errors.push({ stepId: step.id, error: errMsg, timestamp: new Date(), attempt: state.attempts });
 
-            if (step.onError === 'retry' && state.attempts < step.retry.maxAttempts) {
+            if (step.onError === 'retry' && state.attempts < step.retry.maxAttempts && (error as { retryable?: boolean })?.retryable !== false && !(error as { inconclusive?: boolean })?.inconclusive) {
                 state.status = 'pending';
                 await new Promise(r => setTimeout(r, step.retry.backoffMs * state.attempts));
                 await this.executeStep(workflow, execution, step);
             } else if (step.onError === 'skip') {
                 state.status = 'skipped';
                 state.completedAt = new Date();
-                await this.processReadySteps(workflow, execution);
+                await this.checkpoint(execution);
             } else if (step.onError === 'fallback' && step.fallbackStepId) {
                 const fallback = workflow.steps.find(s => s.id === step.fallbackStepId);
                 if (fallback) {
@@ -315,9 +387,11 @@ export class WorkflowEngine {
                     await this.executeStep(workflow, execution, fallback);
                 }
             } else {
-                state.status = 'failed';
+                state.status = (error as { inconclusive?: boolean })?.inconclusive ? 'inconclusive' : 'failed';
                 state.error = errMsg;
-                execution.status = 'failed';
+                state.completedAt = new Date();
+                execution.status = state.status;
+                execution.completedAt = new Date();
             }
         }
     }
@@ -326,29 +400,44 @@ export class WorkflowEngine {
     // Helpers
     // -------------------------------------------------------------------------
 
+    private async invokeExecutor(executor: StepExecutor, step: WorkflowStep, execution: WorkflowExecution, attempt: number): Promise<unknown> {
+        const controller = new AbortController();
+        const parent = this.controllers.get(execution.id)!.signal;
+        parent.throwIfAborted();
+        const cancel = () => controller.abort(parent.reason ?? new Error('Workflow cancelled'));
+        parent.addEventListener('abort', cancel, { once: true });
+        if (parent.aborted) cancel();
+        let rejectAbort!: (reason: unknown) => void;
+        const aborted = new Promise<never>((_, reject) => { rejectAbort = reject; });
+        const onAbort = () => rejectAbort(controller.signal.reason);
+        controller.signal.addEventListener('abort', onAbort, { once: true });
+        if (controller.signal.aborted) onAbort();
+        const timer = setTimeout(() => controller.abort(Object.assign(new Error('Step timeout'), { retryable: step.type !== 'tool', inconclusive: step.type === 'tool' })), step.timeoutMs);
+        try {
+            return await Promise.race([executor.execute(step.config, structuredClone(execution.variables), { signal: controller.signal, stepId: step.id, attempt }), aborted]);
+        } finally {
+            clearTimeout(timer);
+            parent.removeEventListener('abort', cancel);
+            controller.signal.removeEventListener('abort', onAbort);
+        }
+    }
+
     private validateDAG(workflow: Workflow): void {
-        const visited = new Set<string>();
-        const stack = new Set<string>();
-
-        const hasCycle = (stepId: string): boolean => {
-            if (stack.has(stepId)) return true;
-            if (visited.has(stepId)) return false;
-            visited.add(stepId);
-            stack.add(stepId);
-
-            const outgoing = workflow.edges.filter(e => e.from === stepId);
-            for (const edge of outgoing) {
-                if (hasCycle(edge.to)) return true;
-            }
-
-            stack.delete(stepId);
-            return false;
-        };
-
+        validateGraph(workflow.steps, workflow.edges);
         for (const step of workflow.steps) {
-            if (hasCycle(step.id)) {
-                throw new Error(`Workflow ${workflow.id} contains a cycle at step ${step.id}`);
+            if (step.type !== step.config.type || !Number.isInteger(step.retry.maxAttempts) || step.retry.maxAttempts < 1 || step.retry.maxAttempts > 10 || !Number.isFinite(step.retry.backoffMs) || step.retry.backoffMs < 0 || step.retry.backoffMs > 60_000 || !Number.isFinite(step.timeoutMs) || step.timeoutMs <= 0 || step.timeoutMs > 3_600_000) throw new Error('Invalid step execution policy');
+            if (step.onError === 'fallback') throw new Error('Fallback must be represented by explicit graph branches');
+            if (step.config.type === 'condition') {
+                const config = step.config;
+                if (!workflow.edges.some(edge => edge.from === step.id && edge.to === config.trueEdge) || !workflow.edges.some(edge => edge.from === step.id && edge.to === config.falseEdge)) throw new Error('Condition references an unknown branch');
+                if (config.expression.length > 4000) throw new Error('Condition is too large');
+                evalSafeExpression(config.expression, {});
             }
+            if (step.config.type === 'parallel' && (!step.config.stepIds.length || step.config.stepIds.some(id => !workflow.edges.some(edge => edge.from === id && edge.to === step.id)))) throw new Error('Parallel joins require explicit dependency edges');
+        }
+        for (const edge of workflow.edges) if (edge.condition) {
+            if (edge.condition.length > 4000) throw new Error('Edge condition is too large');
+            evalSafeExpression(edge.condition, {});
         }
     }
 
@@ -470,7 +559,7 @@ function tokenizeExpression(input: string): Token[] {
  * Precedence (low → high): || , && , equality , comparison , additive ,
  * multiplicative , unary , primary.
  */
-function evalSafeExpression(expr: string, vars: Record<string, unknown>): unknown {
+export function evalSafeExpression(expr: string, vars: Record<string, unknown>): unknown {
     const tokens = tokenizeExpression(expr);
     let pos = 0;
 
@@ -645,5 +734,5 @@ function resolveVar(path: string, vars: Record<string, unknown>): unknown {
 // ---------------------------------------------------------------------------
 
 export interface StepExecutor {
-    execute(config: StepConfig, variables: Record<string, unknown>): Promise<unknown>;
+    execute(config: StepConfig, variables: Record<string, unknown>, context?: { signal: AbortSignal; stepId: string; attempt: number }): Promise<unknown>;
 }

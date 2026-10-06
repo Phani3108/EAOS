@@ -374,7 +374,9 @@ export interface WorkflowHook {
 export interface WorkflowExecution {
     id: string;
     workflowId: string;
-    status: 'running' | 'completed' | 'failed' | 'cancelled';
+    status: 'queued' | 'running' | 'paused' | 'completed' | 'simulated' | 'failed' | 'rejected' | 'inconclusive' | 'unsupported' | 'cancelled';
+    mode?: 'live' | 'simulation';
+    stepStates?: Map<string, { status: string; childRunId?: string }>;
     trigger: unknown;
     stepResults: Map<string, TaskResult>;
     startedAt: Date;
