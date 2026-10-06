@@ -49,7 +49,7 @@ export class PersistentStore implements Store {
             );
         }
         openStorePaths.add(this.filePath);
-        this.load();
+        try { this.load(); } catch (err) { openStorePaths.delete(this.filePath); throw err; }
     }
 
     /** Release this instance's claim on its file (tests, shutdown). */
@@ -121,7 +121,7 @@ export class PersistentStore implements Store {
             }
         }
 
-        console.error(`💾 Failed to load data file and backup — starting fresh`);
+        throw new Error('Data file and backup are unreadable; refusing to overwrite existing data');
     }
 
     /**

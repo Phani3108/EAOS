@@ -39,6 +39,7 @@ async function getPool(): Promise<PgPool> {
   if (_pool) return _pool as PgPool;
   // Dynamic import so the module only fails when actually used
   const { default: pg } = await import('pg');
+  if (_pool) return _pool as PgPool;
   const Pool = pg.Pool ?? (pg as unknown as { Pool: new (config: Record<string, unknown>) => PgPool }).Pool;
   _pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -108,6 +109,7 @@ export class PostgresStore implements Store {
 
   private async bootstrap(): Promise<void> {
     const pool = await getPool();
+    if (process.env.NODE_ENV === 'production') { await pool.query('SELECT 1 FROM kv_store LIMIT 0'); return; }
     await pool.query(BOOTSTRAP_SQL);
     // Also try to run the typed tables migration (non-fatal if already exists)
     try {

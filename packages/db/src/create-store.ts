@@ -15,7 +15,7 @@
  * be diagnosed. A process that exits before it opens a port cannot.
  */
 
-import { existsSync, mkdirSync, accessSync, constants } from 'node:fs';
+import { existsSync, mkdirSync, accessSync, statSync, constants } from 'node:fs';
 import { join } from 'node:path';
 import { InMemoryStore, type Store } from './connection.js';
 import { PersistentStore } from './persistent-store.js';
@@ -52,6 +52,7 @@ function ensureWritableDir(dir: string): { ok: true } | { ok: false; reason: str
       mkdirSync(dir, { recursive: true });
       return { ok: true };
     }
+    if (!statSync(dir).isDirectory()) return { ok: false, reason: 'DATA_DIR is not a directory' };
     accessSync(dir, constants.W_OK);
     return { ok: true };
   } catch (err) {
