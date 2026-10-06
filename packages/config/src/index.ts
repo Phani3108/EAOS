@@ -71,6 +71,12 @@ const SPEC = {
   CORS_ALLOWED_ORIGINS: { kind: 'string' },
   /** Explicit switches, replacing NODE_ENV-conditional security branches. */
   ALLOW_ANON: { kind: 'bool', default: false },
+  /**
+   * `local`: unauthenticated requests act as one named local-demo administrator
+   * (set by the dev launchers; rejected in production). `public`: visitors may mint
+   * an isolated, simulation-only demo session via POST /api/auth/demo.
+   */
+  EAOS_DEMO_MODE: { kind: 'enum', values: ['off', 'local', 'public'], default: 'off' },
   REQUIRE_SIGNED_TOKENS: { kind: 'bool', default: true },
   /** KEK for credential envelope encryption. 32 bytes, base64. */
   EAOS_ENCRYPTION_KEY: { kind: 'string', secret: true },
@@ -120,6 +126,7 @@ export interface Env {
   EAOS_SETUP_TOKEN?: string;
   CORS_ALLOWED_ORIGINS?: string;
   ALLOW_ANON: boolean;
+  EAOS_DEMO_MODE: 'off' | 'local' | 'public';
   REQUIRE_SIGNED_TOKENS: boolean;
   EAOS_ENCRYPTION_KEY?: string;
   DATABASE_URL?: string;
@@ -286,6 +293,23 @@ function crossFieldProblems(env: Env): EnvProblem[] {
     });
   }
 
+  if (env.EAOS_DEMO_MODE === 'local') {
+    problems.push({
+      key: 'EAOS_DEMO_MODE',
+      severity: isProd ? 'error' : 'warning',
+      message: isProd
+        ? 'Local demo mode signs every unauthenticated request in as an administrator and cannot run in production. Use EAOS_DEMO_MODE=public for a hosted demo.'
+        : 'Local demo mode is ON — unauthenticated requests act as the local demo administrator. Never expose this port.',
+    });
+  }
+  if (env.EAOS_DEMO_MODE === 'public' && !signingSecret) {
+    problems.push({
+      key: 'EAOS_DEMO_MODE',
+      severity: 'error',
+      message: 'Public demo sessions are signed tokens; set JWT_SECRET (openssl rand -base64 48).',
+    });
+  }
+
   const hasLlmKey = Boolean(
     env.ANTHROPIC_API_KEY ||
       env.OPENAI_API_KEY ||
@@ -298,8 +322,8 @@ function crossFieldProblems(env: Env): EnvProblem[] {
       key: 'ANTHROPIC_API_KEY',
       severity: 'warning',
       message:
-        'No LLM provider configured. The gateway boots and serves, but any real run fails with ' +
-        'LLMNotConfiguredError. Explicitly simulated runs still work.',
+        'No LLM provider configured. Runs that do not choose a mode are simulated and labelled as such; ' +
+        'a run that explicitly asks for live mode fails with LLMNotConfiguredError.',
     });
   }
 

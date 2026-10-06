@@ -2,7 +2,6 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { TourProvider } from '../components/tour/TourProvider';
 import ThemeProvider from '../components/ThemeProvider';
-import AuthGate from '../components/AuthGate';
 
 export const metadata: Metadata = {
     title: 'EAOS — Enterprise Agent Operating System',
@@ -35,9 +34,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </head>
             <body className="antialiased">
                 <ThemeProvider>
-                    <TourProvider>
-                        <AuthGate>{children}</AuthGate>
-                    </TourProvider>
+                    {/* The session gate wraps the app shell in page.tsx, not this layout, so the landing page stays public. */}
+                    <TourProvider>{children}</TourProvider>
                 </ThemeProvider>
             </body>
         </html>

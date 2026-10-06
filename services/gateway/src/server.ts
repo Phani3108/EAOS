@@ -27,7 +27,7 @@ import {
 } from './api-key-store.js';
 import { resolveApiKeyScopes, revokeApiKey, rotateApiKey } from './api-key-lifecycle.js';
 import { runSetup, SETUP_TABLE } from './setup.js';
-import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, hashApiKeyCandidates } from './auth.js';
+import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, hashApiKeyCandidates, isDemoPrincipal, DEMO_PRINCIPAL_PREFIX } from './auth.js';
 import { initAuthSessions, createBrowserSession, refreshBrowserSession, getSessionUser, getRefreshUser, revokeBrowserSession, issueLoginCode, consumeLoginCode, readCookie, cookie, setSessionCookies, setSessionRevocationHandler, persistOidcUser, setPrincipalResolver } from './auth-sessions.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
@@ -146,7 +146,7 @@ import { issueStreamTicket, canReadStreamResource, isAllowedBrowserOrigin } from
 import http from 'node:http';
 import fs from 'node:fs';
 import nodePath from 'node:path';
-import { createHash as nodeCreateHash, randomBytes } from 'node:crypto';
+import { createHash as nodeCreateHash, randomBytes, randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 
@@ -922,7 +922,19 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (/^\/api\/tools\/[^/]+\/(auth|(oauth\/)?callback)$/.test(path) && guardRole('admin')) return;
     if (path === '/api/marketing/notifications/config' && guardRole('operator')) return;
     if (method !== 'GET' && (path.startsWith('/api/marketplace/skills') || path === '/api/mcp/execute') && guardRole('operator')) return;
-    if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && guardRole('operator')) return;
+    // Demo visitors may decide steps of their OWN runs (always simulated): the
+    // executionRoute check below 404s any run they cannot read, and a role=user
+    // principal can only read runs it owns.
+    if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && !isDemoPrincipal(authUser) && guardRole('operator')) return;
+    /**
+     * Run mode is decided here, once per request, and recorded on the run
+     * (`exec.mode`). A client may choose; with no choice, no configured LLM
+     * provider means a labelled simulation rather than a run that is accepted
+     * and then fails. Public demo visitors are always simulated — they must not
+     * spend this deployment's LLM budget.
+     */
+    const resolveSimulate = (requested?: unknown): boolean =>
+        (env.EAOS_DEMO_MODE === 'public' && isDemoPrincipal(authUser)) || (typeof requested === 'boolean' ? requested : !hasAnyLLMKey());
     const IS_PRODUCTION = process.env.NODE_ENV === 'production';
     const enforceExecutionOwnership = (): boolean => {
         if (authUser?.role === 'admin' || authUser?.role === 'operator') return false;
@@ -1221,7 +1233,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             }
 
             const skill = synthesizeAdoptedSkill(fsSkill);
-            const shouldSimulate = simulate === true;
+            const shouldSimulate = resolveSimulate(simulate);
             const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${fsSkill.name} (adopted)`);
             broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate: shouldSimulate, adopted: true });
@@ -1306,7 +1318,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const provider = body.provider as string | undefined;
             const modelId = body.modelId as string | undefined;
             try {
-                const result = await runReviewPipeline(artifact, { roles, provider, modelId, simulate: body.simulate === true });
+                const result = await runReviewPipeline(artifact, { roles, provider, modelId, simulate: resolveSimulate(body.simulate) });
                 recordAudit(userId, 'review.run', `autoplan review → ${result.finalVerdict} (${result.reviewers.length} reviewers)`);
                 sendJSON(res, 200, result);
             } catch (err) {
@@ -1381,7 +1393,32 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // GET /api/auth/me — return current user info from token
         if (path === '/api/auth/me' && method === 'GET') {
             if (!authUser) { sendJSON(res, 401, { error: 'Not authenticated' }); return; }
-            sendJSON(res, 200, { user: { id: authUser.id, email: authUser.email, name: authUser.name, role: authUser.role, teams: authUser.teams, personaScopes: authUser.personaScopes, tenantId: authUser.tenantId } });
+            sendJSON(res, 200, { user: { id: authUser.id, email: authUser.email, name: authUser.name, role: authUser.role, teams: authUser.teams, personaScopes: authUser.personaScopes, tenantId: authUser.tenantId, demo: isDemoPrincipal(authUser) } });
+            return;
+        }
+
+        // GET /api/auth/config — which sign-in options the UI should offer (public)
+        if (path === '/api/auth/config' && method === 'GET') {
+            sendJSON(res, 200, {
+                demoMode: env.EAOS_DEMO_MODE,
+                sso: Boolean(process.env.OIDC_ISSUER_URL && process.env.OIDC_CLIENT_ID),
+                llmConfigured: hasAnyLLMKey(),
+            });
+            return;
+        }
+
+        // POST /api/auth/demo — isolated, simulation-only demo visitor (EAOS_DEMO_MODE=public).
+        // Public (see public-paths.ts). Each call is a fresh role=user principal, so a
+        // visitor sees only its own runs; resolveSimulate() forces them to simulation.
+        if (path === '/api/auth/demo' && method === 'POST') {
+            if (env.EAOS_DEMO_MODE !== 'public') { sendJSON(res, 404, { error: 'Demo sessions are not enabled on this deployment' }); return; }
+            if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
+            const issued = await createBrowserSession({
+                id: `${DEMO_PRINCIPAL_PREFIX}${randomUUID()}`, email: '', name: 'Demo visitor', role: 'user',
+                teams: [], personaScopes: ['*'], tenantId: deploymentTenantId,
+            });
+            setSessionCookies(res, issued);
+            sendJSON(res, 200, { expiresIn: issued.expiresIn, user: { ...issued.user, demo: true } });
             return;
         }
 
@@ -1648,8 +1685,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
 
-            // If the client didn't send simulate, auto-detect: no key configured → sandbox mode
-            const shouldSimulate = simulate === true;
+            const shouldSimulate = resolveSimulate(simulate);
             // Adopted skills carry their instructions in the markdown body — feed it as customPrompt.
             const effectiveCustomPrompt = adoptedBody
                 ? (customPrompt ? `${adoptedBody}\n\n---\n${customPrompt}` : adoptedBody)
@@ -2580,7 +2616,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!tmpl) { sendJSON(res, 404, { error: 'Workflow not found' }); return; }
             const body = await readBody(req).catch(() => ({})) as { inputs?: Record<string, unknown>; simulate?: boolean };
             const inputs = body.inputs ?? {};
-            const shouldSimulate = body.simulate === true;
+            const shouldSimulate = resolveSimulate(body.simulate);
             // Cross-functional templates span personas; the execution persona is the first
             // recognized one (each step carries its own agent). Steps are topologically ordered,
             // so the sequential runner satisfies dependsOn; requiresApproval steps pause on the
@@ -3942,7 +3978,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const { workflowId, inputs, simulate, customPrompt, provider, modelId } = body as { workflowId: string; inputs?: Record<string, unknown>; simulate?: boolean; customPrompt?: string; provider?: string; modelId?: string };
             if (!workflowId) { sendJSON(res, 400, { error: 'Missing workflowId' }); return; }
             try {
-                const exec = await marketingApi.createMarketingExecution(authUser!.tenantId, workflowId, inputs ?? {}, userId, simulate === true, customPrompt, provider as any, modelId);
+                const exec = await marketingApi.createMarketingExecution(authUser!.tenantId, workflowId, inputs ?? {}, userId, resolveSimulate(simulate), customPrompt, provider as any, modelId);
                 sendJSON(res, 201, { execution: exec });
             } catch (err) {
                 sendJSON(res, 400, { error: (err as Error).message });
@@ -5005,7 +5041,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getTASkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'ta' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'ta' as any, skill as any, inputs || {}, userId, resolveSimulate(simulate));
             sendJSON(res, 201, { execution });
             return;
         }
@@ -5048,7 +5084,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getProgramSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'program' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'program' as any, skill as any, inputs || {}, userId, resolveSimulate(simulate));
             sendJSON(res, 201, { execution });
             return;
         }

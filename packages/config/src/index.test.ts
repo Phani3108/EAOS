@@ -163,3 +163,26 @@ describe('exit code', () => {
     expect(EX_CONFIG).toBe(78);
   });
 });
+
+describe('demo mode is explicit and validated', () => {
+  it('defaults to off', () => {
+    expect(validateEnv({}).env.EAOS_DEMO_MODE).toBe('off');
+  });
+  it('rejects an unknown value instead of coercing it', () => {
+    expect(errorKeys({ EAOS_DEMO_MODE: 'yes' })).toContain('EAOS_DEMO_MODE');
+  });
+  it('refuses local demo mode in production', () => {
+    expect(errorKeys({ ...PROD_OK, EAOS_DEMO_MODE: 'local' })).toContain('EAOS_DEMO_MODE');
+  });
+  it('warns but allows local demo mode outside production', () => {
+    const r = validateEnv({ EAOS_DEMO_MODE: 'local' });
+    expect(r.ok).toBe(true);
+    expect(r.problems.some(p => p.key === 'EAOS_DEMO_MODE' && p.severity === 'warning')).toBe(true);
+  });
+  it('allows a public demo in production', () => {
+    expect(errorKeys({ ...PROD_OK, EAOS_DEMO_MODE: 'public' })).not.toContain('EAOS_DEMO_MODE');
+  });
+  it('requires a signing secret for public demo sessions', () => {
+    expect(errorKeys({ EAOS_DEMO_MODE: 'public' })).toContain('EAOS_DEMO_MODE');
+  });
+});

@@ -15,7 +15,7 @@
         }
     },
     "scripts": {
-        "dev": "npx tsx src/server.ts",
+        "dev": "EAOS_DEMO_MODE=${EAOS_DEMO_MODE:-local} npx tsx src/server.ts",
         "start": "node dist/server.js",
         "build": "tsc",
         "typecheck": "tsc --noEmit"

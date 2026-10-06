@@ -1,7 +1,10 @@
 'use client';
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { authRequest, clearUserState, signInWithKey, type SessionUser } from '../lib/auth-client';
+import {
+  authRequest, clearUserState, getAuthConfig, GatewayRequestError, GatewayUnavailableError,
+  signInWithKey, startDemoSession, type AuthConfig, type SessionUser,
+} from '../lib/auth-client';
 
 let initialSession: Promise<{ user: SessionUser }> | undefined;
 const SessionContext = createContext<{ user: SessionUser; busy: boolean; logout: () => Promise<void>; showKey: (key: string) => void } | null>(null);
@@ -16,15 +19,21 @@ export function SessionControls({ compact = false }: { compact?: boolean }) {
   </div>;
 }
 
+/** Only an explicit 401 means "signed out"; an unreachable gateway is not a logout. */
+const isUnauthenticated = (err: unknown) => err instanceof GatewayRequestError && err.status === 401;
+
 export default function AuthGate({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<SessionUser | null>(null);
   const [loading, setLoading] = useState(true);
+  const [offline, setOffline] = useState(false);
+  const [config, setConfig] = useState<AuthConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const [setup, setSetup] = useState(false);
   const [credential, setCredential] = useState('');
   const [email, setEmail] = useState('');
   const [error, setError] = useState('');
   const [issuedKey, setIssuedKey] = useState('');
+  const [attempt, setAttempt] = useState(0);
 
   const accept = useCallback((principal: SessionUser, reload = true) => {
     const identity = `${principal.tenantId}:${principal.id}`;
@@ -46,17 +55,26 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     }
     const load = initialSession ??= (code
       ? authRequest('/api/auth/oidc/exchange', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }) })
-      : authRequest('/api/auth/me'));
-    load.then(data => { if (active) accept(data.user); })
-      .catch(err => { if (active && code) setError(err.message); })
+      : authRequest('/api/auth/me')) as Promise<{ user: SessionUser }>;
+    load.then(data => { if (active) { setOffline(false); accept(data.user); } })
+      .catch(async err => {
+        initialSession = undefined;
+        if (!active) return;
+        if (err instanceof GatewayUnavailableError) { setOffline(true); return; }
+        setOffline(false);
+        if (code) setError(err.message);
+        try { const next = await getAuthConfig(); if (active) setConfig(next); } catch { /* sign-in form still works */ }
+      })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [accept]);
+  }, [accept, attempt]);
 
   useEffect(() => {
     if (!user || issuedKey) return;
     let active = true;
-    const check = () => authRequest('/api/auth/me').catch(() => { if (active) { setUser(null); initialSession = undefined; clearUserState(); } });
+    const check = () => authRequest('/api/auth/me').catch(err => {
+      if (active && isUnauthenticated(err)) { setUser(null); initialSession = undefined; clearUserState(); }
+    });
     const timer = setInterval(check, 60_000);
     window.addEventListener('focus', check);
     return () => { active = false; clearInterval(timer); window.removeEventListener('focus', check); };
@@ -75,6 +93,13 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
       accept(await signInWithKey(key), !setup);
     } catch (err) { setError(err instanceof Error ? err.message : 'Sign-in failed'); }
     finally { setCredential(''); setBusy(false); }
+  }
+
+  async function tryDemo() {
+    setBusy(true); setError('');
+    try { accept(await startDemoSession()); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Could not start the demo'); }
+    finally { setBusy(false); }
   }
 
   async function logout() {
@@ -96,17 +121,33 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
     </section>}
     {!issuedKey && children}
   </SessionContext.Provider>;
+
+  if (offline) return <main className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
+    <section className="w-full max-w-md rounded-xl border bg-white p-6 space-y-4" aria-labelledby="gateway-offline-title">
+      <h1 id="gateway-offline-title" className="text-xl font-semibold">Can’t reach the EAOS gateway</h1>
+      <p className="text-sm text-slate-600">The web app is up, but the gateway API is not answering. Locally, start everything with <code>pnpm dev</code>; on a deployment, check the gateway’s health endpoint.</p>
+      <button className="btn btn-primary w-full" onClick={() => { setLoading(true); setOffline(false); setAttempt(n => n + 1); }}>Retry</button>
+    </section>
+  </main>;
+
   return <main className="min-h-screen flex items-center justify-center bg-slate-50 p-6">
-    <form onSubmit={submit} className="w-full max-w-md rounded-xl border bg-white p-6 space-y-4">
-      <h1 className="text-xl font-semibold">{setup ? 'Set up EAOS' : 'Sign in to EAOS'}</h1>
-      <p className="text-sm text-slate-600">Use your organization API key or single sign-on. Credentials are not saved in browser storage.</p>
-      {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
-      {issuedKey && <section><p>Save your bootstrap key before continuing:</p><code className="break-all select-all">{issuedKey}</code></section>}
-      {setup && <label className="block text-sm">Administrator email<input className="input w-full mt-1" type="email" required value={email} onChange={event => setEmail(event.target.value)} /></label>}
-      <label className="block text-sm">{setup ? 'Operator setup token' : 'API key'}<input className="input w-full mt-1" type="password" autoComplete="off" required value={credential} onChange={event => setCredential(event.target.value)} /></label>
-      <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Working…' : setup ? 'Create administrator' : 'Sign in'}</button>
-      <a className="block text-sm underline" href="/_/gateway/api/auth/oidc/authorize">Sign in with organization SSO</a>
-      <button type="button" className="text-sm underline" onClick={() => { setSetup(!setup); setError(''); setCredential(''); }}>{setup ? 'Use an existing API key' : 'First-time administrator setup'}</button>
-    </form>
+    <div className="w-full max-w-md space-y-4">
+      {config?.demoMode === 'public' && <section className="rounded-xl border bg-white p-6 space-y-3" aria-labelledby="demo-title">
+        <h1 id="demo-title" className="text-xl font-semibold">Try EAOS</h1>
+        <p className="text-sm text-slate-600">Start a private demo session. Every run is simulated and labelled, and only you can see your work.</p>
+        <button className="btn btn-primary w-full" disabled={busy} onClick={() => void tryDemo()}>{busy ? 'Starting…' : 'Try the demo'}</button>
+      </section>}
+      <form onSubmit={submit} className="rounded-xl border bg-white p-6 space-y-4">
+        <h2 className="text-xl font-semibold">{setup ? 'Set up EAOS' : 'Sign in to EAOS'}</h2>
+        <p className="text-sm text-slate-600">Use your organization API key or single sign-on. Credentials are not saved in browser storage.</p>
+        {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
+        {issuedKey && <section><p>Save your bootstrap key before continuing:</p><code className="break-all select-all">{issuedKey}</code></section>}
+        {setup && <label className="block text-sm">Administrator email<input className="input w-full mt-1" type="email" required value={email} onChange={event => setEmail(event.target.value)} /></label>}
+        <label className="block text-sm">{setup ? 'Operator setup token' : 'API key'}<input className="input w-full mt-1" type="password" autoComplete="off" required value={credential} onChange={event => setCredential(event.target.value)} /></label>
+        <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Working…' : setup ? 'Create administrator' : 'Sign in'}</button>
+        {config?.sso !== false && <a className="block text-sm underline" href="/_/gateway/api/auth/oidc/authorize">Sign in with organization SSO</a>}
+        <button type="button" className="text-sm underline" onClick={() => { setSetup(!setup); setError(''); setCredential(''); }}>{setup ? 'Use an existing API key' : 'First-time administrator setup'}</button>
+      </form>
+    </div>
   </main>;
 }

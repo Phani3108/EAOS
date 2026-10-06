@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthUser } from './middleware.js';
 
 const user: AuthUser = { id: 'a', tenantId: 'tenant-a', email: '', name: '', role: 'user', teams: [], personaScopes: ['engineering'] };
@@ -42,5 +42,34 @@ describe('JWT rotation and claims', () => {
   });
   it('rejects invalid token lifetimes', () => {
     for (const ttl of [0, -1, Infinity, 86401]) expect(() => auth.generateJWT(user, ttl)).toThrow();
+  });
+});
+
+describe('demo principals', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+  it('stays unauthenticated when demo mode is off', async () => {
+    expect((await auth.authenticateRequest({})).authenticated).toBe(false);
+  });
+  it('signs unauthenticated requests in as the named local demo admin in local mode', async () => {
+    vi.resetModules(); vi.stubEnv('EAOS_DEMO_MODE', 'local'); vi.stubEnv('EAOS_TENANT_ID', 'tenant-a');
+    const local = await import('./middleware.js');
+    const result = await local.authenticateRequest({});
+    expect(result.user).toMatchObject({ id: 'demo:local', role: 'admin', tenantId: 'tenant-a' });
+    expect(local.isDemoPrincipal(result.user)).toBe(true);
+  });
+  it('never signs in a local demo principal under production', async () => {
+    vi.resetModules(); vi.stubEnv('EAOS_DEMO_MODE', 'local'); vi.stubEnv('NODE_ENV', 'production');
+    const prod = await import('./middleware.js');
+    expect((await prod.authenticateRequest({})).authenticated).toBe(false);
+  });
+  it('grants public demo visitors nothing without a minted session', async () => {
+    vi.resetModules(); vi.stubEnv('EAOS_DEMO_MODE', 'public');
+    const pub = await import('./middleware.js');
+    expect((await pub.authenticateRequest({})).authenticated).toBe(false);
+  });
+  it('recognises only demo:-prefixed ids as demo principals', () => {
+    expect(auth.isDemoPrincipal({ id: 'demo:abc' })).toBe(true);
+    expect(auth.isDemoPrincipal({ id: 'anonymous' })).toBe(false);
+    expect(auth.isDemoPrincipal(undefined)).toBe(false);
   });
 });

@@ -97,6 +97,29 @@ const REQUIRE_SIGNED_TOKENS = process.env.REQUIRE_SIGNED_TOKENS !== 'false';
  */
 const ALLOW_DEV_API_KEYS = process.env.ALLOW_DEV_API_KEYS === 'true';
 
+/**
+ * Demo mode: `off` (default) | `local` | `public`, validated by @agentos/config.
+ *
+ * Demo principals are NAMED (`demo:<id>`), unlike the anonymous fallback. The
+ * ownership, stream-access and approval checks reject the literal 'anonymous'
+ * user by design, so a named principal is what lets a demo visitor own, watch
+ * and approve the runs it starts without loosening those checks for anyone else.
+ */
+const DEMO_MODE = process.env.EAOS_DEMO_MODE ?? 'off';
+export const DEMO_PRINCIPAL_PREFIX = 'demo:';
+
+export function isDemoPrincipal(user: Pick<AuthUser, 'id'> | undefined): boolean {
+    return Boolean(user?.id.startsWith(DEMO_PRINCIPAL_PREFIX));
+}
+
+/** The single principal behind `EAOS_DEMO_MODE=local`: the developer on their own machine. */
+export function localDemoUser(): AuthUser {
+    return {
+        id: `${DEMO_PRINCIPAL_PREFIX}local`, email: 'demo@localhost', name: 'Local demo', role: 'admin',
+        teams: [], personaScopes: ['*'], tenantId: process.env.EAOS_TENANT_ID || 'default',
+    };
+}
+
 // NOTE: the fail-fast check for a missing JWT_SECRET used to live here as a
 // top-level `throw`. A throw during module evaluation exits before any logger,
 // health endpoint or listener exists, so a misconfigured container restart-looped
@@ -144,6 +167,14 @@ export async function authenticateRequest(headers: Record<string, string | undef
             authenticated: true,
             user: { id: 'anonymous', email: 'anon@local', name: 'Anonymous', role: 'user', teams: [], personaScopes: ['*'], tenantId: 'default' },
         };
+    }
+
+    // 4. Local demo. Opt-in (EAOS_DEMO_MODE=local, set by the dev launchers) and
+    //    rejected under production by @agentos/config; the IS_PRODUCTION check is
+    //    defence-in-depth. `public` demo visitors instead hold a browser session
+    //    minted by POST /api/auth/demo, so they never reach this fallback.
+    if (!IS_PRODUCTION && DEMO_MODE === 'local') {
+        return { authenticated: true, user: localDemoUser() };
     }
 
     return { authenticated: false, error: 'Missing authentication' };

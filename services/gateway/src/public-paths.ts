@@ -106,6 +106,21 @@ const PUBLIC_PATHS: readonly PublicPath[] = [
   //   EAOS_SETUP_TOKEN → POST /api/setup → API key → POST /api/auth/token → JWT
   //   or: OIDC authorize → callback → exchange → JWT
   {
+    method: 'GET',
+    path: '/api/auth/config',
+    reason:
+      'Tells the sign-in screen which options exist (demo mode, SSO). Booleans and an enum only; ' +
+      'no tenant data, no secrets.',
+  },
+  {
+    method: 'POST',
+    path: '/api/auth/demo',
+    reason:
+      'Mints an isolated demo-visitor session when EAOS_DEMO_MODE=public (404 otherwise). The principal ' +
+      'is a fresh role=user identity whose runs are forced to simulation, so it can neither spend LLM ' +
+      'budget nor read another visitor\'s work. Rate limited per address like every unauthenticated call.',
+  },
+  {
     method: 'POST',
     path: '/api/auth/token/refresh',
     reason:

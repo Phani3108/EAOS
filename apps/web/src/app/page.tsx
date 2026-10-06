@@ -52,6 +52,7 @@ import { ToastViewport } from '../components/ui';
 import FirstRunFlow from '../components/firstrun/FirstRunFlow';
 import { PromptLibrary } from '../components/PromptLibrary';
 import AboutPage from '../components/AboutPage';
+import AuthGate from '../components/AuthGate';
 import { hasCompletedOnboarding } from '../lib/storage';
 
 function MainContent({ section }: { section: string }) {
@@ -214,6 +215,7 @@ export default function Home() {
   }
 
   return (
+    <AuthGate>
     <MotionConfig reducedMotion="user">
     <div className="flex h-dscreen md:h-screen bg-white text-slate-900 overflow-hidden">
       <Sidebar mobileOpen={mobileNavOpen} onMobileClose={() => setMobileNavOpen(false)} />
@@ -246,5 +248,6 @@ export default function Home() {
       <FirstRunFlow open={firstRunOpen} onClose={() => setFirstRunOpen(false)} />
     </div>
     </MotionConfig>
+    </AuthGate>
   );
 }
