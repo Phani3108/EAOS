@@ -16,6 +16,7 @@ import { EngineeringHub } from '../components/EngineeringHub';
 import { ProductHub } from '../components/ProductHub';
 import { HRHub } from '../components/HRHub';
 import { OpsExecutionsView } from '../components/OpsExecutionsView';
+import { PlatformConsole } from '../components/PlatformConsole';
 
 import { AdminUsageView } from '../components/AdminUsageView';
 import GovernanceDashboard from '../components/GovernanceDashboard';
@@ -112,15 +113,15 @@ function MainContent({ section }: { section: string }) {
 
     // Operations
     case 'ops-integrations':        return <ToolsRegistry />;
-    case 'ops-notifications':       return <NotificationCenter />;
+    case 'ops-notifications':       return <PlatformConsole initialTab="notifications" />;
     case 'ops-executions':          return <OpsExecutionsView />;
     case 'ops-discussions':         return <DiscussionForum />;
     case 'ops-blog':                return <BlogEditor />;
 
     // Admin
-    case 'admin-governance':        return <GovernanceDashboard />;
-    case 'admin-evals':             return <AgentEvalsPanel />;
-    case 'admin-usage':             return <AdminUsageView />;
+    case 'admin-governance':        return <PlatformConsole initialTab="registry" />;
+    case 'admin-evals':             return <PlatformConsole initialTab="evaluations" />;
+    case 'admin-usage':             return <PlatformConsole />;
     case 'admin-settings':          return <SettingsPanel />;
 
     // About / Platform info (reached from Settings → About → View)

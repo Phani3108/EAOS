@@ -10,6 +10,8 @@ import { useExecutionStore, type SkillDefinition, type Execution, type PreCheckR
 import { useConnectionsStore, resolveConnectorId } from '../store/connections-store';
 import { useEAOSStore } from '../store/eaos-store';
 import { OutputViewer } from './OutputViewer';
+import { isTerminalExecutionStatus, type WorkflowPersona } from '@agentos/skills/schema';
+import { fetchExecution, submitExecution, uploadArtifact } from '../lib/execution-client';
 
 const GATEWAY = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
 const POLL_MS = 2000;
@@ -21,6 +23,7 @@ const STEP_DOT: Record<string, string> = {
   running:           'bg-blue-500 animate-pulse',
   completed:         'bg-emerald-500',
   failed:            'bg-red-500',
+  rejected: 'bg-red-500', cancelled: 'bg-slate-500', unsupported: 'bg-amber-500', inconclusive: 'bg-amber-500', simulated: 'bg-purple-500',
   approval_required: 'bg-amber-500',
   skipped:           'bg-slate-300',
 };
@@ -30,6 +33,7 @@ const STEP_TEXT: Record<string, string> = {
   running:           'text-blue-600 font-medium',
   completed:         'text-emerald-700',
   failed:            'text-red-600',
+  rejected: 'text-red-600', cancelled: 'text-slate-500', unsupported: 'text-amber-600', inconclusive: 'text-amber-600', simulated: 'text-purple-600',
   approval_required: 'text-amber-600',
   skipped:           'text-slate-400 line-through',
 };
@@ -39,6 +43,7 @@ const STEP_LABEL: Record<string, string> = {
   running:           'Running…',
   completed:         'Complete',
   failed:            'Failed',
+  rejected: 'Rejected', cancelled: 'Cancelled', unsupported: 'Unsupported', inconclusive: 'Inconclusive', simulated: 'Simulated',
   approval_required: 'Needs approval',
   skipped:           'Skipped',
 };
@@ -72,9 +77,8 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
   // Phase: 'pick' → 'configure' → 'running' → 'output'
   const phase = !selectedSkill && !activeExecution ? 'pick'
     : selectedSkill && !activeExecution ? 'configure'
-    : activeExecution && (activeExecution.status === 'running' || activeExecution.status === 'queued') ? 'running'
-    : activeExecution && activeExecution.status === 'completed' ? 'output'
-    : activeExecution && activeExecution.status === 'failed' ? 'output'
+    : activeExecution && ['running', 'queued', 'paused'].includes(activeExecution.status) ? 'running'
+    : activeExecution && isTerminalExecutionStatus(activeExecution.status) ? 'output'
     : 'configure';
 
   // ── Load available skills for this persona ───────────────────────────────
@@ -102,12 +106,14 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
               requiresApproval: st.requiresApproval ?? false,
               description: st.description ?? '',
             })),
+            support: s.support,
             inputFields: (s.inputFields ?? s.inputs ?? s.fields ?? []).map((f: any) => ({
               key: f.key ?? f.id ?? f.name,
               label: f.label ?? f.key ?? f.name,
               type: f.type ?? 'text',
               placeholder: f.placeholder ?? '',
               required: f.required ?? false,
+              multiple: f.multiple ?? false,
               hint: f.hint ?? f.helpText,
               options: f.options
                 ? (Array.isArray(f.options) && typeof f.options[0] === 'string'
@@ -137,27 +143,26 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
   }, []);
 
+  const activeId = activeExecution?.id;
+  const activeStatus = activeExecution?.status;
   useEffect(() => {
-    if (!activeExecution || (activeExecution.status !== 'running' && activeExecution.status !== 'queued')) {
+    if (!activeId || !activeStatus || !['running', 'queued', 'paused'].includes(activeStatus)) {
       stopPolling();
       return;
     }
 
     const poll = async () => {
       try {
-        const res = await fetch(`${GATEWAY}/api/${persona}/executions/${activeExecution.id}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        const exec = data.execution ?? data;
+        const exec = await fetchExecution(activeId);
 
-        updateExecution(activeExecution.id, {
+        updateExecution(activeId, {
           status: exec.status,
           completedAt: exec.completedAt,
           outputs: exec.outputs ?? {},
         });
 
         for (const step of exec.steps ?? []) {
-          updateStep(activeExecution.id, step.stepId ?? step.id, {
+          updateStep(activeId, step.stepId, {
             status: step.status,
             startedAt: step.startedAt,
             completedAt: step.completedAt,
@@ -166,7 +171,7 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
           });
         }
 
-        if (exec.status === 'completed' || exec.status === 'failed') {
+        if (isTerminalExecutionStatus(exec.status)) {
           stopPolling();
         }
       } catch { /* gateway unreachable — keep trying */ }
@@ -175,7 +180,7 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
     pollRef.current = setInterval(poll, POLL_MS);
     poll(); // immediate first poll
     return stopPolling;
-  }, [activeExecution?.id, activeExecution?.status, persona, updateExecution, updateStep, stopPolling]);
+  }, [activeId, activeStatus, updateExecution, updateStep, stopPolling]);
 
   // ── Handlers ─────────────────────────────────────────────────────────────
 
@@ -222,20 +227,14 @@ export function ExecutionScreen({ persona, workspace, onBack }: Props) {
           isToolConnected={isToolConnected}
           onRun={(inputs, fileIds, simulate) => {
             const exec = createExecution({ persona, skill: selectedSkill, workspace, inputs, fileIds, simulate });
+            if (fileIds?.length) {
+              updateExecution(exec.id, { status: 'unsupported' });
+              if (exec.steps[0]) updateStep(exec.id, exec.steps[0].stepId, { status: 'unsupported', error: 'Uploaded files require a tenant-scoped artifact binding before execution.' });
+              return;
+            }
             // Fire execution on gateway
-            fetch(`${GATEWAY}/api/${persona}/execute`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                workflowId: selectedSkill.id,
-                skillId: selectedSkill.id,
-                inputs: { ...inputs, _fileIds: fileIds },
-                simulate,
-              }),
-            })
-              .then(r => r.json())
-              .then(data => {
-                const remote = data.execution ?? data;
+            submitExecution({ persona: persona as WorkflowPersona, skillId: selectedSkill.id, inputs, simulate })
+              .then(remote => {
                 if (remote?.id) {
                   // Overwrite local ID with gateway's ID so polling works
                   updateExecution(exec.id, { id: remote.id, status: remote.status ?? 'queued' });
@@ -380,6 +379,7 @@ function SkillPicker({ skills, persona, onSelect }: {
                       </span>
                     </div>
                     <p className="text-[12px] text-slate-500 mt-0.5 line-clamp-2">{skill.description}</p>
+                    {skill.support && <p className="text-[11px] text-amber-700 mt-1">{skill.support.executionClass} · {skill.support.readiness} · vendor sandbox not certified</p>}
                     <div className="flex items-center gap-2 mt-2">
                       {skill.executableType === 'workflow' && skill.composedSkillIds && skill.composedSkillIds.length > 0 && (
                         <span className="text-[11px] text-purple-400">
@@ -432,6 +432,9 @@ function ConfigurePanel({ skill, persona, workspace, isToolConnected, onRun, onB
   onBack: () => void;
 }) {
   const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [artifacts, setArtifacts] = useState<Record<string, Array<{ artifactId: string }>>>({});
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const [simulate, setSimulate] = useState(false);
   const [preCheck, setPreCheck] = useState<PreCheckResult | null>(null);
   const [checking, setChecking] = useState(false);
@@ -462,9 +465,15 @@ function ConfigurePanel({ skill, persona, workspace, isToolConnected, onRun, onB
 
   const allRequiredFilled = skill.inputFields
     .filter(f => f.required)
-    .every(f => (inputs[f.key] ?? '').trim().length > 0);
+    .every(f => f.type === 'file' ? (artifacts[f.key]?.length ?? 0) > 0 : (inputs[f.key] ?? '').trim().length > 0);
 
-  const canRun = (preCheck?.canExecute || simulate) && allRequiredFilled;
+  const canRun = !uploading && (preCheck?.canExecute || simulate) && allRequiredFilled;
+  const handleUpload = async (key: string, files: FileList | null) => {
+    setUploading(true); setUploadError(null);
+    try { setArtifacts(previous => ({ ...previous, [key]: [] })); const refs = await Promise.all(Array.from(files ?? []).map(uploadArtifact)); setArtifacts(previous => ({ ...previous, [key]: refs })); }
+    catch (error) { setUploadError(error instanceof Error ? error.message : 'Upload failed'); }
+    finally { setUploading(false); }
+  };
 
   return (
     <div>
@@ -495,7 +504,13 @@ function ConfigurePanel({ skill, persona, workspace, isToolConnected, onRun, onB
                       {field.label}
                       {field.required && <span className="text-red-400 ml-0.5">*</span>}
                     </label>
-                    {field.type === 'textarea' ? (
+                    {field.type === 'file' ? (
+                      <div>
+                        <input type="file" multiple={field.multiple} disabled={uploading} accept=".txt,.md,.csv,.json,.log,.ts,.js,.py,.go,.rs,.java,.sql" onChange={event => handleUpload(field.key, event.target.files)} />
+                        <p className="text-xs text-slate-500">UTF-8 text, Markdown, CSV, JSON or source code; 512 KB maximum. {artifacts[field.key]?.length ?? 0} stored artifact(s).</p>
+                        {uploadError && <p role="alert" className="text-xs text-red-600">{uploadError}</p>}
+                      </div>
+                    ) : field.type === 'textarea' ? (
                       <textarea
                         className="input w-full min-h-[100px] resize-y"
                         placeholder={field.placeholder}
@@ -616,7 +631,7 @@ function ConfigurePanel({ skill, persona, workspace, isToolConnected, onRun, onB
             </label>
 
             <button
-              onClick={() => onRun(inputs, [], simulate)}
+              onClick={() => onRun({ ...inputs, ...Object.fromEntries(skill.inputFields.filter(field => field.type === 'file' && artifacts[field.key]?.length).map(field => [field.key, field.multiple ? artifacts[field.key] : artifacts[field.key]?.[0]])) }, [], simulate)}
               disabled={!canRun}
               className="btn btn-primary w-full py-2.5 text-[14px] disabled:opacity-40 disabled:cursor-not-allowed"
             >
@@ -637,10 +652,10 @@ function ExecutionView({ execution, onBack, onRerun }: {
   onRerun: () => void;
 }) {
   const isRunning = execution.status === 'running' || execution.status === 'queued';
-  const isDone = execution.status === 'completed';
-  const isFailed = execution.status === 'failed';
+  const isDone = execution.status === 'completed' || execution.status === 'simulated';
+  const isFailed = isTerminalExecutionStatus(execution.status) && !isDone;
 
-  const completedSteps = execution.steps.filter(s => s.status === 'completed').length;
+  const completedSteps = execution.steps.filter(s => s.status === 'completed' || s.status === 'simulated').length;
   const totalSteps = execution.steps.length;
   const progressPct = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
 
@@ -682,12 +697,12 @@ function ExecutionView({ execution, onBack, onRerun }: {
             <h1 className="text-[18px] font-semibold text-slate-900">{execution.skillName}</h1>
             <div className="flex items-center gap-3 mt-0.5">
               <span className={`inline-flex items-center gap-1.5 text-[12px] font-medium ${
-                isRunning ? 'text-blue-600' : isDone ? 'text-emerald-600' : 'text-red-600'
+                isRunning ? 'text-blue-600' : execution.status === 'simulated' ? 'text-purple-600' : isDone ? 'text-emerald-600' : 'text-red-600'
               }`}>
                 <span className={`w-2 h-2 rounded-full ${
-                  isRunning ? 'bg-blue-500 animate-pulse' : isDone ? 'bg-emerald-500' : 'bg-red-500'
+                  isRunning ? 'bg-blue-500 animate-pulse' : execution.status === 'simulated' ? 'bg-purple-500' : isDone ? 'bg-emerald-500' : 'bg-red-500'
                 }`} />
-                {isRunning ? 'Running' : isDone ? 'Completed' : 'Failed'}
+                {STEP_LABEL[execution.status] ?? execution.status}
               </span>
               <span className="text-[12px] text-slate-400">{duration}s</span>
               <span className="text-[12px] text-slate-400">{completedSteps}/{totalSteps} steps</span>
@@ -791,7 +806,7 @@ function ExecutionView({ execution, onBack, onRerun }: {
                   {step.error && (
                     <div className="mt-1.5 p-2 rounded bg-red-50 text-[12px] text-red-700">{step.error}</div>
                   )}
-                  {step.outputPreview && step.status === 'completed' && (
+                  {step.outputPreview && (step.status === 'completed' || step.status === 'simulated') && (
                     <div className="mt-1.5 p-2.5 rounded-lg bg-slate-50 text-[12px] text-slate-600 border border-slate-100 line-clamp-3">
                       {step.outputPreview}
                     </div>

@@ -12,6 +12,7 @@ import { useEAOSStore } from '../../store/eaos-store';
 import { InlineError } from '../ui';
 import type { WorkflowDef, InputField, InputFieldType } from '../../lib/marketing-workflows';
 import { getPrompts, type PromptEntry } from '@/lib/api';
+import { uploadArtifact } from '../../lib/execution-client';
 
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
 
@@ -47,23 +48,11 @@ function FileUploadField({
       const ids: string[] = [];
       for (const file of files) {
         try {
-          const buf = await file.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          const res = await fetch(`${GATEWAY_URL}/api/marketing/upload`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fileName: file.name,
-              contentBase64: base64,
-              mimeType: file.type || 'application/octet-stream',
-            }),
-          });
-          if (res.ok) {
-            const { fileId } = await res.json();
-            ids.push(fileId);
-          }
-        } catch {
-          // ignore
+          const { artifactId } = await uploadArtifact(file);
+          ids.push(artifactId);
+        } catch (error) {
+          // Surface rejection without inventing an uploaded reference
+          notify('error', 'Upload failed', error instanceof Error ? error.message : 'Artifact upload failed');
         }
       }
       setUploadedIds(ids);
@@ -79,8 +68,8 @@ function FileUploadField({
       <div className="border border-dashed border-slate-300 rounded-lg p-4 bg-slate-50/50">
         <input
           type="file"
-          accept={field.accept ?? '.pdf,.ppt,.pptx,.doc,.docx,.csv,image/*'}
-          multiple
+          accept=".txt,.md,.csv,.json,.log,.ts,.js,.py,.go,.rs,.java,.sql"
+          multiple={field.multiple}
           onChange={handleFileChange}
           className="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-slate-200 file:text-slate-700 hover:file:bg-slate-300"
         />
@@ -216,7 +205,7 @@ function renderField(
         <FileUploadField
           key={field.id}
           field={field}
-          onFileIdsChange={(ids) => onChange(ids)}
+          onFileIdsChange={(ids) => onChange(field.multiple ? ids.map(artifactId => ({ artifactId })) : ids[0] ? { artifactId: ids[0] } : undefined)}
         />
       );
     default:
@@ -295,13 +284,10 @@ export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck,
       notify('warning', 'Tools not connected', 'Connect required tools or enable Simulation mode to run without real execution.');
       return;
     }
-    const allFileIds = workflow.inputs
-      .filter((f) => f.type === 'file')
-      .flatMap((f) => (inputs[f.id] as string[]) ?? []);
     const promptContent = selectedPromptId
       ? prompts.find((p) => p.id === selectedPromptId)?.content
       : undefined;
-    onExecute(inputs, allFileIds.length > 0 ? allFileIds : undefined, simulateMode, promptContent, selectedModelId);
+    onExecute(inputs, undefined, simulateMode, promptContent, selectedModelId);
   };
 
   return (

@@ -11,6 +11,7 @@ export type ConnectorAuthType = 'api-key' | 'oauth' | 'url-token' | 'credentials
 
 export type ConnectionStatus =
   | 'connected'
+  | 'configured'
   | 'not-connected'
   | 'expired'
   | 'reauth-required'

@@ -4,7 +4,7 @@
  * Tabs: Executions · Scheduler · Agent Collaboration
  */
 import { useState } from 'react';
-import { ObservabilityPanel } from './ObservabilityPanel';
+import { PlatformConsole } from './PlatformConsole';
 import { ExecutionScheduler } from './ExecutionScheduler';
 import AgentCollaboration from './AgentCollaboration';
 
@@ -33,7 +33,7 @@ export function OpsExecutionsView() {
         ))}
       </div>
       <div className="flex-1 overflow-auto">
-        {tab === 'executions' && <ObservabilityPanel />}
+        {tab === 'executions' && <PlatformConsole />}
         {tab === 'scheduler'  && <ExecutionScheduler />}
         {tab === 'collab'     && <AgentCollaboration />}
       </div>

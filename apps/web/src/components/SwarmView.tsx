@@ -95,7 +95,7 @@ interface SwarmTemplate {
 interface A2AAgent { agent_id: string; name: string; regiment: string; rank: string; persona: string }
 interface SwarmMetrics { total_messages: number; total_tool_calls: number; total_tokens: number; total_cost_usd: number; duration_ms: number; human_interventions: number }
 interface AgentSwarm {
-  swarm_id: string; mission: string; task_ref: string; type: string;
+  swarm_id: string; mission: string; task_ref: string; type: string; can_advance?: boolean;
   agents: A2AAgent[]; status: string; messages: unknown[]; meetings: unknown[];
   artifacts: { type: string; title: string; content: string; author: string; created_at: string }[];
   created_at: string; completed_at?: string; metrics: SwarmMetrics;
@@ -129,6 +129,7 @@ export default function SwarmView() {
   const [launching, setLaunching] = useState(false);
   const [tab, setTab] = useState<'active' | 'completed' | 'templates'>('active');
   const [isDemo, setIsDemo] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -138,8 +139,24 @@ export default function SwarmView() {
     ]).then(([t, s, st]) => {
       setTemplates(t.templates || []);
       if (s.swarms?.length) { setSwarms(s.swarms); setStats(st); }
-      else { setSwarms(DEMO_SWARMS); setStats(DEMO_STATS); setIsDemo(true); setSelectedSwarm(DEMO_SWARMS[0]); }
+      else { setSwarms([]); setStats({ active: 0, completed: 0, totalAgents: 0, totalMessages: 0 }); setIsDemo(false); }
     });
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const timer = setInterval(() => {
+      fetch(`${API}/api/a2a/swarms`).then(async response => {
+        if (!response.ok) throw new Error(`Swarm state unavailable (${response.status})`);
+        return response.json();
+      }).then(data => {
+        if (!active) return;
+        const next = (data.swarms ?? []) as AgentSwarm[];
+        setSwarms(next);
+        setSelectedSwarm(previous => previous ? next.find(swarm => swarm.swarm_id === previous.swarm_id) ?? null : null);
+      }).catch(cause => { if (active) setError(cause.message); });
+    }, 2000);
+    return () => { active = false; clearInterval(timer); };
   }, []);
 
   const launchNewSwarm = async () => {
@@ -151,6 +168,7 @@ export default function SwarmView() {
         body: JSON.stringify({ type: launchType, mission: launchMission }),
       });
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `Swarm launch failed (${res.status})`);
       if (data.swarm) {
         setSwarms(prev => [data.swarm, ...prev]);
         setSelectedSwarm(data.swarm);
@@ -158,25 +176,29 @@ export default function SwarmView() {
         setLaunchMission('');
         setStats(prev => ({ ...prev, active: prev.active + 1, totalAgents: prev.totalAgents + (data.swarm.agents?.length || 0) }));
       }
-    } catch {}
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Swarm launch failed'); }
     setLaunching(false);
   };
 
   const advancePhase = async (swarmId: string) => {
-    const res = await fetch(`${API}/api/swarms/${swarmId}/advance`, { method: 'POST' });
-    const data = await res.json();
-    if (data.swarm) {
-      setSwarms(prev => prev.map(s => s.swarm_id === swarmId ? data.swarm : s));
-      setSelectedSwarm(data.swarm);
-    }
+    try {
+      const res = await fetch(`${API}/api/swarms/${encodeURIComponent(swarmId)}/advance`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error ?? `Phase was not advanced (${res.status})`);
+      if (data.swarm) {
+        setSwarms(prev => prev.map(s => s.swarm_id === swarmId ? data.swarm : s));
+        setSelectedSwarm(data.swarm);
+      }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Phase was not advanced'); }
   };
 
-  const activeSwarms = swarms.filter(s => s.status === 'active' || s.status === 'forming');
-  const completedSwarms = swarms.filter(s => s.status === 'completed' || s.status === 'dissolved');
+  const activeSwarms = swarms.filter(s => ['active','forming','queued','running','paused'].includes(s.status));
+  const completedSwarms = swarms.filter(s => ['completed','simulated','failed','rejected','cancelled','dissolved','inconclusive','unsupported'].includes(s.status));
 
   return (
     <div className="page-container">
       <div className="page-content">
+        {error && <p role="alert" className="text-sm text-red-700">{error}</p>}
         {/* Header */}
         <div className="flex items-center justify-between mb-6">
           <div>
@@ -284,7 +306,7 @@ export default function SwarmView() {
                         <span>Started {new Date(selectedSwarm.created_at).toLocaleDateString()}</span>
                       </div>
                     </div>
-                    {selectedSwarm.status === 'active' && (
+                    {selectedSwarm.can_advance && (
                       <button onClick={() => advancePhase(selectedSwarm.swarm_id)} className="btn btn-primary btn-sm">
                         Advance Phase
                       </button>
@@ -319,7 +341,7 @@ export default function SwarmView() {
                         {i < selectedSwarm.artifacts.length - 1 && <span className="text-slate-300">→</span>}
                       </div>
                     ))}
-                    {selectedSwarm.status === 'active' && (
+                    {['active','queued','running','paused'].includes(selectedSwarm.status) && (
                       <div className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 border border-blue-200">
                         <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
                         <span className="text-xs font-medium text-blue-700">In Progress</span>

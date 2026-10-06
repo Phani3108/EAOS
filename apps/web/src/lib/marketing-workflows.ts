@@ -8,6 +8,8 @@
 // Types
 // ---------------------------------------------------------------------------
 
+import { MARKETING_INPUT_FIELDS } from '@agentos/skills/schema';
+
 export type WorkflowCluster = 'Campaign' | 'Content' | 'Creative' | 'Event' | 'Research' | 'Analytics' | 'Sales';
 
 export type InputFieldType = 'text' | 'textarea' | 'select' | 'multiselect' | 'date' | 'file' | 'url' | 'checkbox' | 'tags' | 'number';
@@ -21,6 +23,7 @@ export interface InputField {
   placeholder?: string;
   options?: string[];
   accept?: string;
+  multiple?: boolean;
   helpText?: string;
 }
 
@@ -869,6 +872,13 @@ export const WORKFLOW_CLUSTERS: Record<WorkflowCluster, { label: string; icon: s
   Analytics: { label: 'Marketing Analytics',     icon: '📊', color: 'amber',  description: 'Performance, funnel, channel comparison' },
   Sales:     { label: 'Sales Enablement',        icon: '⚔️', color: 'slate',  description: 'One-pagers, battlecards, meeting briefs' },
 };
+
+for (const workflow of MARKETING_WORKFLOWS) {
+  workflow.inputs = MARKETING_INPUT_FIELDS[workflow.id]!.map(field => {
+    const display = workflow.inputs.find(input => input.id === field.id);
+    return { ...display, ...field, label: display?.label ?? field.label, section: display?.section ?? field.section, required: field.required === true, options: field.options as string[] | undefined, type: field.type === 'toggle' ? 'checkbox' : field.type };
+  });
+}
 
 export function getWorkflowsByCluster(): Record<WorkflowCluster, WorkflowDef[]> {
   const grouped = {} as Record<WorkflowCluster, WorkflowDef[]>;

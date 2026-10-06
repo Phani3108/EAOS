@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next';
 import './globals.css';
 import { TourProvider } from '../components/tour/TourProvider';
 import ThemeProvider from '../components/ThemeProvider';
+import AuthGate from '../components/AuthGate';
 
 export const metadata: Metadata = {
     title: 'EAOS — Enterprise Agent Operating System',
@@ -35,7 +36,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <body className="antialiased">
                 <ThemeProvider>
                     <TourProvider>
-                        {children}
+                        <AuthGate>{children}</AuthGate>
                     </TourProvider>
                 </ThemeProvider>
             </body>

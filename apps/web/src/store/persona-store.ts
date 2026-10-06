@@ -22,7 +22,7 @@ export type TASection = 'run' | 'library' | 'pipelines' | 'history';
 
 export type ProgramSection = 'run' | 'library' | 'pipelines' | 'history';
 
-export type ExecutionStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'approval_required';
+export type ExecutionStepStatus = import('@agentos/skills/schema').StepStatus;
 
 export interface PersonaExecutionStep {
   id: string;
@@ -50,7 +50,8 @@ export interface PersonaExecution {
   persona: 'engineering' | 'product' | 'hr' | 'ta' | 'program';
   skillId: string;
   skillName: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: import('@agentos/skills/schema').ExecutionStatus;
+  mode?: import('@agentos/skills/schema').RunMode;
   steps: PersonaExecutionStep[];
   outputs: Record<string, string>;
   startedAt: string;

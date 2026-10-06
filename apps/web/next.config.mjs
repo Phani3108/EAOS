@@ -8,6 +8,7 @@ const nextConfig = {
     // Emit a self-contained server (.next/standalone/server.js) so Vercel "services"
     // (which run each service as a server) have a runnable entrypoint for the web service.
     output: 'standalone',
+    env: { NEXT_PUBLIC_GATEWAY_URL: '/_/gateway' },
     transpilePackages: ['@agentos/sdk', '@agentos/output-schemas', '@agentos/streaming', '@agentos/gateway'],
     // Marketing subdomain: build with basePath when deploying to marketing.agentos.com
     // basePath: process.env.MARKETING_SUBDOMAIN === 'true' ? '/marketing' : undefined,
@@ -15,6 +16,7 @@ const nextConfig = {
     // SPA-style routing: all paths served by the root page.tsx
     async rewrites() {
         return [
+            { source: '/_/gateway/:path*', destination: `${process.env.GATEWAY_INTERNAL_URL || 'http://127.0.0.1:3000'}/:path*` },
             { source: '/:path*', destination: '/' },
         ];
     },

@@ -6,6 +6,7 @@
  */
 import { useState } from 'react';
 import { useEAOSStore } from '../store/eaos-store';
+import { SessionControls } from './AuthGate';
 
 const NAV_LABELS: Record<string, string> = {
   home:                   'Home',
@@ -138,6 +139,7 @@ export function TopBar({ onOpenMobileNav }: TopBarProps = {}) {
 
       {/* Right: actions */}
       <div className="flex items-center gap-1 sm:gap-1.5 flex-shrink-0">
+        <SessionControls />
         {/* Create */}
         <div className="relative">
           <button

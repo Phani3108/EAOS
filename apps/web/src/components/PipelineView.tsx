@@ -8,6 +8,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { isTerminalExecutionStatus, type ExecutionStatus } from '@agentos/skills/schema';
 
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
 const POLL_MS = 2500;
@@ -41,7 +42,9 @@ interface QualityGate {
 
 interface Checkpoint {
   id: string;
-  after_node: string;
+  after_node?: string;
+  before_node?: string;
+  within_node?: string;
   type: string;
   timeout_hours: number;
   notify?: string[];
@@ -50,9 +53,9 @@ interface Checkpoint {
 
 interface FeedbackLoop {
   id: string;
-  trigger_node: string;
-  trigger_condition: Record<string, unknown>;
-  re_invoke: string[];
+  from: string;
+  trigger: { condition: string; thresholds: Record<string, unknown> };
+  to: string[];
   circuit_breaker: Record<string, unknown>;
 }
 
@@ -70,7 +73,8 @@ interface GraphConfig {
 
 interface PipelineExecution {
   id: string;
-  status: 'initializing' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled';
+  status: ExecutionStatus;
+  execution?: { steps: Array<{ stepId: string; stepName: string; status: string; approvalFields?: string[] }> };
   intent: string;
   totalTokensUsed: number;
   totalCostUsd: number;
@@ -137,6 +141,7 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
   const [activeExecution, setActiveExecution] = useState<PipelineExecution | null>(null);
   const [intent, setIntent] = useState('');
   const [history, setHistory] = useState<PipelineListItem[]>([]);
+  const [confirmations, setConfirmations] = useState<Record<string, boolean>>({});
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -171,7 +176,7 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
         if (!r.ok) return;
         const data: PipelineExecution = await r.json();
         setActiveExecution(data);
-        if (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled') {
+        if (isTerminalExecutionStatus(data.status)) {
           if (pollRef.current) clearInterval(pollRef.current);
           pollRef.current = null;
           setExecuting(false);
@@ -187,29 +192,15 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
     if (!graphConfig || !intent.trim()) return;
     setExecuting(true);
     setError(null);
+    setConfirmations({});
 
     try {
-      // Load orchestrator & agent defs for the persona
-      const [orchRes, agentRes] = await Promise.all([
-        fetch(`${GATEWAY_URL}/api/${persona}/orchestrator`).then(r => r.ok ? r.json() : null),
-        fetch(`${GATEWAY_URL}/api/${persona}/agents`).then(r => r.ok ? r.json() : null),
-      ]);
-
+      // Resolve orchestrator and agent identities through the canonical server adapter
       const body = {
         intent: intent.trim(),
+        persona,
         context: { persona, timestamp: new Date().toISOString() },
         graphConfig,
-        orchestratorConfig: orchRes ?? { orchestrator_id: `${persona}.orchestrator`, intent_routes: [] },
-        agentDefinitions: agentRes?.agents ?? graphConfig.nodes.map(n => ({
-          agent_id: n.agent,
-          name: n.id,
-          identity: { personality: 'Professional', vibe: 'Focused' },
-          mission: [`Execute ${n.id} phase`],
-          critical_rules: [],
-          deliverables: [],
-          success_metrics: {},
-          system_prompt: `You are the ${n.id} agent.`,
-        })),
       };
 
       const r = await fetch(`${GATEWAY_URL}/api/pipeline/execute`, {
@@ -226,7 +217,7 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
       const exec: PipelineExecution = await r.json();
       setActiveExecution(exec);
 
-      if (exec.status !== 'completed' && exec.status !== 'failed') {
+      if (!isTerminalExecutionStatus(exec.status)) {
         startPolling(exec.id);
       } else {
         setExecuting(false);
@@ -237,15 +228,26 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
     }
   };
 
+  const decide = async (stepId: string, approved: boolean, fields: string[] = []) => {
+    if (!activeExecution) return;
+    try {
+      const response = await fetch(`${GATEWAY_URL}/api/executions/${encodeURIComponent(activeExecution.id)}/${approved ? 'approve' : 'reject'}/${encodeURIComponent(stepId)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmations: Object.fromEntries(fields.map(field => [field, confirmations[`${stepId}:${field}`] === true])) }) });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error ?? 'Approval decision was not accepted');
+      startPolling(activeExecution.id);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Approval decision failed'); }
+  };
+
   // Cancel pipeline
   const handleCancel = async () => {
     if (!activeExecution) return;
     try {
-      await fetch(`${GATEWAY_URL}/api/pipeline/${encodeURIComponent(activeExecution.id)}/cancel`, { method: 'POST' });
+      const response = await fetch(`${GATEWAY_URL}/api/pipeline/${encodeURIComponent(activeExecution.id)}/cancel`, { method: 'POST' });
+      if (!response.ok || !(await response.json()).cancelled) throw new Error('Cancellation was not acknowledged');
       if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
       setExecuting(false);
       setActiveExecution(prev => prev ? { ...prev, status: 'cancelled' } : null);
-    } catch { /* ignore */ }
+    } catch (cause) { /* Preserve authoritative state on failure */ setError(cause instanceof Error ? cause.message : 'Cancellation failed'); }
   };
 
   // ---------------------------------------------------------------------------
@@ -279,7 +281,7 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
 
   const phases = Object.entries(graphConfig.phases).sort(([, a], [, b]) => a.order - b.order);
   const gateMap = new Map(graphConfig.quality_gates.map(g => [g.after_node, g]));
-  const checkpointMap = new Map(graphConfig.checkpoints.map(c => [c.after_node, c]));
+  const checkpointMap = new Map(graphConfig.checkpoints.map(c => [c.before_node ?? c.within_node ?? c.after_node, c]));
 
   return (
     <div className="p-6 space-y-6">
@@ -326,6 +328,22 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
       {error && (
         <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-4 py-3">{error}</div>
       )}
+
+      {activeExecution?.execution?.steps.filter(step => step.status === 'approval_required').map(step => (
+        <div key={step.stepId} className="border border-amber-200 rounded-xl p-4 bg-amber-50">
+          <p className="font-medium">Approval required: {step.stepName}</p>
+          {(step.approvalFields ?? []).map(field => (
+            <label key={field} className="flex gap-2 text-sm mt-2">
+              <input type="checkbox" checked={confirmations[`${step.stepId}:${field}`] === true} onChange={event => setConfirmations(previous => ({ ...previous, [`${step.stepId}:${field}`]: event.target.checked }))} />
+              {field.replace(/_/g, ' ')}
+            </label>
+          ))}
+          <div className="flex gap-2 mt-3">
+            <button className="btn btn-primary" disabled={(step.approvalFields ?? []).some(field => !confirmations[`${step.stepId}:${field}`])} onClick={() => decide(step.stepId, true, step.approvalFields)}>Approve</button>
+            <button className="btn btn-secondary" onClick={() => decide(step.stepId, false)}>Reject</button>
+          </div>
+        </div>
+      ))}
 
       {/* Active Execution Status */}
       {activeExecution && (
@@ -449,7 +467,7 @@ export function PipelineView({ persona, accentColor = 'blue-600' }: PipelineView
                   <span className="text-xs font-bold text-slate-800">{loop.id}</span>
                 </div>
                 <p className="text-[11px] text-slate-600">
-                  Trigger: <strong>{loop.trigger_node}</strong> → Re-invoke: {loop.re_invoke.join(', ')}
+                  Trigger: <strong>{loop.from}</strong> → Re-invoke: {loop.to.join(', ')}
                 </p>
                 <p className="text-[10px] text-slate-400 mt-1">
                   Circuit breaker: {JSON.stringify(loop.circuit_breaker)}

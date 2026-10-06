@@ -8,6 +8,7 @@
 import { useState, useCallback } from 'react';
 import { useEAOSStore } from '../store/eaos-store';
 import { setPreference } from '../lib/storage';
+import { SessionControls } from './AuthGate';
 
 // ═══════════════════════════════════════════════════════════════
 // Data Constants
@@ -246,6 +247,7 @@ function LandingNav() {
 
         {/* Right */}
         <div className="flex items-center gap-2 sm:gap-3">
+          <SessionControls compact />
           <button
             onClick={enterApp}
             className="hidden md:inline text-sm text-slate-400 hover:text-white transition-colors"
