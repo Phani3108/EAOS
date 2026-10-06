@@ -27,7 +27,8 @@ import {
 } from './api-key-store.js';
 import { resolveApiKeyScopes, revokeApiKey, rotateApiKey } from './api-key-lifecycle.js';
 import { runSetup, SETUP_TABLE } from './setup.js';
-import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, hashApiKeyCandidates, isDemoPrincipal, DEMO_PRINCIPAL_PREFIX } from './auth.js';
+import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, hashApiKeyCandidates, isDemoPrincipal, localDemoUser, DEMO_PRINCIPAL_PREFIX } from './auth.js';
+import { DemoTenantMissingError, provisionDemoUser } from './demo-principals.js';
 import { initAuthSessions, createBrowserSession, refreshBrowserSession, getSessionUser, getRefreshUser, revokeBrowserSession, issueLoginCode, consumeLoginCode, readCookie, cookie, setSessionCookies, setSessionRevocationHandler, persistOidcUser, setPrincipalResolver } from './auth-sessions.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
@@ -286,6 +287,8 @@ const verifyDeploymentStorage = async () => {
     if (pgPool) await pgPool.query('SELECT c.secret_version,c.binding_hash,c.config FROM workspace_connections c JOIN input_artifacts a ON FALSE JOIN runtime_tool_receipts t ON FALSE JOIN integration_audit i ON FALSE');
     if (pgPool) await pgPool.query('SELECT p.revision,d.version,m.state,e.stream_sequence,n.execution_run_id FROM platform_registry_packages p JOIN platform_datasets d ON FALSE JOIN platform_memberships m ON FALSE JOIN runtime_events e ON FALSE JOIN platform_http_metrics h ON FALSE JOIN platform_event_offsets o ON FALSE JOIN runtime_deliveries n ON FALSE JOIN runtime_connector_observations co ON FALSE');
     await bindDeploymentTenant(store, pgPool);
+    // The local demo principal acts without a session, so it is provisioned with storage.
+    if (pgPool && env.EAOS_DEMO_MODE === 'local') await provisionDemoUser(pgPool, localDemoUser());
 };
 try { await verifyDeploymentStorage(); } catch (error) {
     if (!pgPool) throw error;
@@ -296,7 +299,10 @@ if (pgPool) {
     setInterval(() => {
         if (!deploymentBindingError || checking) return;
         checking = true;
-        void verifyDeploymentStorage().then(() => { deploymentBindingError = undefined; }).catch(() => {}).finally(() => { checking = false; });
+        // Rehydrate BEFORE lifting the 503: boot skipped it while storage was
+        // unverified, so clearing the error first would serve empty state as if
+        // it were the tenant's real (empty) data.
+        void verifyDeploymentStorage().then(rehydrateStores).then(() => { deploymentBindingError = undefined; }).catch(() => {}).finally(() => { checking = false; });
     }, 5000).unref();
 }
 const runRepository = pgPool ? new PostgresRunRepository(pgPool) : undefined;
@@ -337,32 +343,38 @@ const executions = new ExecutionRepository(store);
 // whereas one that exits before opening a port cannot be diagnosed at all. But it
 // must never be silent, so the reason is recorded and reported.
 let rehydrationError: string | undefined;
-try {
-  if (!deploymentBindingError) await Promise.all([
-    initPersonaStore(store),      // persona executions, KPIs, AARs, retraining flags, agent memory
-    initVisionStore(store),       // vision statements, programs & OKRs
-    initNotificationStore(store), // notification channels, rules & delivery log
-    initWebhookStore(store),      // webhook endpoints & subscriptions
-  ]);
-} catch (err) {
-  rehydrationError = (err as Error).message;
-  console.error(
-    `[server] REHYDRATION FAILED: ${rehydrationError}\n` +
-      '[server] The gateway is running but started with EMPTY state. Existing executions, ' +
-      'KPIs and webhooks were not restored. Do not treat this instance as healthy.',
-  );
+// Hoisted so the storage-recovery loop above can run it once the database is
+// verified; at boot it runs only when storage verified first time.
+async function rehydrateStores(): Promise<void> {
+  rehydrationError = undefined;
+  try {
+    await Promise.all([
+      initPersonaStore(store),      // persona executions, KPIs, AARs, retraining flags, agent memory
+      initVisionStore(store),       // vision statements, programs & OKRs
+      initNotificationStore(store), // notification channels, rules & delivery log
+      initWebhookStore(store),      // webhook endpoints & subscriptions
+    ]);
+  } catch (err) {
+    rehydrationError = (err as Error).message;
+    console.error(
+      `[server] REHYDRATION FAILED: ${rehydrationError}\n` +
+        '[server] The gateway is running but started with EMPTY state. Existing executions, ' +
+        'KPIs and webhooks were not restored. Do not treat this instance as healthy.',
+    );
+  }
+  try {
+    await Promise.all([
+      initInnovationStore(store),  // innovation labs experiments, hackathons & graduations
+      initBudgetStore(store),      // agent budgets, spend log & cost alerts
+      initImprovementStore(store), // performance reviews, improvement plans & feedback
+    ]);
+  } catch (err) {
+    rehydrationError ??= (err as Error).message;
+    console.error(`[server] REHYDRATION FAILED (secondary stores): ${(err as Error).message}`);
+  }
 }
+if (!deploymentBindingError) await rehydrateStores();
 wireNotificationBridge(); // Wire event bus patterns → notification dispatch
-try {
-  if (!deploymentBindingError) await Promise.all([
-    initInnovationStore(store),  // innovation labs experiments, hackathons & graduations
-    initBudgetStore(store),      // agent budgets, spend log & cost alerts
-    initImprovementStore(store), // performance reviews, improvement plans & feedback
-  ]);
-} catch (err) {
-  rehydrationError ??= (err as Error).message;
-  console.error(`[server] REHYDRATION FAILED (secondary stores): ${(err as Error).message}`);
-}
 initAgentStatusReconciler(); // Wire agent status reconciler (subscribes to execution events + 5s ground-truth sweep)
 initSlackNotifier();          // Post execution.completed summaries to SLACK_WEBHOOK_URL for hero workflows
 
@@ -1413,10 +1425,16 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/auth/demo' && method === 'POST') {
             if (env.EAOS_DEMO_MODE !== 'public') { sendJSON(res, 404, { error: 'Demo sessions are not enabled on this deployment' }); return; }
             if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
-            const issued = await createBrowserSession({
-                id: `${DEMO_PRINCIPAL_PREFIX}${randomUUID()}`, email: '', name: 'Demo visitor', role: 'user',
-                teams: [], personaScopes: ['*'], tenantId: deploymentTenantId,
-            });
+            const visitor = randomUUID();
+            const principal = {
+                id: `${DEMO_PRINCIPAL_PREFIX}${visitor}`, email: `demo-${visitor}@demo.invalid`, name: 'Demo visitor', role: 'user' as const,
+                teams: [], personaScopes: ['*' as const], tenantId: deploymentTenantId,
+            };
+            try { await provisionDemoUser(pgPool, principal); } catch (err) {
+                if (err instanceof DemoTenantMissingError) { sendJSON(res, 409, { error: err.message }); return; }
+                throw err;
+            }
+            const issued = await createBrowserSession(principal);
             setSessionCookies(res, issued);
             sendJSON(res, 200, { expiresIn: issued.expiresIn, user: { ...issued.user, demo: true } });
             return;

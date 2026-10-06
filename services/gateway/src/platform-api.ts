@@ -18,7 +18,7 @@ const version = z.number().int().nonnegative();
 const measuredAliases = ['/api/metrics','/api/observability/metrics','/api/costs/meter','/api/costs/history'];
 export function isPlatformRoute(path: string): boolean { return ['/api/operations','/api/evaluations','/api/registry/packages','/api/registry/connectors','/api/admin/members','/api/knowledge/governance','/api/knowledge/search','/api/prompts'].some(prefix => path === prefix || path.startsWith(prefix + '/')) || measuredAliases.includes(path) || path.startsWith('/api/agent-evals') || path.startsWith('/api/evals/'); }
 export async function platformRequest(repository: PlatformRepository | undefined, runs: PostgresRunRepository | undefined, user: AuthUser, url: URL, method: string, readBody: () => Promise<Record<string, unknown>>, onMemberChange: (id: string) => void): Promise<{ status: number; data: unknown }> {
-  if (!repository || !runs) return { status: 422, data: { error: 'Operating platform requires durable PostgreSQL storage' } };
+  if (!repository || !runs) return { status: 422, data: { error: 'Operating platform requires durable PostgreSQL storage', code: 'durable_runtime_required' } };
   const principal = platformPrincipal(user), path = url.pathname;
   if ((path === '/api/operations' || path === '/api/operations/summary' || measuredAliases.includes(path) || path.startsWith('/api/agent-evals')) && method === 'GET') return { status: 200, data: await repository.summary(principal) };
   if ((path === '/api/operations/agents' || path === '/api/evals/agents') && method === 'GET') return { status: 200, data: { agents: await repository.agentMetrics(principal), synthetic: false } };

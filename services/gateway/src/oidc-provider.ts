@@ -132,8 +132,11 @@ export async function exchangeCode(code: string, verifier: string): Promise<Toke
   });
 
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Token exchange failed: ${res.status} — ${text}`);
+    // The identity provider's error body stays in the server log. It used to be
+    // put into the thrown message, which the callback handler sends to the browser.
+    const text = (await res.text()).slice(0, 500);
+    console.warn(`[oidc] token exchange failed: ${res.status} — ${text}`);
+    throw new Error(`Token exchange failed (${res.status})`);
   }
 
   return res.json() as Promise<TokenResponse>;

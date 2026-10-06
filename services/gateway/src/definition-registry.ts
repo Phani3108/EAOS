@@ -177,7 +177,18 @@ export function requiredPersonas(definition: UnifiedSkillDef): PersonaId[] {
   return [...personas];
 }
 
+let compiledCatalog: CompiledDefinition[] | undefined;
+
+/**
+ * The source catalogues are static module data, so the compiled catalogue is
+ * built once. It was rebuilt — every definition recompiled and re-validated —
+ * on each call, and several request paths call it per request.
+ */
 export function getCompiledCatalog(): CompiledDefinition[] {
+  return compiledCatalog ??= buildCompiledCatalog();
+}
+
+function buildCompiledCatalog(): CompiledDefinition[] {
   const flagships: UnifiedSkillDef[] = FLAGSHIP_WORKFLOWS.map(workflow => ({
     ...workflow, persona: canonicalPersona(workflow.personas[0]!)!, executableType: 'workflow', cluster: 'Flagship',
     complexity: workflow.complexity === 'critical' ? 'complex' : workflow.complexity,

@@ -10,7 +10,7 @@ const connection = /^\/api\/connections(?:\/([a-z][a-z0-9_-]{0,99})\/(connect|di
 const artifact = /^\/api\/artifacts(?:\/(artifact-[a-zA-Z0-9-]+)(\/content)?)?$/;
 export function isIntegrationRoute(path: string, method: string): boolean { return ['GET','POST','DELETE'].includes(method) && (connection.test(path) || artifact.test(path) || path === '/api/marketing/upload' && method === 'POST'); }
 export async function integrationRequest(workspace: PostgresWorkspaceRepository | undefined, repository: PostgresIntegrationRepository | undefined, connectors: ConnectorService | undefined, principal: AuthUser, url: URL, method: string, readBody: () => Promise<Record<string, unknown>>): Promise<{ status: number; data?: unknown; download?: { bytes: Buffer; filename: string; mimeType: string } }> {
-  if (!workspace || !repository || !connectors) return { status: 422, data: { error: 'Integration evidence requires durable storage' } };
+  if (!workspace || !repository || !connectors) return { status: 422, data: { error: 'Integration evidence requires durable PostgreSQL storage', code: 'durable_runtime_required' } };
   const owner = { tenantId: principal.tenantId, userId: principal.id };
   const connector = url.pathname.match(connection);
   if (connector) {

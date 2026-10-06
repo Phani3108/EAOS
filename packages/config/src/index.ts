@@ -64,6 +64,8 @@ const SPEC = {
   VAULT_TOKEN: { kind: 'string', secret: true },
   VAULT_KV_MOUNT: { kind: 'string', default: 'secret' },
   EAOS_TENANT_ID: { kind: 'string', default: 'default' },
+  /** Bind data written before tenant binding existed to EAOS_TENANT_ID (single-tenant upgrade in place). */
+  EAOS_ADOPT_LEGACY_DATA: { kind: 'bool', default: false },
   ALLOW_DEV_API_KEYS: { kind: 'bool', default: false },
   /** One-shot bootstrap token for POST /api/setup. Long enough to be unguessable. */
   EAOS_SETUP_TOKEN: { kind: 'string', secret: true, minLength: 24 },
@@ -122,6 +124,7 @@ export interface Env {
   VAULT_TOKEN?: string;
   VAULT_KV_MOUNT: string;
   EAOS_TENANT_ID: string;
+  EAOS_ADOPT_LEGACY_DATA: boolean;
   ALLOW_DEV_API_KEYS: boolean;
   EAOS_SETUP_TOKEN?: string;
   CORS_ALLOWED_ORIGINS?: string;

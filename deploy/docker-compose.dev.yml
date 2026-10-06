@@ -1,0 +1,26 @@
+# Local development database. `pnpm dev` starts and health-checks this for you.
+#
+# Development-only credentials, bound to 127.0.0.1 so the database is never
+# reachable from the network. Production uses docker-compose.production.yml (no
+# default password) or a managed Postgres with a non-owner application role.
+name: eaos-dev
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: eaos
+      POSTGRES_PASSWORD: eaos-local-dev-only
+      POSTGRES_DB: eaos
+    ports:
+      - "127.0.0.1:${EAOS_DEV_PG_PORT:-55432}:5432"
+    volumes:
+      - eaos-dev-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eaos -d eaos"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  eaos-dev-pg:

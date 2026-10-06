@@ -119,7 +119,7 @@ services:
       - '5432:5432'
     environment:
       - POSTGRES_USER=eaos
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-eaos-dev-password}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD — the production stack has no default database password}
       - POSTGRES_DB=eaos
     volumes:
       - pgdata:/var/lib/postgresql/data
