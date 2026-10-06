@@ -45,8 +45,13 @@ export async function discoverOIDC(): Promise<OIDCConfig> {
   const url = `${ISSUER_URL.replace(/\/$/, '')}/.well-known/openid-configuration`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`OIDC discovery failed: ${res.status}`);
-  _config = await res.json() as OIDCConfig;
-  return _config;
+  const config = await res.json() as OIDCConfig;
+  if (config.issuer !== ISSUER_URL) throw new Error('OIDC discovery issuer mismatch');
+  for (const endpoint of [config.authorization_endpoint, config.token_endpoint, config.jwks_uri]) {
+    if (new URL(endpoint).protocol !== 'https:') throw new Error('OIDC endpoints must use HTTPS');
+  }
+  _config = config;
+  return config;
 }
 
 // ---------------------------------------------------------------------------
@@ -54,14 +59,17 @@ export async function discoverOIDC(): Promise<OIDCConfig> {
 // ---------------------------------------------------------------------------
 
 /** In-memory nonce/state store (production: use Redis with TTL) */
-const pendingStates = new Map<string, { nonce: string; createdAt: number }>();
+const pendingStates = new Map<string, { nonce: string; createdAt: number; binding: string; verifier: string }>();
 
-export async function buildAuthorizationUrl(): Promise<{ url: string; state: string }> {
+export async function buildAuthorizationUrl(binding: string): Promise<{ url: string; state: string }> {
+  if (!binding || !CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) throw new Error('OIDC client and browser binding are required');
   const cfg = await discoverOIDC();
-  const state = randomBytes(16).toString('hex');
-  const nonce = randomBytes(16).toString('hex');
+  const state = randomBytes(32).toString('hex');
+  const nonce = randomBytes(32).toString('hex');
+  const verifier = randomBytes(32).toString('base64url');
+  if (pendingStates.size >= 1000) throw new Error('Too many pending authorization requests');
 
-  pendingStates.set(state, { nonce, createdAt: Date.now() });
+  pendingStates.set(state, { nonce, createdAt: Date.now(), binding: createHash('sha256').update(binding).digest('hex'), verifier });
   // Prune states older than 10 minutes
   for (const [k, v] of pendingStates) {
     if (Date.now() - v.createdAt > 600_000) pendingStates.delete(k);
@@ -74,6 +82,8 @@ export async function buildAuthorizationUrl(): Promise<{ url: string; state: str
     scope: 'openid email profile',
     state,
     nonce,
+    code_challenge_method: 'S256',
+    code_challenge: createHash('sha256').update(verifier).digest('base64url'),
   });
 
   return { url: `${cfg.authorization_endpoint}?${params}`, state };
@@ -90,7 +100,16 @@ interface TokenResponse {
   expires_in?: number;
 }
 
-export async function exchangeCode(code: string): Promise<TokenResponse> {
+export async function completeAuthorization(code: string, state: string, binding: string): Promise<OIDCClaims> {
+  const pending = pendingStates.get(state);
+  pendingStates.delete(state);
+  if (!pending || Date.now() - pending.createdAt >= 600_000 || !binding ||
+      pending.binding !== createHash('sha256').update(binding).digest('hex')) throw new Error('Invalid or expired authorization state');
+  const tokens = await exchangeCode(code, pending.verifier);
+  return verifyIdToken(tokens.id_token, pending.nonce);
+}
+
+export async function exchangeCode(code: string, verifier: string): Promise<TokenResponse> {
   const cfg = await discoverOIDC();
 
   // Pre-warm the JWKS cache (production only) so the subsequent synchronous
@@ -103,6 +122,7 @@ export async function exchangeCode(code: string): Promise<TokenResponse> {
     redirect_uri: REDIRECT_URI,
     client_id: CLIENT_ID,
     client_secret: CLIENT_SECRET,
+    code_verifier: verifier,
   });
 
   const res = await fetch(cfg.token_endpoint, {
@@ -193,7 +213,7 @@ async function fetchJWKS(): Promise<JWK[]> {
  * IdP keys configured, exactly as before.
  */
 export async function prewarmJWKS(): Promise<void> {
-  if (!IS_PRODUCTION) return;
+  _jwks = null;
   try {
     await fetchJWKS();
   } catch {
@@ -258,15 +278,13 @@ export function verifyIdToken(idToken: string, state: string): OIDCClaims {
   //     path — claims are trusted without checking the signature so the
   //     anonymous demo flow keeps working with no IdP keys configured.
   // ---------------------------------------------------------------------------
-  if (IS_PRODUCTION) {
-    verifyIdTokenSignatureSync(parts);
-  }
+  verifyIdTokenSignatureSync(parts);
   // else: dev/demo — signature-less, exactly as before.
 
   const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString()) as OIDCClaims;
 
   // Expiry
-  if (claims.exp < Math.floor(Date.now() / 1000)) {
+  if (!Number.isFinite(claims.exp) || claims.exp <= Math.floor(Date.now() / 1000) || claims.iss !== ISSUER_URL || !claims.sub) {
     throw new Error('id_token expired');
   }
 
@@ -275,11 +293,9 @@ export function verifyIdToken(idToken: string, state: string): OIDCClaims {
   if (!aud.includes(CLIENT_ID)) throw new Error('id_token audience mismatch');
 
   // Nonce (CSRF protection)
-  const pending = pendingStates.get(state);
-  if (pending && claims.nonce && claims.nonce !== pending.nonce) {
+  if (!state || claims.nonce !== state) {
     throw new Error('id_token nonce mismatch');
   }
-  if (pending) pendingStates.delete(state);
 
   return claims;
 }
@@ -302,11 +318,11 @@ export interface OIDCUser {
  */
 export function provisionUser(claims: OIDCClaims): OIDCUser {
   const email = claims.email ?? `${claims.sub}@oidc.local`;
-  const emailDomain = email.split('@')[1] ?? 'default';
-  const tenantId = process.env.OIDC_DEFAULT_TENANT ?? emailDomain;
+  const tenantId = process.env.OIDC_DEFAULT_TENANT;
+  if (!tenantId) throw new Error('OIDC_DEFAULT_TENANT must identify the trusted identity provider tenant');
 
   return {
-    id: `oidc:${claims.sub}`,
+    id: `oidc:${createHash('sha256').update(`${claims.iss}\u0000${claims.sub}`).digest('hex')}`,
     email,
     name: claims.name ?? ([claims.given_name, claims.family_name].filter(Boolean).join(' ') || email),
     tenantId,

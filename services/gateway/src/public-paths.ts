@@ -54,12 +54,19 @@ const PUBLIC_PATHS: readonly PublicPath[] = [
       'Container healthcheck. Must be unauthenticated or the container never becomes healthy. ' +
       'Detailed fields are gated inside the handler.',
   },
-  {
-    method: 'GET',
-    path: '/metrics',
-    reason:
-      'Prometheus scrape. Aggregate counters only. Bind to an internal interface or IP-allowlist at the edge.',
-  },
+  // NOTE: there is deliberately no `/metrics` entry.
+  //
+  // It was declared here with the reason "aggregate counters only", and both
+  // halves of that were false: no `/metrics` route exists (the real one is
+  // `/api/metrics`, so the declared path simply 404'd), and `/api/metrics`
+  // returns JSON including `llm.cost_meter` and per-provider circuit state —
+  // i.e. spend. Publishing that unauthenticated tells the internet what a tenant
+  // is spending and which providers are failing.
+  //
+  // Probes are already covered by `/api/live` and `/api/ready`. If a Prometheus
+  // scrape target is needed later it should be a separate `text/plain` endpoint
+  // exposing request/error/latency/uptime counters only, behind an explicit
+  // opt-in flag — not this route.
 
   // ── Credential acquisition ────────────────────────────────────────────────
   {
@@ -86,15 +93,24 @@ const PUBLIC_PATHS: readonly PublicPath[] = [
       'Exchanges a one-time code for a token. Replaces returning the JWT in a URL query string, ' +
       'which leaked it into browser history, Referer headers and proxy logs.',
   },
-  {
-    method: 'POST',
-    path: '/api/auth/login',
-    reason: 'Password/token login. Rate limited; exists to mint a credential.',
-  },
+  // NOTE: there is deliberately no `/api/auth/login` entry.
+  //
+  // It was declared as "password/token login" — but there are no passwords in
+  // this system. The `users` table has no password_hash column, and
+  // `authenticateRequest` accepts exactly two credential types: an API key and
+  // an HS256 JWT. Implementing it would mean inventing a password store,
+  // hashing, reset, and lockout — a whole subsystem, to justify an allowlist
+  // entry that was added by mistake.
+  //
+  // The credential chain that does exist:
+  //   EAOS_SETUP_TOKEN → POST /api/setup → API key → POST /api/auth/token → JWT
+  //   or: OIDC authorize → callback → exchange → JWT
   {
     method: 'POST',
     path: '/api/auth/token/refresh',
-    reason: 'Refresh flow. Authenticated by the refresh cookie, not the Authorization header.',
+    reason:
+      'Refresh flow. Authenticated by the HttpOnly refresh cookie, not the Authorization ' +
+      'header, so it cannot require one. Single-use: rotation revokes the whole family on reuse.',
   },
 ];
 
