@@ -24,6 +24,8 @@ export interface AuthUser {
     personaScopes?: PersonaScope[];
     /** Tenant this user belongs to (default: 'default') */
     tenantId: string;
+    sessionId?: string;
+    tokenExpiresAt?: number;
 }
 
 /** Result of generating a new API key — raw key is shown once, only hash is stored. */
@@ -42,7 +44,7 @@ export function generateApiKey(secret?: string): GeneratedApiKey {
     // No hardcoded fallback secret: an API key hash is only meaningful when a real
     // signing secret exists. Require an explicit secret or JWT_SECRET — never a
     // predictable constant baked into the source.
-    const signingSecret = secret ?? JWT_SECRET;
+    const signingSecret = secret ?? (process.env.API_KEY_HASH_SECRET || JWT_SECRET).split(',').map(value => value.trim()).find(Boolean);
     if (!signingSecret) throw new Error('generateApiKey: no signing secret (set JWT_SECRET/AUTH_SECRET or pass one)');
     const keyHash = createHmac('sha256', signingSecret).update(rawKey).digest('hex');
     const keyPrefix = rawKey.slice(0, 10);
@@ -57,7 +59,7 @@ const DEV_API_KEYS: Record<string, AuthUser> = {
 };
 
 /** JWT signing secret — set via env (required in production) */
-const JWT_SECRET = process.env.JWT_SECRET ?? process.env.AUTH_SECRET ?? '';
+const JWT_SECRET = process.env.JWT_SECRET || process.env.AUTH_SECRET || '';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 /**
@@ -122,6 +124,11 @@ export async function authenticateRequest(headers: Record<string, string | undef
         // Verify as JWT
         try {
             const user = verifyJWT(token);
+            if (user?.sessionId) {
+                const current = await sessionResolver?.(user.sessionId);
+                if (!current || current.id !== user.id || current.tenantId !== user.tenantId) return { authenticated: false, error: 'Session expired or revoked' };
+                return { authenticated: true, user: { ...current, sessionId: user.sessionId, tokenExpiresAt: Math.min(current.tokenExpiresAt ?? Infinity, user.tokenExpiresAt ?? Infinity) } };
+            }
             if (user) return { authenticated: true, user };
             return { authenticated: false, error: 'Invalid or expired token' };
         } catch {
@@ -150,20 +157,25 @@ export function requireRole(user: AuthUser, requiredRole: UserRole): boolean {
 
 /** Check if user has access to a specific persona */
 export function requirePersonaAccess(user: AuthUser, persona: string): boolean {
-    if (!user.personaScopes || user.personaScopes.length === 0) return true;
+    if (!user.personaScopes || user.personaScopes.length === 0) return false;
     if (user.personaScopes.includes('*')) return true;
     return user.personaScopes.includes(persona as PersonaScope);
 }
 
 /** Generate a signed JWT token (for issuing tokens from auth endpoints) */
 export function generateJWT(user: AuthUser, expiresInSec = 86400): string {
-    const secret = JWT_SECRET;
+    const secret = JWT_SECRET.split(',').map(value => value.trim()).find(Boolean);
     if (!secret) throw new Error('JWT_SECRET not configured');
+    if (!Number.isInteger(expiresInSec) || expiresInSec < 1 || expiresInSec > 86400) throw new Error('Token lifetime must be between 1 and 86400 seconds');
+    if (!user.id || !user.tenantId) throw new Error('Token principal and tenant are required');
 
     const header = { alg: 'HS256', typ: 'JWT' };
     const now = Math.floor(Date.now() / 1000);
     const payload = {
         sub: user.id,
+        iss: 'eaos',
+        aud: 'eaos-api',
+        sid: user.sessionId,
         email: user.email,
         name: user.name,
         role: user.role,
@@ -194,6 +206,11 @@ export function generateJWT(user: AuthUser, expiresInSec = 86400): string {
 export type ApiKeyResolver = (rawKey: string) => Promise<AuthUser | undefined>;
 
 let apiKeyResolver: ApiKeyResolver | undefined;
+let sessionResolver: ((id: string) => Promise<AuthUser | undefined>) | undefined;
+
+export function setSessionResolver(resolver: (id: string) => Promise<AuthUser | undefined>): void {
+    sessionResolver = resolver;
+}
 
 /** Register the backing key store. Called once from the gateway's boot. */
 export function setApiKeyResolver(resolver: ApiKeyResolver): void {
@@ -207,9 +224,14 @@ export function setApiKeyResolver(resolver: ApiKeyResolver): void {
  * is how the two sides silently drift apart.
  */
 export function hashApiKey(rawKey: string, secret?: string): string {
-    const signingSecret = secret ?? JWT_SECRET;
+    const signingSecret = secret ?? (process.env.API_KEY_HASH_SECRET || JWT_SECRET).split(',').map(value => value.trim()).find(Boolean);
     if (!signingSecret) throw new Error('hashApiKey: no signing secret (set JWT_SECRET/AUTH_SECRET)');
     return createHmac('sha256', signingSecret).update(rawKey).digest('hex');
+}
+
+export function hashApiKeyCandidates(rawKey: string): string[] {
+    const raw = process.env.API_KEY_HASH_SECRET || JWT_SECRET;
+    return [...new Set([...raw.split(',').map(value => value.trim()).filter(Boolean), raw].filter(Boolean).map(secret => hashApiKey(rawKey, secret)))];
 }
 
 async function resolveApiKey(key: string): Promise<AuthUser | undefined> {
@@ -217,7 +239,7 @@ async function resolveApiKey(key: string): Promise<AuthUser | undefined> {
     // default OFF. They were previously reachable on a `!IS_PRODUCTION` branch,
     // which meant any deployment that forgot to set NODE_ENV=production handed
     // admin to anyone who had read the source.
-    if (ALLOW_DEV_API_KEYS) {
+    if (ALLOW_DEV_API_KEYS && !IS_PRODUCTION) {
         const devUser = DEV_API_KEYS[key];
         if (devUser) return devUser;
     }
@@ -280,7 +302,12 @@ function verifyJWT(token: string): AuthUser | null {
         const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString());
 
         // Check expiration
-        if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+        if (!Number.isFinite(payload.exp) || payload.exp <= Math.floor(Date.now() / 1000) ||
+            payload.iss !== 'eaos' || payload.aud !== 'eaos-api' ||
+            typeof payload.sub !== 'string' || !payload.sub || typeof payload.tenantId !== 'string' || !payload.tenantId ||
+            !['user', 'operator', 'admin'].includes(payload.role ?? 'user') ||
+            (payload.nbf !== undefined && (!Number.isFinite(payload.nbf) || payload.nbf > Date.now() / 1000)) ||
+            (payload.sid !== undefined && typeof payload.sid !== 'string')) {
             return null; // Token expired
         }
 
@@ -291,7 +318,9 @@ function verifyJWT(token: string): AuthUser | null {
             role: payload.role ?? 'user',
             teams: payload.teams ?? [],
             personaScopes: payload.personaScopes ?? ['*'],
-            tenantId: payload.tenantId ?? 'default',
+            tenantId: payload.tenantId,
+            sessionId: payload.sid,
+            tokenExpiresAt: payload.exp * 1000,
         };
     } catch {
         return null;

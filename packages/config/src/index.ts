@@ -59,6 +59,12 @@ const SPEC = {
   /** HS256 signing secret. Comma-separated to rotate: sign with the first, verify against any. */
   JWT_SECRET: { kind: 'string', secret: true },
   AUTH_SECRET: { kind: 'string', secret: true },
+  API_KEY_HASH_SECRET: { kind: 'string', secret: true },
+  VAULT_ADDR: { kind: 'string', secret: true },
+  VAULT_TOKEN: { kind: 'string', secret: true },
+  VAULT_KV_MOUNT: { kind: 'string', default: 'secret' },
+  EAOS_TENANT_ID: { kind: 'string', default: 'default' },
+  ALLOW_DEV_API_KEYS: { kind: 'bool', default: false },
   /** One-shot bootstrap token for POST /api/setup. Long enough to be unguessable. */
   EAOS_SETUP_TOKEN: { kind: 'string', secret: true, minLength: 24 },
   /** Comma-separated allowlist. Unset in production means NO CORS header, not `*`. */
@@ -105,6 +111,12 @@ export interface Env {
   PORT: number;
   JWT_SECRET?: string;
   AUTH_SECRET?: string;
+  API_KEY_HASH_SECRET?: string;
+  VAULT_ADDR?: string;
+  VAULT_TOKEN?: string;
+  VAULT_KV_MOUNT: string;
+  EAOS_TENANT_ID: string;
+  ALLOW_DEV_API_KEYS: boolean;
   EAOS_SETUP_TOKEN?: string;
   CORS_ALLOWED_ORIGINS?: string;
   ALLOW_ANON: boolean;
@@ -218,6 +230,14 @@ function crossFieldProblems(env: Env): EnvProblem[] {
   const problems: EnvProblem[] = [];
   const isProd = env.NODE_ENV === 'production';
   const signingSecret = env.JWT_SECRET ?? env.AUTH_SECRET;
+  if (Boolean(env.VAULT_ADDR) !== Boolean(env.VAULT_TOKEN)) problems.push({ key: 'VAULT_ADDR', severity: 'error', message: 'Vault address and authentication must be configured together' });
+  if (env.VAULT_ADDR) {
+    try {
+      const url = new URL(env.VAULT_ADDR);
+      if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('Invalid Vault origin');
+    } catch { problems.push({ key: 'VAULT_ADDR', severity: 'error', message: 'Vault requires a credential-free HTTPS origin' }); }
+  }
+  if (!/^[a-zA-Z0-9_-]{1,200}$/.test(env.VAULT_KV_MOUNT)) problems.push({ key: 'VAULT_KV_MOUNT', severity: 'error', message: 'Invalid Vault KV mount' });
 
   if (isProd && !signingSecret) {
     problems.push({
@@ -247,6 +267,13 @@ function crossFieldProblems(env: Env): EnvProblem[] {
         'Unset in production: no Access-Control-Allow-Origin header will be sent (fail closed, not "*"). ' +
         'Set it to your web origin, e.g. https://app.example.com',
     });
+  }
+
+  if (isProd && (!env.REQUIRE_SIGNED_TOKENS || env.ALLOW_DEV_API_KEYS)) {
+    problems.push({ key: 'REQUIRE_SIGNED_TOKENS', severity: 'error', message: 'Production requires signed tokens and forbids development API keys.' });
+  }
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(env.EAOS_TENANT_ID)) {
+    problems.push({ key: 'EAOS_TENANT_ID', severity: 'error', message: 'Invalid deployment tenant identifier.' });
   }
 
   if (env.ALLOW_ANON) {

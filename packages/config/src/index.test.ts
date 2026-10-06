@@ -23,6 +23,15 @@ const errorKeys = (env: NodeJS.ProcessEnv) =>
     .problems.filter(p => p.severity === 'error')
     .map(p => p.key);
 
+describe('Vault deployment configuration', () => {
+  it('requires paired credentials and a safe HTTPS origin', () => {
+    expect(errorKeys({ ...PROD_OK, VAULT_ADDR: 'https://vault.example.invalid' })).toContain('VAULT_ADDR');
+    expect(errorKeys({ ...PROD_OK, VAULT_ADDR: 'http://vault.example.invalid', VAULT_TOKEN: 'fixture' })).toContain('VAULT_ADDR');
+    expect(errorKeys({ ...PROD_OK, VAULT_ADDR: 'https://vault.example.invalid', VAULT_TOKEN: 'fixture', VAULT_KV_MOUNT: 'secret' })).not.toContain('VAULT_ADDR');
+    expect(errorKeys({ ...PROD_OK, VAULT_ADDR: 'https://user:fixture@vault.example.invalid', VAULT_TOKEN: 'fixture' })).toContain('VAULT_ADDR');
+  });
+});
+
 describe('defaults', () => {
   it('validates an empty env as development, with warnings but no errors', () => {
     const r = validateEnv({});
