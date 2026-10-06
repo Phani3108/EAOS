@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto';
 import { callLLM, hasAnyLLMKey } from './llm-provider.js';
 
-export type ReviewVerdict = 'approve' | 'changes_requested';
+export type ReviewVerdict = 'approve' | 'changes_requested' | 'inconclusive' | 'simulated';
 
 export interface ReviewerResult {
   role: string;
@@ -92,8 +92,8 @@ function simulatedReview(roleDef: ReviewRoleDef): ReviewerResult {
     role: roleDef.role,
     label: roleDef.label,
     persona: roleDef.persona,
-    verdict: 'approve',
-    summary: `[simulated] ${roleDef.label} found no blocking issues. Configure an LLM API key (ANTHROPIC_API_KEY/OPENAI_API_KEY) for a real review.`,
+    verdict: 'simulated',
+    summary: `[simulated] ${roleDef.label}: no live review was performed.`,
     findings: [],
     simulated: true,
   };
@@ -106,10 +106,10 @@ export function getReviewChain(): Array<{ role: string; label: string; persona: 
 
 export async function runReviewPipeline(
   artifact: string,
-  opts: { roles?: string[]; provider?: string; modelId?: string } = {}
+  opts: { roles?: string[]; provider?: string; modelId?: string; simulate?: boolean } = {}
 ): Promise<ReviewPipelineResult> {
   const chain = DEFAULT_REVIEW_CHAIN.filter(r => !opts.roles || opts.roles.includes(r.role));
-  const simulate = !hasAnyLLMKey();
+  const simulate = opts.simulate === true;
   const reviewers: ReviewerResult[] = [];
   let totalCost = 0;
 
@@ -148,7 +148,8 @@ export async function runReviewPipeline(
       });
       totalCost += res.cost;
       const parsed = parseVerdictJson(res.content);
-      const verdict: ReviewVerdict = parsed?.verdict === 'changes_requested' ? 'changes_requested' : 'approve';
+      if (!parsed || !['approve', 'changes_requested'].includes(parsed.verdict ?? '') || typeof parsed.summary !== 'string' || !parsed.summary.trim() || !Array.isArray(parsed.findings) || parsed.findings.some(finding => typeof finding !== 'string')) throw new Error('Invalid reviewer response contract');
+      const verdict = parsed.verdict as ReviewVerdict;
       reviewers.push({
         role: roleDef.role,
         label: roleDef.label,
@@ -166,10 +167,10 @@ export async function runReviewPipeline(
         role: roleDef.role,
         label: roleDef.label,
         persona: roleDef.persona,
-        verdict: 'approve',
+        verdict: 'inconclusive',
         summary: `Review could not complete: ${(err as Error).message}`,
         findings: [],
-        simulated: true,
+        simulated: false,
       });
     }
   }
@@ -181,9 +182,9 @@ export async function runReviewPipeline(
     id: `review-${randomUUID().slice(0, 8)}`,
     artifactPreview: artifact.slice(0, 200),
     reviewers,
-    finalVerdict: changesRequested > 0 ? 'changes_requested' : 'approve',
+    finalVerdict: simulate ? 'simulated' : !reviewers.length || reviewers.some(reviewer => reviewer.verdict === 'inconclusive') ? 'inconclusive' : changesRequested > 0 ? 'changes_requested' : 'approve',
     consolidatedFindings,
-    approvals: reviewers.length - changesRequested,
+    approvals: reviewers.filter(reviewer => reviewer.verdict === 'approve' && !reviewer.simulated).length,
     changesRequested,
     simulated: simulate,
     totalCost,

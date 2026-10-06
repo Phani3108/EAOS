@@ -176,7 +176,7 @@ export class Scheduler {
     private tickInterval?: ReturnType<typeof setInterval>;
 
     constructor() {
-        this.seed();
+        if (process.env.SEED_DEMO === 'true') this.seed();
         this.startTick();
     }
 
@@ -314,10 +314,11 @@ export class Scheduler {
                 // to `timeout` seconds for it to reach a terminal state to record
                 // accurate success/failure in the job log.
                 const persona = this.resolvePersonaForJob(job);
-                const exec = createPersonaExecution(
-                    // Pre-existing jobs have no tenant recorded; 'default' matches
-                    // the single-tenant behaviour they were created under.
-                    job.tenantId ?? 'default',
+                if (!job.tenantId || job.tenantId !== (process.env.EAOS_TENANT_ID || 'default')) throw new Error('Legacy job tenant ownership requires review');
+                const exec = await createPersonaExecution(
+                    // Pre-existing jobs without verified tenant ownership remain
+                    // quarantined until an explicit migration has been reviewed.
+                    job.tenantId,
                     persona,
                     skill,
                     job.inputs ?? {},

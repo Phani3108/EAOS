@@ -12,13 +12,18 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { addMessage, buildConversationContext, getSession } from './chat-store.js';
+import { addMessage, buildConversationContext, getSession, usesDurableChat } from './chat-store.js';
 import { callLLM } from './llm-provider.js';
 import { broadcastEvent } from './ws.js';
 import { eventBus } from './event-bus.js';
 import { createUTCPPacket, storePacket } from './utcp-protocol.js';
 import { intentEngine } from './intent-engine.js';
 import { skillMarketplace } from './skill-marketplace.js';
+import type { AuthUser } from './auth.js';
+import type { ChatSession } from './chat-store.js';
+
+let submitExecution: ((principal: AuthUser, session: ChatSession, content: string, conversation: string, messageId: string) => Promise<string>) | undefined;
+export function configureChatExecutionAdapter(adapter: NonNullable<typeof submitExecution>): void { submitExecution = adapter; }
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -30,6 +35,7 @@ export interface PostMessageResult {
     agentMessage?: { id: string; content: string; createdAt: string };
     detectedSkillSlug?: string;
     detectedAgent?: string;
+    executionId?: string;
     error?: string;
 }
 
@@ -48,9 +54,11 @@ export interface PostMessageResult {
 export async function postMessage(params: {
     sessionId: string;
     userId: string;
+    tenantId: string;
     content: string;
+    principal?: AuthUser;
 }): Promise<PostMessageResult> {
-    const session = getSession(params.sessionId);
+    const session = await getSession(params.sessionId, params);
     if (!session) {
         return {
             userMessage: { id: '', content: params.content, createdAt: new Date().toISOString() },
@@ -60,7 +68,8 @@ export async function postMessage(params: {
     }
 
     // 1. Record the user message
-    const userMsg = addMessage({
+    const userMsg = await addMessage({
+        userId: params.userId, tenantId: params.tenantId,
         sessionId: params.sessionId,
         role: 'user',
         content: params.content,
@@ -77,10 +86,28 @@ export async function postMessage(params: {
     broadcastEvent(`chat:${params.sessionId}`, 'chat.message', {
         role: 'user',
         message: userMsg,
-    });
+    }, params.tenantId);
+
+    if (usesDurableChat()) {
+        try {
+            if (!submitExecution || !params.principal || params.principal.id !== params.userId || params.principal.tenantId !== params.tenantId) throw new Error('Verified chat execution context is required');
+            const context = await buildConversationContext(params.sessionId, params, { maxMessages: 20 });
+            if (!context) throw new Error('Chat context is unavailable');
+            const conversation = context.messages.map(message => `${message.role}: ${message.content}`).join('\n\n');
+            const executionId = await submitExecution(params.principal, session, params.content, conversation, userMsg.id);
+            const ack = await addMessage({ ...params, role: 'tool', content: `Execution ${executionId} was queued. Results and approval state are available on the execution.`, attachments: [{ type: 'execution', ref: executionId, title: 'Open execution' }] });
+            if (ack) broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'tool', message: ack }, params.tenantId);
+            return { userMessage: userMsg, replyPath: 'skill', executionId, agentMessage: ack };
+        } catch (error) {
+            const message = error instanceof Error ? error.message : 'Chat execution was not accepted';
+            const failure = await addMessage({ ...params, role: 'system', content: message });
+            if (failure) broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: failure }, params.tenantId);
+            return { userMessage: userMsg, replyPath: 'error', error: message };
+        }
+    }
 
     // 2. Create a UTCP packet for audit uniformity
-    try {
+    if (!usesDurableChat()) try {
         const packet = createUTCPPacket({
             function: (session.persona as any) ?? 'engineering',
             stage: 'chat',
@@ -100,23 +127,25 @@ export async function postMessage(params: {
         const slug = commandMatch[1]!;
         const result: PostMessageResult = {
             userMessage: { id: userMsg.id, content: userMsg.content, createdAt: userMsg.createdAt },
-            replyPath: 'skill',
+            replyPath: 'error',
+            error: 'Structured skill inputs and a validated submission adapter are required',
             detectedSkillSlug: slug,
         };
 
         // For now, add a system message acknowledging the skill was requested.
         // Full skill enqueue path will be wired when chat→queue→skill loop is integrated.
-        const ack = addMessage({
+        const ack = await addMessage({
+        userId: params.userId, tenantId: params.tenantId,
             sessionId: params.sessionId,
             role: 'system',
-            content: `Skill "${slug}" requested. Enqueueing via task queue...`,
+            content: `Skill "${slug}" was not enqueued: structured inputs and a validated submission adapter are required.`,
         });
         if (ack) {
-            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: ack });
+            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: ack }, params.tenantId);
         }
 
         // Fire an A2A-style event so Protocol Monitor can see it
-        eventBus.emit('chat.skill.requested', { sessionId: params.sessionId, slug, userId: params.userId }).catch(() => {});
+        if (!usesDurableChat()) eventBus.emit('chat.skill.requested', { sessionId: params.sessionId, slug, userId: params.userId }).catch(() => {});
 
         return result;
     }
@@ -126,24 +155,26 @@ export async function postMessage(params: {
         const agentName = mentionMatch[1]!;
         const result: PostMessageResult = {
             userMessage: { id: userMsg.id, content: userMsg.content, createdAt: userMsg.createdAt },
-            replyPath: 'delegation',
+            replyPath: 'error',
+            error: 'Delegation requires a validated agent/task contract',
             detectedAgent: agentName,
         };
 
-        const ack = addMessage({
+        const ack = await addMessage({
+        userId: params.userId, tenantId: params.tenantId,
             sessionId: params.sessionId,
             role: 'system',
-            content: `Delegating to @${agentName}...`,
+            content: `No delegation was started for @${agentName}: a validated agent/task contract is required.`,
         });
         if (ack) {
-            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: ack });
+            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: ack }, params.tenantId);
         }
-        eventBus.emit('chat.delegation.requested', { sessionId: params.sessionId, agentName, userId: params.userId }).catch(() => {});
+        if (!usesDurableChat()) eventBus.emit('chat.delegation.requested', { sessionId: params.sessionId, agentName, userId: params.userId }).catch(() => {});
         return result;
     }
 
     // Path 3: direct chat reply via LLM
-    const context = buildConversationContext(params.sessionId, { maxMessages: 20 });
+    const context = await buildConversationContext(params.sessionId, params, { maxMessages: 20 });
     if (!context) {
         return {
             userMessage: { id: userMsg.id, content: userMsg.content, createdAt: userMsg.createdAt },
@@ -159,15 +190,18 @@ export async function postMessage(params: {
 
     let reply: string;
     try {
+        if (usesDurableChat()) throw new Error('Durable chat replies require the canonical execution adapter; no provider was called');
         const llmResponse = await callLLM({
             systemPrompt: context.systemPrompt,
             userPrompt: conversationText,
             maxTokens: 1024,
             temperature: 0.7,
         });
-        reply = llmResponse.content || '(no response)';
+        if (!llmResponse.content?.trim()) throw new Error('Provider returned no chat content');
+        reply = llmResponse.content;
 
-        const agentMsg = addMessage({
+        const agentMsg = await addMessage({
+        userId: params.userId, tenantId: params.tenantId,
             sessionId: params.sessionId,
             role: 'agent',
             agentId: session.agentId,
@@ -175,7 +209,7 @@ export async function postMessage(params: {
             tokenCost: llmResponse.cost,
         });
         if (agentMsg) {
-            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'agent', message: agentMsg });
+            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'agent', message: agentMsg }, params.tenantId);
         }
 
         return {
@@ -186,13 +220,14 @@ export async function postMessage(params: {
     } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         console.error('[chat-engine] LLM call failed:', errorMsg);
-        const sysMsg = addMessage({
+        const sysMsg = await addMessage({
+        userId: params.userId, tenantId: params.tenantId,
             sessionId: params.sessionId,
             role: 'system',
             content: `Error generating reply: ${errorMsg}`,
         });
         if (sysMsg) {
-            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: sysMsg });
+            broadcastEvent(`chat:${params.sessionId}`, 'chat.message', { role: 'system', message: sysMsg }, params.tenantId);
         }
         return {
             userMessage: { id: userMsg.id, content: userMsg.content, createdAt: userMsg.createdAt },

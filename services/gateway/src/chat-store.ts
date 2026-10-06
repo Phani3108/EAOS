@@ -10,6 +10,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import type { PostgresWorkspaceRepository } from '@agentos/db/workspace-repository';
+
+let repository: PostgresWorkspaceRepository | undefined;
+export function configureChatRepository(value: PostgresWorkspaceRepository | undefined): void { repository = value; }
+export function usesDurableChat(): boolean { return repository !== undefined; }
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -39,6 +44,7 @@ export interface ChatMessage {
 export interface ChatSession {
     sessionId: string;
     userId: string;
+    tenantId: string;
     title: string;
     agentId?: string;         // optional: pinned primary agent
     persona?: PersonaId;       // scopes available skills
@@ -60,16 +66,20 @@ const messagesBySession = new Map<string, ChatMessage[]>();
 // Sessions
 // ═══════════════════════════════════════════════════════════════
 
-export function createSession(params: {
-    userId: string;
+export type ChatOwner = Pick<ChatSession, 'userId' | 'tenantId'>;
+
+export async function createSession(params: ChatOwner & {
     title?: string;
     agentId?: string;
     persona?: PersonaId;
-}): ChatSession {
+}): Promise<ChatSession> {
+    if (!params.tenantId || !params.userId) throw new Error('Chat tenant and user are required');
+    if (repository) return await repository.createChat(params, params) as ChatSession;
     const now = new Date().toISOString();
     const session: ChatSession = {
-        sessionId: `chat-${randomUUID().slice(0, 8)}`,
+        sessionId: `chat-${randomUUID()}`,
         userId: params.userId,
+        tenantId: params.tenantId,
         title: params.title ?? 'New conversation',
         agentId: params.agentId,
         persona: params.persona,
@@ -82,26 +92,32 @@ export function createSession(params: {
     return session;
 }
 
-export function getSession(sessionId: string): ChatSession | undefined {
-    return sessions.get(sessionId);
+export async function getSession(sessionId: string, owner: ChatOwner): Promise<ChatSession | undefined> {
+    if (repository) return await repository.getChat(owner, sessionId) as ChatSession | undefined;
+    const session = sessions.get(sessionId);
+    return owner?.tenantId && owner.userId && session?.tenantId === owner.tenantId &&
+        session.userId === owner.userId && !session.archivedAt ? session : undefined;
 }
 
-export function listSessions(userId: string): ChatSession[] {
+export async function listSessions(owner: ChatOwner): Promise<ChatSession[]> {
+    if (repository) return await repository.listChats(owner) as ChatSession[];
     return Array.from(sessions.values())
-        .filter(s => s.userId === userId && !s.archivedAt)
+        .filter(s => owner.tenantId && owner.userId && s.tenantId === owner.tenantId && s.userId === owner.userId && !s.archivedAt)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
-export function updateSession(sessionId: string, updates: Partial<ChatSession>): ChatSession | undefined {
-    const existing = sessions.get(sessionId);
+export async function updateSession(sessionId: string, owner: ChatOwner, updates: Partial<ChatSession>): Promise<ChatSession | undefined> {
+    if (repository) return await repository.updateChat(owner, sessionId, updates) as ChatSession | undefined;
+    const existing = await getSession(sessionId, owner);
     if (!existing) return undefined;
-    const updated = { ...existing, ...updates, updatedAt: new Date().toISOString() };
+    const updated = { ...existing, ...updates, sessionId: existing.sessionId, userId: existing.userId, tenantId: existing.tenantId, updatedAt: new Date().toISOString() };
     sessions.set(sessionId, updated);
     return updated;
 }
 
-export function archiveSession(sessionId: string): boolean {
-    const existing = sessions.get(sessionId);
+export async function archiveSession(sessionId: string, owner: ChatOwner): Promise<boolean> {
+    if (repository) return repository.archiveChat(owner, sessionId);
+    const existing = await getSession(sessionId, owner);
     if (!existing) return false;
     existing.archivedAt = new Date().toISOString();
     existing.updatedAt = existing.archivedAt;
@@ -113,15 +129,16 @@ export function archiveSession(sessionId: string): boolean {
 // Messages
 // ═══════════════════════════════════════════════════════════════
 
-export function addMessage(params: {
+export async function addMessage(params: ChatOwner & {
     sessionId: string;
     role: ChatRole;
     content: string;
     agentId?: string;
     attachments?: ChatAttachment[];
     tokenCost?: number;
-}): ChatMessage | undefined {
-    const session = sessions.get(params.sessionId);
+}): Promise<ChatMessage | undefined> {
+    if (repository) return await repository.appendChat(params, params.sessionId, params) as ChatMessage;
+    const session = await getSession(params.sessionId, params);
     if (!session) return undefined;
 
     const message: ChatMessage = {
@@ -150,12 +167,16 @@ export function addMessage(params: {
     return message;
 }
 
-export function listMessages(sessionId: string, limit = 100): ChatMessage[] {
+export async function listMessages(sessionId: string, owner: ChatOwner, limit = 100): Promise<ChatMessage[]> {
+    if (repository) return await repository.listChatMessages(owner, sessionId, limit) as ChatMessage[];
+    if (!await getSession(sessionId, owner)) return [];
     const list = messagesBySession.get(sessionId) ?? [];
     return list.slice(-limit);
 }
 
-export function getMessageCount(sessionId: string): number {
+export async function getMessageCount(sessionId: string, owner: ChatOwner): Promise<number> {
+    if (repository) return repository.countChatMessages(owner, sessionId);
+    if (!await getSession(sessionId, owner)) return 0;
     return (messagesBySession.get(sessionId) ?? []).length;
 }
 
@@ -168,15 +189,15 @@ export interface ConversationContext {
     messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>;
 }
 
-export function buildConversationContext(sessionId: string, opts: {
+export async function buildConversationContext(sessionId: string, owner: ChatOwner, opts: {
     maxMessages?: number;
     systemPrompt?: string;
-} = {}): ConversationContext | undefined {
-    const session = sessions.get(sessionId);
+} = {}): Promise<ConversationContext | undefined> {
+    const session = await getSession(sessionId, owner);
     if (!session) return undefined;
 
     const maxMessages = opts.maxMessages ?? 20;
-    const recent = (messagesBySession.get(sessionId) ?? []).slice(-maxMessages);
+    const recent = await listMessages(sessionId, owner, maxMessages);
 
     // System prompt = rolling summary + optional override
     const parts: string[] = [];
