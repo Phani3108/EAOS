@@ -23,12 +23,15 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type http from 'node:http';
 import type { Duplex } from 'node:stream';
 import { getRedis } from './redis-client.js';
+import type { AuthUser } from './auth.js';
+import { consumeStreamTicket, isAllowedBrowserOrigin, revokeStreamTickets } from './stream-access.js';
 
 const WS_CHANNEL = 'agentos:ws:events';
+const INSTANCE_ID = randomUUID();
 
 // Initialize Redis pub/sub for multi-instance broadcast on startup
 (async () => {
@@ -44,6 +47,7 @@ const WS_CHANNEL = 'agentos:ws:events';
         await sub.connect();
         await sub.subscribe(WS_CHANNEL);
         sub.on('message', (_ch: string, msg: string) => {
+            try { if (JSON.parse(msg).instanceId === INSTANCE_ID) return; } catch { return; }
             // Deliver to all local WS clients
             for (const client of clients) {
                 writeToClient(client, msg);
@@ -63,6 +67,9 @@ const STALL_TIMEOUT_MS = 2_000;
 
 interface WSClient {
     socket: Duplex;
+    user: AuthUser;
+    expiresAt: number;
+    authorize: (user: AuthUser, channel: string) => boolean | Promise<boolean>;
     /** Legacy session-ID subscriptions (kept for backwards compatibility) */
     subscriptions: Set<string>;
     /** New channel-based subscriptions (agents, chat:<id>, execution:<id>) */
@@ -77,9 +84,13 @@ interface WSClient {
     /** Last time the socket drained below threshold */
     lastDrainAt: number;
     connectedAt: number;
+    delivery: Promise<void>;
+    queuedChecks: number;
 }
 
 type BroadcastEvent = {
+    instanceId: string;
+    tenantId: string;
     type: string;
     sessionId: string;
     timestamp: string;
@@ -97,17 +108,35 @@ let totalDisconnectedForSlow = 0;
 /**
  * Attach WebSocket handling to an existing HTTP server.
  */
-export function attachWebSocket(server: http.Server): void {
-    server.on('upgrade', (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
-        const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
-        if (url.pathname !== '/ws') {
+export interface StreamAuthOptions {
+    authenticate: (req: http.IncomingMessage) => Promise<AuthUser | undefined>;
+    authorize: (user: AuthUser, channel: string) => boolean | Promise<boolean>;
+}
+
+export function attachWebSocket(server: http.Server, options: StreamAuthOptions = { authenticate: async () => undefined, authorize: () => false }): void {
+    server.on('upgrade', async (req: http.IncomingMessage, socket: Duplex, head: Buffer) => {
+        socket.on('error', () => socket.destroy());
+        const url = new URL(req.url ?? '/', 'http://localhost');
+        if (!['/ws', '/_/gateway/ws'].includes(url.pathname)) {
             socket.destroy();
             return;
         }
 
         const key = req.headers['sec-websocket-key'];
-        if (!key) {
-            socket.destroy();
+        if (req.method !== 'GET' || req.headers['sec-websocket-version'] !== '13' || typeof key !== 'string' || !/^[A-Za-z0-9+/]{22}==$/.test(key)) {
+            socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+            return;
+        }
+        const protocols = String(req.headers['sec-websocket-protocol'] ?? '').split(',').map(value => value.trim());
+        const ticket = protocols.find(value => value.startsWith('eaos-ticket.'))?.slice('eaos-ticket.'.length);
+        if ((req.headers.origin || ticket) && !isAllowedBrowserOrigin(req.headers.origin)) {
+            socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+            return;
+        }
+        let user: AuthUser | undefined;
+        try { user = ticket ? consumeStreamTicket(ticket) : await options.authenticate(req); } catch {}
+        if (!user?.id || user.id === 'anonymous' || !user.tenantId) {
+            socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
             return;
         }
 
@@ -122,12 +151,16 @@ export function attachWebSocket(server: http.Server): void {
             'Upgrade: websocket\r\n' +
             'Connection: Upgrade\r\n' +
             `Sec-WebSocket-Accept: ${accept}\r\n` +
+            (protocols.includes('eaos') ? 'Sec-WebSocket-Protocol: eaos\r\n' : '') +
             '\r\n',
         );
 
         const now = Date.now();
         const client: WSClient = {
             socket,
+            user,
+            expiresAt: Math.min(user.tokenExpiresAt ?? Infinity, now + 15 * 60_000),
+            authorize: options.authorize,
             subscriptions: new Set(),
             channels: new Set(),
             alive: true,
@@ -136,6 +169,8 @@ export function attachWebSocket(server: http.Server): void {
             droppedCount: 0,
             lastDrainAt: now,
             connectedAt: now,
+            delivery: Promise.resolve(),
+            queuedChecks: 0,
         };
         clients.add(client);
 
@@ -146,9 +181,12 @@ export function attachWebSocket(server: http.Server): void {
             flushPending(client);
         });
 
-        socket.on('data', (buf: Buffer) => {
-            const parsed = decodeFrame(buf);
+        let incoming = Buffer.alloc(0);
+        const receive = async (): Promise<void> => {
+            let parsed: ReturnType<typeof decodeFrame>;
+            try { parsed = decodeFrame(incoming); } catch { removeClient(client); return; }
             if (!parsed) return;
+            incoming = incoming.subarray(parsed.bytesRead);
 
             if (parsed.opcode === 0x8) {
                 // Close frame
@@ -156,6 +194,10 @@ export function attachWebSocket(server: http.Server): void {
                 return;
             }
 
+            if (parsed.opcode === 0x9) {
+                socket.write(encodeFrame(0xa, parsed.payload));
+                return;
+            }
             if (parsed.opcode === 0xa) {
                 // Pong
                 client.alive = true;
@@ -171,8 +213,15 @@ export function attachWebSocket(server: http.Server): void {
                         channel?: string;
                     };
                     if (msg.type === 'subscribe') {
-                        if (msg.sessionId) client.subscriptions.add(msg.sessionId);
-                        if (msg.channel) client.channels.add(msg.channel);
+                        const channel = msg.channel ?? msg.sessionId;
+                        if (typeof channel !== 'string' || !channel || channel === '*' || client.expiresAt <= Date.now() ||
+                            !(await client.authorize(client.user, channel)) || client.channels.size + client.subscriptions.size >= 64) {
+                            removeClient(client);
+                            return;
+                        }
+                        if (msg.sessionId) client.subscriptions.add(channel);
+                        if (msg.channel) client.channels.add(channel);
+                        writeToClient(client, JSON.stringify({ type: 'stream.subscribed', tenantId: client.user.tenantId, sessionId: channel, data: {} }));
                     } else if (msg.type === 'unsubscribe') {
                         if (msg.sessionId) client.subscriptions.delete(msg.sessionId);
                         if (msg.channel) client.channels.delete(msg.channel);
@@ -181,7 +230,25 @@ export function attachWebSocket(server: http.Server): void {
                     // Ignore malformed messages
                 }
             }
+        };
+        let receiving = false;
+        socket.on('data', (buf: Buffer) => {
+            if (incoming.length + buf.length > 65536) { removeClient(client); return; }
+            incoming = Buffer.concat([incoming, buf]);
+            if (receiving) return;
+            receiving = true;
+            void (async () => {
+                try {
+                    while (incoming.length >= 2 && !socket.destroyed) {
+                        const before = incoming;
+                        await receive();
+                        if (incoming === before) break;
+                    }
+                } finally { receiving = false; }
+            })().catch(() => removeClient(client));
         });
+        if (head.length) socket.emit('data', head);
+        socket.on('end', () => removeClient(client));
 
         socket.on('close', () => removeClient(client));
         socket.on('error', () => removeClient(client));
@@ -239,27 +306,47 @@ export function attachWebSocket(server: http.Server): void {
 // Writing & Backpressure Handling
 // ---------------------------------------------------------------------------
 
+function scheduleDelivery(client: WSClient, work: () => Promise<void>): void {
+    if (!clients.has(client)) return;
+    if (client.queuedChecks >= RING_BUFFER_SIZE) { removeClient(client); return; }
+    client.queuedChecks++;
+    client.delivery = client.delivery.then(work).catch(() => { removeClient(client); }).finally(() => { client.queuedChecks--; });
+}
+
+function writeToClient(client: WSClient, payload: string): void {
+    try {
+        const event = JSON.parse(payload) as BroadcastEvent;
+        if (event.tenantId !== client.user.tenantId || !(client.subscriptions.has(event.sessionId) || client.channels.has(event.sessionId))) return;
+    } catch { return; }
+    scheduleDelivery(client, () => deliverToClient(client, payload));
+}
+
 /** Try to flush pending messages from the per-client ring buffer. */
 function flushPending(client: WSClient): void {
-    while (client.pendingBuffer.length > 0) {
-        const msg = client.pendingBuffer.shift()!;
-        const canWrite = client.socket.writable && !(client.socket as any).writableNeedDrain;
-        if (!canWrite) {
-            // Put it back; we'll flush again on next drain
-            client.pendingBuffer.unshift(msg);
-            return;
+    if (!client.pendingBuffer.length) return;
+    scheduleDelivery(client, async () => {
+        while (client.pendingBuffer.length > 0) {
+            const msg = client.pendingBuffer.shift()!;
+            if (!(await canDeliver(client, msg))) continue;
+            const canWrite = client.socket.writable && !(client.socket as any).writableNeedDrain;
+            if (!canWrite) {
+                // Put it back; we'll flush again on next drain
+                client.pendingBuffer.unshift(msg);
+                return;
+            }
+            try {
+                client.socket.write(encodeFrame(0x1, msg));
+            } catch {
+                removeClient(client);
+                return;
+            }
         }
-        try {
-            client.socket.write(encodeFrame(0x1, msg));
-        } catch {
-            removeClient(client);
-            return;
-        }
-    }
+    });
 }
 
 /** Write a message to a client with backpressure handling. */
-function writeToClient(client: WSClient, payload: string): void {
+async function deliverToClient(client: WSClient, payload: string): Promise<void> {
+    if (!(await canDeliver(client, payload))) return;
     // If the socket needs draining, enqueue to the ring buffer instead
     const needDrain = (client.socket as any).writableNeedDrain === true;
     if (needDrain) {
@@ -298,8 +385,11 @@ export function broadcastEvent(
     sessionId: string,
     type: string,
     data: Record<string, unknown> = {},
+    tenantId = process.env.EAOS_TENANT_ID || 'default',
 ): void {
     const event: BroadcastEvent = {
+        instanceId: INSTANCE_ID,
+        tenantId,
         type,
         sessionId,
         timestamp: new Date().toISOString(),
@@ -365,10 +455,34 @@ export function getWSMetrics(): {
 // Helpers — Minimal RFC 6455 frame encode/decode
 // ---------------------------------------------------------------------------
 
+async function canDeliver(client: WSClient, payload: string): Promise<boolean> {
+    if (!clients.has(client)) return false;
+    if (client.expiresAt <= Date.now()) { removeClient(client); return false; }
+    try {
+        const event = JSON.parse(payload) as BroadcastEvent;
+        const allowed = event.tenantId === client.user.tenantId && typeof event.sessionId === 'string' && event.sessionId !== '*' &&
+            (client.subscriptions.has(event.sessionId) || client.channels.has(event.sessionId)) &&
+            await client.authorize(client.user, event.sessionId);
+        return allowed && clients.has(client) && client.expiresAt > Date.now();
+    } catch { return false; }
+}
+
+export function closeWebSockets(): void {
+    for (const client of clients) removeClient(client);
+}
+
+export function disconnectStreamUser(user: Pick<AuthUser, 'id' | 'tenantId'>): void {
+    revokeStreamTickets(user);
+    for (const client of clients) {
+        if (client.user.id === user.id && client.user.tenantId === user.tenantId) removeClient(client);
+    }
+}
+
 function removeClient(client: WSClient): void {
     clients.delete(client);
+    client.pendingBuffer.length = 0;
     try {
-        client.socket.end();
+        client.socket.destroy();
     } catch {
         /* already closed */
     }
@@ -400,7 +514,7 @@ function encodeFrame(opcode: number, payload: string): Buffer {
 
 function decodeFrame(
     buf: Buffer,
-): { opcode: number; payload: string } | null {
+): { opcode: number; payload: string; bytesRead: number } | null {
     if (buf.length < 2) return null;
 
     const opcode = buf[0]! & 0x0f;
@@ -418,6 +532,8 @@ function decodeFrame(
         offset = 10;
     }
 
+    if (!masked || !(buf[0]! & 0x80) || (buf[0]! & 0x70) || ![1, 8, 9, 10].includes(opcode) ||
+        !Number.isSafeInteger(payloadLen) || payloadLen > 65522 || (opcode >= 8 && payloadLen > 125)) throw new Error('Invalid WebSocket frame');
     let maskKey: Buffer | null = null;
     if (masked) {
         if (buf.length < offset + 4) return null;
@@ -435,5 +551,5 @@ function decodeFrame(
         }
     }
 
-    return { opcode, payload: data.toString('utf-8') };
+    return { opcode, payload: data.toString('utf-8'), bytesRead: offset + payloadLen };
 }

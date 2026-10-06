@@ -17,6 +17,8 @@
 export type LLMProviderId = 'anthropic' | 'openai' | 'azure-openai' | 'gemini' | 'ollama';
 
 export interface LLMRequest {
+  signal?: AbortSignal;
+  usage?: { reserve: (request: LLMRequest) => Promise<string>; settle: (id: string, response: LLMResponse) => Promise<void> };
   provider?: LLMProviderId;
   model?: string;
   systemPrompt: string;
@@ -149,6 +151,7 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -196,6 +199,7 @@ async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
@@ -246,6 +250,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(url, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
     headers: {
       'Content-Type': 'application/json',
       'api-key': apiKey,
@@ -294,6 +299,7 @@ async function callGemini(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(url, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: req.systemPrompt }] },
@@ -336,6 +342,7 @@ async function callOllama(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(`${baseUrl}/api/chat`, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model,
@@ -471,7 +478,17 @@ const PROVIDER_DISPATCH: Record<LLMProviderId, (req: LLMRequest) => Promise<LLMR
  * @throws {LLMNotConfiguredError} no provider has credentials — not retryable
  * @throws {LLMUnavailableError}   every configured provider failed — retryable
  */
+export function estimateRequestMicros(request: LLMRequest): number {
+  const config = getAvailableProviders().find(provider => provider.id === request.provider);
+  const model = request.model ?? config?.defaultModel;
+  const price = model ? COST_TABLE[model] : undefined;
+  if (!price) throw new Error('A known model price is required for usage reservation');
+  const inputBound = Buffer.byteLength(request.systemPrompt + request.userPrompt, 'utf8') + 256;
+  return Math.ceil(inputBound * price.input + (request.maxTokens ?? 4096) * price.output);
+}
+
 export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
+  req.signal?.throwIfAborted();
   const providers = getAvailableProviders();
   const availableIds = providers.filter(p => p.available).map(p => p.id);
 
@@ -494,11 +511,14 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
     const handler = PROVIDER_DISPATCH[providerId];
     if (!handler) continue;
 
+    // For fallback providers, clear the model so they use their default
+    const callReq = providerId === requestedId ? { ...req, provider: providerId } : { ...req, provider: providerId, model: undefined };
+    const reservation = await req.usage?.reserve(callReq);
+    let response: LLMResponse;
     try {
-      // For fallback providers, clear the model so they use their default
-      const callReq = providerId === requestedId ? req : { ...req, provider: providerId, model: undefined };
-      return await handler(callReq);
+      response = await handler(callReq);
     } catch (err) {
+      req.signal?.throwIfAborted();
       const status = err instanceof ProviderCallError ? err.status : undefined;
       const message = (err as Error).message;
       attempts.push({ id: providerId, status, message });
@@ -506,7 +526,10 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
       console.warn(
         `[llm-provider] ${providerId} failed: ${message}${isLast ? '' : ' — trying next provider'}`,
       );
+      continue;
     }
+    if (reservation !== undefined) await req.usage!.settle(reservation, response);
+    return response;
   }
 
   // Every configured provider failed. Throwing here is what allows

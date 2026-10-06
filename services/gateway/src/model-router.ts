@@ -20,6 +20,7 @@ import { callLLM, LLMNotConfiguredError, type LLMRequest, type LLMResponse, type
 export type TaskComplexity = 'simple' | 'moderate' | 'complex' | 'critical';
 
 export interface ModelRouterConfig {
+  signal?: AbortSignal;
   /** Maximum cost per execution in USD */
   maxCostPerExec: number;
   /** Maximum cost per hour in USD */
@@ -205,6 +206,7 @@ export async function routedLLMCall(
   }
 
   const callArgs: LLMRequest = {
+    signal: config.signal,
     provider: routing.provider,
     model: routing.model,
     systemPrompt,

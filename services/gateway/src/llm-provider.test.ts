@@ -38,6 +38,28 @@ const PROVIDER_ENV_KEYS = [
   'OLLAMA_MODEL',
 ] as const;
 
+describe('durable usage boundary', () => {
+  it('does not call a provider when budget reservation fails', async () => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    const fetch = stubFetchAnthropicOk();
+    const reserve = vi.fn(async () => { throw new Error('Fixture budget denied'); });
+    const settle = vi.fn(async () => {});
+    await expect(callLLM({ ...REQ, usage: { reserve, settle } })).rejects.toThrow('Fixture budget denied');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(settle).not.toHaveBeenCalled();
+  });
+  it('does not repeat a successful vendor call after settlement fails', async () => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    process.env.OPENAI_API_KEY = 'fixture';
+    const fetch = stubFetchAnthropicOk();
+    const reserve = vi.fn(async () => 'reservation');
+    const settle = vi.fn(async () => { throw new Error('Fixture ledger outage'); });
+    await expect(callLLM({ ...REQ, provider: 'anthropic', usage: { reserve, settle } })).rejects.toThrow('Fixture ledger outage');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(settle).toHaveBeenCalledTimes(1);
+  });
+});
+
 const originalEnv: Record<string, string | undefined> = {};
 
 const REQ = {

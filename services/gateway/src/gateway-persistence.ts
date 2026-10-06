@@ -121,18 +121,20 @@ export function registerStore(name: string, save: () => Record<string, unknown>[
  * Initialize persistence — call from server.ts after all stores are created.
  * Restores saved state and starts periodic save timer.
  */
-export function initGatewayPersistence(store: Store): void {
-  backingStore = store;
+export async function initGatewayPersistence(store: Store, readOnly = false): Promise<void> {
+  if (saveTimer) { clearInterval(saveTimer); saveTimer = null; }
+  backingStore = readOnly ? null : store;
 
   const asyncStore = asAsyncStore(store);
   if (asyncStore) {
     // Async backing store (Postgres): restore through awaited reads, then start
     // the periodic save. The function itself stays synchronous for callers.
-    void restoreAllAsync(asyncStore);
+    await restoreAllAsync(asyncStore);
   } else {
     restoreAllSync(store);
   }
 
+  if (readOnly) return;
   // Start periodic save
   saveTimer = setInterval(() => {
     saveAll();
@@ -182,15 +184,16 @@ async function restoreAllAsync(store: AsyncStore): Promise<void> {
  * Routes through the awaited async path when the backing store is async,
  * keeping the synchronous file-backed path exactly as before.
  */
-export function saveAll(): void {
-  if (!backingStore) return;
+let saveInFlight: Promise<void> = Promise.resolve();
 
-  const asyncStore = asAsyncStore(backingStore);
-  if (asyncStore) {
-    void saveAllAsync(asyncStore);
-  } else {
-    saveAllSync(backingStore);
-  }
+export function saveAll(): Promise<void> {
+  saveInFlight = saveInFlight.catch(() => {}).then(async () => {
+    if (!backingStore) return;
+    const asyncStore = asAsyncStore(backingStore);
+    if (asyncStore) await saveAllAsync(asyncStore);
+    else saveAllSync(backingStore);
+  });
+  return saveInFlight;
 }
 
 function saveAllSync(store: Store): void {
@@ -238,10 +241,10 @@ async function saveAllAsync(store: AsyncStore): Promise<void> {
 /**
  * Flush all stores and stop the periodic save timer.
  */
-export function flushGatewayPersistence(): void {
+export async function flushGatewayPersistence(): Promise<void> {
   if (saveTimer) {
     clearInterval(saveTimer);
     saveTimer = null;
   }
-  saveAll();
+  await saveAll();
 }

@@ -2,13 +2,17 @@
     "name": "@agentos/gateway",
     "version": "0.1.0",
     "private": true,
-    "description": "EOS Gateway \u2014 API server",
+    "description": "EOS Gateway — API server",
     "license": "MIT",
     "type": "module",
     "main": "src/server.ts",
     "exports": {
         ".": "./src/server.ts",
-        "./persona-system": "./src/persona-system.ts"
+        "./persona-system": "./src/persona-system.ts",
+        "./execution-api-contract": {
+            "types": "./dist/execution-api-contract.d.ts",
+            "import": "./dist/execution-api-contract.js"
+        }
     },
     "scripts": {
         "dev": "npx tsx src/server.ts",
@@ -18,18 +22,21 @@
     },
     "dependencies": {
         "@agentos/auth": "workspace:*",
+        "@agentos/config": "workspace:*",
         "@agentos/connector-github": "workspace:*",
         "@agentos/connector-jira": "workspace:*",
         "@agentos/connector-slack": "workspace:*",
         "@agentos/db": "workspace:*",
         "@agentos/observability": "workspace:*",
         "@agentos/sandbox": "workspace:*",
+        "@agentos/sdk": "workspace:*",
+        "@agentos/secrets": "workspace:*",
         "@agentos/skills": "workspace:*",
         "@agentos/workflow-engine": "workspace:*",
-        "@modelcontextprotocol/sdk": "^1.0.0",
+        "@modelcontextprotocol/sdk": "^1.30.0",
         "ioredis": "^5.10.1",
-        "zod": "^4.3.6",
-        "@agentos/config": "workspace:*"
+        "yaml": "2.9.0",
+        "zod": "^4.3.6"
     },
     "devDependencies": {
         "tsx": "^4.7.0",
