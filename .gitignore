@@ -50,3 +50,4 @@ logs/
 **/src/**/*.js
 !**/*.config.js
 !**/next.config.*
+.claude/worktrees/
