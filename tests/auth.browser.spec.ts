@@ -269,4 +269,24 @@ test.describe('public demo mode', () => {
     await expect(page.getByRole('button', { name: 'Try the demo' })).toBeVisible();
     expect((await page.request.get(`${base}/_/gateway/api/auth/me`)).status()).toBe(401);
   });
+
+  test('sidebar entries that share the platform console each open their own tab', async ({ page }) => {
+    await page.goto(base);
+    await page.getByRole('button', { name: 'Go to Dashboard', exact: true }).first().click();
+    await page.getByRole('button', { name: 'Try the demo' }).click();
+    await expect(page.getByRole('button', { name: 'Sign out' })).toBeVisible();
+    // Arriving on a console section opens its sidebar group; every later move is a
+    // sidebar click, which is the path that used to keep the previous tab.
+    await page.goto(`${base}/admin-governance`);
+    await expect(page.getByRole('button', { name: 'Stage immutable candidate' })).toBeVisible();
+    await page.locator('[data-tour="sidebar-admin-evals"]').click();
+    await expect(page.getByRole('button', { name: 'Create labeled dataset' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Stage immutable candidate' })).toHaveCount(0);
+    await page.locator('[data-tour="sidebar-admin-usage"]').click();
+    await expect(page.getByRole('heading', { name: 'Recovery queue' })).toBeVisible();
+    await page.getByRole('button', { name: 'Operations', exact: true }).click();
+    await page.locator('[data-tour="sidebar-ops-notifications"]').click();
+    await expect(page.getByRole('button', { name: 'Queue authorized notification' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Recovery queue' })).toHaveCount(0);
+  });
 });

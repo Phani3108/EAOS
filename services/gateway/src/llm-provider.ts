@@ -16,6 +16,14 @@
 
 export type LLMProviderId = 'anthropic' | 'openai' | 'azure-openai' | 'gemini' | 'ollama';
 
+/**
+ * Ceiling on a single provider attempt. Exported because callers that answer
+ * synchronously (review, chat) and the web tier's gateway proxy derive their
+ * own deadlines from it: a proxy that gives up first turns a slow but healthy
+ * call into an opaque 500 while the gateway keeps paying for it.
+ */
+export const PROVIDER_CALL_TIMEOUT_MS = 60_000;
+
 export interface LLMRequest {
   signal?: AbortSignal;
   /**
@@ -175,7 +183,7 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
-    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -223,7 +231,7 @@ async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
@@ -274,7 +282,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(url, {
     method: 'POST',
-    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'api-key': apiKey,
@@ -323,7 +331,7 @@ async function callGemini(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(url, {
     method: 'POST',
-    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: req.systemPrompt }] },
@@ -366,7 +374,7 @@ async function callOllama(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(`${baseUrl}/api/chat`, {
     method: 'POST',
-    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000),
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model,
