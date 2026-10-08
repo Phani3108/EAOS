@@ -182,6 +182,15 @@ export async function verifyIntegrationEvidence(pool: RuntimePool, runs: Postgre
     assert.equal(deliveries.find(row => row.executionId === notificationId)?.status, 'delivered');
     const repeated = await platformRequest(platform, runs, principal, new URL('http://localhost/api/operations/notifications'), 'POST', async () => notificationInput, () => {});
     assert.equal((repeated.data as { execution: { id: string } }).execution.id, notificationId);
+    // Durable reads go through the repository, so nothing a replica submitted or
+    // ran stays in its process: paused, resumed and completed runs all left it.
+    const submitted = await runtime.createPersonaExecution(tenantId, 'engineering', compileDefinition({ id: 'm4-uncached', slug: 'm4-uncached', name: 'Fixture uncached', description: '', icon: '', persona: 'engineering', executableType: 'skill', cluster: 'Fixture', complexity: 'simple', estimatedTime: '', inputs: [], outputs: ['result'], requiredTools: [], optionalTools: [], tags: [], steps: [{ id: 'draft', order: 1, name: 'Draft', agent: 'code-reviewer', tool: 'llm', outputKey: 'result' }] }), {}, owner.userId, true);
+    assert.deepEqual(runtime.getAllExecutions(tenantId), []);
+    const uncached = (await runs.claim(tenantId, 'm4-uncached'))!;
+    assert.equal(uncached.snapshot.id, submitted.id);
+    await runtime.runDurableExecution(uncached, new AbortController().signal);
+    assert.equal((await runs.get(tenantId, submitted.id))?.status, 'simulated');
+    assert.deepEqual(runtime.getAllExecutions(tenantId), []);
   } finally { runtime.configureIntegrationRuntime(undefined, undefined); runtime.configureRuntimeRepository(undefined); }
   console.log('PASS scoped secret binding, connection verification, GitHub/Jira/Slack readback, no duplicate writes, rotation invalidation, artifact ACLs and canonical approved action dispatch');
 }

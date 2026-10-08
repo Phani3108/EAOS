@@ -1030,6 +1030,17 @@ export function getAgentIdentity(idOrCallSign: string): AgentIdentity | undefine
   return identityMap.get(idOrCallSign) ?? callSignMap.get(idOrCallSign.toLowerCase());
 }
 
+/**
+ * The agent a workflow persona's own runs default to: its director (the first
+ * agent listed for it). TA runs under HR's agents and program under the PMO
+ * director, matching CATALOG_AGENT_ALIASES.
+ */
+export function primaryWorkflowAgent(persona: 'engineering' | 'product' | 'marketing' | 'hr' | 'ta' | 'program'): string {
+  const agent = persona === 'program' ? getAgentIdentity('pmo-director') : getAgentsByPersona(persona === 'ta' ? 'hr' : persona)[0];
+  if (!agent) throw new Error('No canonical agent for persona');
+  return agent.id;
+}
+
 /** Get all agents for a persona */
 export function getAgentsByPersona(persona: AgentPersona): AgentIdentity[] {
   return AGENT_IDENTITIES.filter(a => a.persona === persona);

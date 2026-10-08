@@ -229,6 +229,14 @@ const RETRAIN_TABLE = 'retraining_flags';
 export interface AfterActionReport {
   id: string;
   executionId: string;
+  /**
+   * The run's owner, copied from it so reads are scoped like the run itself.
+   * Optional only because reports persisted before owners were recorded carry
+   * none; those resolve through their execution or are not readable at all.
+   */
+  tenantId?: string;
+  userId?: string;
+  requiredPersonas?: string[];
   persona: string;
   skillName: string;
   generatedAt: string;
@@ -351,7 +359,9 @@ async function persistExec(exec: PersonaExecutionRecord): Promise<void> {
       }
     });
   }
-  executions.set(executionKey(exec.tenantId, exec.id), exec);
+  // Durable runs live in the repository; the map entry is runDurableExecution's
+  // to add and remove, so a late checkpoint cannot resurrect it.
+  if (!runtimeRepository) executions.set(executionKey(exec.tenantId, exec.id), exec);
   if (backingStore) {
     const existing = backingStore.get(EXEC_TABLE, exec.id);
     if (existing) {
@@ -2014,6 +2024,9 @@ function generateAfterActionReport(exec: PersonaExecutionRecord, routedAgents: S
   const aar: AfterActionReport = {
     id: `aar-${exec.id}`,
     executionId: exec.id,
+    tenantId: exec.tenantId,
+    userId: exec.userId,
+    ...(exec.requiredPersonas ? { requiredPersonas: exec.requiredPersonas } : {}),
     persona: exec.persona,
     skillName: exec.skillName,
     generatedAt: new Date().toISOString(),
@@ -2230,8 +2243,11 @@ export function preparePersonaExecution(tenantId: string, persona: WorkflowPerso
   // From the run's owner: demo principals are simulated whatever was asked, and
   // with no choice, no configured provider means simulation (run-mode.ts).
   simulate = resolveSimulate(userId, simulate);
-  const definition = compileDefinition(skill);
-  if (definition.persona !== persona) throw new Error('Execution persona does not match its definition');
+  // A definition that does not compile, or claims another persona, is the
+  // request's fault: refuse it as unprocessable rather than an internal error.
+  let definition: CompiledDefinition;
+  try { definition = compileDefinition(skill); } catch (error) { throw new ExecutionOutcomeError('unsupported', error instanceof Error ? error.message : 'Definition does not compile'); }
+  if (definition.persona !== persona) throw new ExecutionOutcomeError('unsupported', 'Execution persona does not match its definition');
   inputs = validateSkillInputs(definition.inputs, inputs);
   // A live run reserves budget at its model's price before every provider call,
   // so an unpriced model is refused now, with the models to choose from, rather
@@ -2281,9 +2297,9 @@ export async function createPersonaExecution(
 
   if (runtimeRepository) {
     const accepted = await runtimeRepository.submit(exec as unknown as RuntimeSnapshot, definition as unknown as Record<string, unknown>, { ...payload, ...(source?.timeoutMs ? { timeoutMs: source.timeoutMs } : {}), ...(source?.globalTimeoutMs ? { runTimeoutMs: source.globalTimeoutMs } : {}), ...(source?.priority ? { priority: ({ low: 10, normal: 50, high: 80, critical: 100 } as Record<string, number>)[String(source.priority)] ?? 50 } : {}) }, requestKey);
-    const record = accepted as unknown as PersonaExecutionRecord;
-    executions.set(executionKey(record.tenantId, record.id), record);
-    return record;
+    // Not cached: durable reads go through the run repository, and whichever
+    // replica claims the run loads it from there.
+    return accepted as unknown as PersonaExecutionRecord;
   }
 
   // ── UTCP: Create task packet for this execution ──
@@ -2374,8 +2390,16 @@ export async function runDurableExecution(claim: NonNullable<Awaited<ReturnType<
   }
   for (const step of run.steps) if (step.status === 'running') step.status = 'pending';
   run.status = 'queued';
-  executions.set(executionKey(run.tenantId, run.id), run);
-  await runtimeContext.run({ lease: claim.lease, signal, userId: claim.snapshot.userId, usageCounts: new Map(), coordinator: { writes: Promise.resolve(), children: new Map() } }, () => runSkillExecution(claim.payload));
+  // The map holds the working copy only while this replica holds the lease;
+  // every checkpoint is already in the repository, so keeping it afterwards
+  // would grow the heap with every run the replica ever executed.
+  const key = executionKey(run.tenantId, run.id);
+  executions.set(key, run);
+  try {
+    await runtimeContext.run({ lease: claim.lease, signal, userId: claim.snapshot.userId, usageCounts: new Map(), coordinator: { writes: Promise.resolve(), children: new Map() } }, () => runSkillExecution(claim.payload));
+  } finally {
+    if (executions.get(key) === run) executions.delete(key);
+  }
 }
 
 export async function runSkillExecution(payload: unknown): Promise<void> {
@@ -2416,46 +2440,48 @@ export function getAllExecutions(tenantId = legacyTenantId()): PersonaExecutionR
   return Array.from(executions.values()).filter(execution => execution.tenantId === tenantId);
 }
 
-/** Computed stats from actual execution data */
-export function getExecutionStats(): {
+export interface ExecutionStats {
   totalExecutions: number;
   byPersona: Record<string, { count: number; totalCost: number; avgQuality: number }>;
   totalCost: number;
   avgQuality: number;
   activeAgents: string[];
-} {
-  const execs = Array.from(executions.values()).filter(execution => execution.mode === 'live' && execution.tenantId === legacyTenantId());
-  const byPersona: Record<string, { count: number; totalCost: number; qualitySum: number; qualityCount: number }> = {};
+}
 
-  let totalCost = 0;
-  let qualitySum = 0;
-  let qualityCount = 0;
+function foldExecutionStats(byPersona: Array<{ persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>, activeAgents: string[]): ExecutionStats {
+  const result: ExecutionStats['byPersona'] = {};
+  let totalExecutions = 0, totalCost = 0, qualitySum = 0, qualityCount = 0;
+  for (const v of byPersona) {
+    result[v.persona] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
+    totalExecutions += v.count; totalCost += v.totalCost; qualitySum += v.qualitySum; qualityCount += v.qualityCount;
+  }
+  return { totalExecutions, byPersona: result, totalCost, avgQuality: qualityCount ? qualitySum / qualityCount : 0, activeAgents };
+}
+
+/**
+ * Computed stats from actual execution data. Durable runs are aggregated in
+ * the repository: runDurableExecution evicts each working copy when its lease
+ * ends, so counting the map would report only in-flight runs (near zero).
+ */
+export async function getExecutionStats(tenantId = legacyTenantId()): Promise<ExecutionStats> {
+  if (runtimeRepository) {
+    const stats = await runtimeRepository.stats(tenantId);
+    return foldExecutionStats(stats.byPersona, stats.activeAgents);
+  }
+  const byPersona = new Map<string, { persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>();
   const activeAgentSet = new Set<string>();
-
-  for (const exec of execs) {
-    const pc = byPersona[exec.persona] ?? { count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
+  for (const exec of executions.values()) {
+    if (exec.mode !== 'live' || exec.tenantId !== tenantId) continue;
+    const pc = byPersona.get(exec.persona) ?? { persona: exec.persona, count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
     pc.count++;
-    if (exec.totalTokenCost) { pc.totalCost += exec.totalTokenCost; totalCost += exec.totalTokenCost; }
-    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; qualitySum += exec.avgQualityScore; qualityCount++; }
-    byPersona[exec.persona] = pc;
-
+    if (exec.totalTokenCost) pc.totalCost += exec.totalTokenCost;
+    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; }
+    byPersona.set(exec.persona, pc);
     for (const step of exec.steps) {
       if (step.status === 'running') activeAgentSet.add(step.agent);
     }
   }
-
-  const result: Record<string, { count: number; totalCost: number; avgQuality: number }> = {};
-  for (const [p, v] of Object.entries(byPersona)) {
-    result[p] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
-  }
-
-  return {
-    totalExecutions: execs.length,
-    byPersona: result,
-    totalCost,
-    avgQuality: qualityCount ? qualitySum / qualityCount : 0,
-    activeAgents: Array.from(activeAgentSet),
-  };
+  return foldExecutionStats([...byPersona.values()], Array.from(activeAgentSet));
 }
 
 export function approvePersonaStep(execId: string, stepId: string, approverId: string): { success: boolean; message: string } {
@@ -2472,15 +2498,28 @@ export function approvePersonaStep(execId: string, stepId: string, approverId: s
 // ---------------------------------------------------------------------------
 
 /** Get AAR for a specific execution */
-export function getAfterActionReport(executionId: string): AfterActionReport | undefined {
-  return afterActionReports.get(`aar-${executionId}`);
+/** The principal-facing ownership of a report, in the shape run read checks take. */
+export type AfterActionReportOwner = Pick<AfterActionReport, 'tenantId' | 'userId' | 'persona' | 'requiredPersonas'>;
+
+function reportOwner(aar: AfterActionReport): AfterActionReportOwner {
+  if (aar.tenantId && aar.userId) return aar;
+  const run = Array.from(executions.values()).find(execution => execution.id === aar.executionId);
+  return run ? { tenantId: run.tenantId, userId: run.userId, persona: aar.persona, requiredPersonas: run.requiredPersonas } : { persona: aar.persona };
 }
 
-/** List all AARs, optionally filtered by persona */
-export function listAfterActionReports(persona?: string, limit = 20): AfterActionReport[] {
-  let all = Array.from(afterActionReports.values());
-  if (persona) all = all.filter(a => a.persona === persona);
-  return all
+/**
+ * Reports carry step errors, costs and skill names, so every read is scoped by
+ * the caller's run read check: a report is visible exactly when its run is.
+ */
+export function getAfterActionReport(executionId: string, canRead: (owner: AfterActionReportOwner) => boolean): AfterActionReport | undefined {
+  const aar = afterActionReports.get(`aar-${executionId}`);
+  return aar && canRead(reportOwner(aar)) ? aar : undefined;
+}
+
+/** List the AARs the caller may read, optionally filtered by persona */
+export function listAfterActionReports(canRead: (owner: AfterActionReportOwner) => boolean, persona?: string, limit = 20): AfterActionReport[] {
+  return Array.from(afterActionReports.values())
+    .filter(a => (!persona || a.persona === persona) && canRead(reportOwner(a)))
     .sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime())
     .slice(0, limit);
 }

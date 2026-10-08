@@ -95,6 +95,7 @@ import { postMessage as postChatMessage, configureChatExecutionAdapter } from '.
 import { submitChatExecution } from './orchestration-adapters.js';
 import { isEntrypointRoute, entrypointRequest } from './entrypoint-api.js';
 import { getFsSkills, reloadFsSkills, getAllFsSkills, warmAllFsSkills } from './skill-fs-loader.js';
+import { adoptedSkillPersona, synthesizeAdoptedSkill } from './adopted-skills.js';
 import { runReviewPipeline, getReviewChain } from './review-pipeline.js';
 import { ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT_PLACEHOLDERS } from './prompts/orchestrator-prompt.js';
 import type { AfterActionReport, RetrainingFlag } from './persona-api.js';
@@ -146,7 +147,7 @@ import { getAgentMemory, getAllAgentMemorySnapshots, recordAgentMemory, getAgent
 // import { executeWorkflow, getWorkflowExecution, resumeWorkflow } from './workflow-bridge.js';
 import { initOTel, shutdownOTel } from '@agentos/observability';
 import { validate, ValidationError, ExecuteSchema, GoalSchema, A2AMessageSchema, UTCPPacketSchema } from './validation.js';
-import { attachWebSocket, broadcastEvent, getWSClientCount, getWSMetrics, disconnectStreamUser, closeWebSockets } from './ws.js';
+import { attachWebSocket, broadcastEvent, getWSClientCount, getWSMetrics, disconnectStreamUser, closeWebSockets, streamChannelKey } from './ws.js';
 import { issueStreamTicket, canReadStreamResource, isAllowedBrowserOrigin } from './stream-access.js';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -405,7 +406,7 @@ eventBus.on('execution.completed', async (event) => {
 
 // Bridge agent status changes to WebSocket clients on the "agents" channel
 subscribeToAgentStatus((record) => {
-  try { broadcastEvent('agents', 'agent.status.changed', record as unknown as Record<string, unknown>); } catch {}
+  try { broadcastEvent('agents', 'agent.status.changed', record as unknown as Record<string, unknown>, deploymentTenantId); } catch {}
 });
 
 // Register task handlers and start workers (Phase 3 — Task Queue with atomic claim)
@@ -451,32 +452,6 @@ setMcpResolver(async (action) => {
 void mcpManager.init(loadMcpServerConfigs())
   .then((n) => { if (n > 0) console.log(`[mcp] connected ${n} MCP server(s)`); })
   .catch((err) => console.warn('[mcp] init failed:', err));
-
-/**
- * Adapt an adopted community skill (FSSkillDef) into an executable single-step
- * UnifiedSkillDef. The skill's markdown body is passed separately as the step's
- * instructions (via customPrompt) so the LLM receives the actual skill content.
- */
-function synthesizeAdoptedSkill(fs: ReturnType<typeof getAllFsSkills>[number]): any {
-  return {
-    id: fs.id,
-    slug: fs.slug,
-    name: fs.name,
-    description: fs.description || fs.name,
-    icon: '🧩',
-    persona: fs.persona,
-    executableType: 'skill',
-    cluster: fs.cluster ?? 'Adopted Skills',
-    complexity: fs.complexity ?? 'moderate',
-    estimatedTime: fs.estimatedTime ?? '~varies',
-    inputs: [{ id: 'request', label: 'Request / Context', type: 'textarea', required: false, section: 'basic', helpText: 'Optional context or target for this skill.' }],
-    steps: [{ id: `${fs.id}-s1`, order: 1, name: fs.name, agent: '', tool: 'Claude', outputKey: 'result', capability: 'content.generate' }],
-    outputs: ['result'],
-    requiredTools: ['Claude'],
-    optionalTools: fs.requiredTools ?? [],
-    tags: fs.tags ?? [],
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Gateway-wide persistence — wire all ephemeral stores to backing store
@@ -1250,12 +1225,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
-        // POST /api/skills/fs/execute — run an adopted community skill (works for ANY
-        // persona, incl. design/program/ta that the unified /api/execute doesn't branch on).
+        // POST /api/skills/fs/execute — run an adopted community skill under its folder's
+        // workflow persona (design/learning/leadership folders have no workflow runtime).
         if (path === '/api/skills/fs/execute' && method === 'POST') {
             const body = await readBody(req);
             const skillId = String((body.skillId as string) ?? '');
-            const reqPersona = body.persona ? String(body.persona) : undefined;
             const inputs = (body.inputs as Record<string, unknown>) ?? {};
             const simulate = typeof body.simulate === 'boolean' ? body.simulate : undefined;
             const provider = body.provider as string | undefined;
@@ -1264,16 +1238,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
             if (!fsSkill) { sendJSON(res, 404, { error: `Adopted skill not found: ${skillId}` }); return; }
 
-            const persona = fsSkill.persona || reqPersona || 'engineering';
-            if (authUser && !requirePersonaAccess(authUser, persona)) {
-                sendJSON(res, 403, { error: `Access denied for persona: ${persona}` }); return;
+            // The skill's folder decides its persona; a request cannot run it as another.
+            const persona = adoptedSkillPersona(fsSkill);
+            if (authUser && !requirePersonaAccess(authUser, persona ?? fsSkill.persona)) {
+                sendJSON(res, 403, { error: `Access denied for persona: ${persona ?? fsSkill.persona}` }); return;
             }
-
             const skill = synthesizeAdoptedSkill(fsSkill);
+            if (!persona || !skill) { sendJSON(res, 422, { error: `Adopted skills for persona ${fsSkill.persona} have no workflow runtime` }); return; }
+
             const shouldSimulate = resolveSimulate(simulate);
-            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${fsSkill.name} (adopted)`);
-            broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate: shouldSimulate, adopted: true });
+            broadcastEvent(exec.id, 'session.started', { tenantId: exec.tenantId, persona, skillId, simulate: exec.mode === 'simulation', adopted: true }, exec.tenantId);
             sendJSON(res, 201, { execution: exec });
             return;
         }
@@ -1739,7 +1715,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             let adoptedBody: string | undefined;
             if (!skill) {
                 const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
-                if (fsSkill) { skill = synthesizeAdoptedSkill(fsSkill); adoptedBody = fsSkill.systemPrompt; }
+                if (fsSkill) {
+                    // Persona access was checked for the requested persona, so the
+                    // skill must belong to it; non-workflow folders cannot run here.
+                    if (adoptedSkillPersona(fsSkill) !== persona) { sendJSON(res, 422, { error: `Adopted skill ${fsSkill.id} does not run under persona ${persona}` }); return; }
+                    skill = synthesizeAdoptedSkill(fsSkill); adoptedBody = fsSkill.systemPrompt;
+                }
             }
 
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
@@ -1792,7 +1773,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 sendJSON(res, 404, { error: 'Execution not found' });
                 return;
             }
-            const aar = getAfterActionReport(execId);
+            const aar = getAfterActionReport(execId, canReadExecution);
             sendJSON(res, 200, { execution: exec, afterActionReport: aar ?? null });
             return;
         }
@@ -3262,7 +3243,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/observability/agents' && method === 'GET') {
             // Real agent data from KPI store + registry
             const kpis = getAgentKPIs();
-            const stats = getExecutionStats();
+            const stats = await getExecutionStats();
             const activeSet = new Set(stats.activeAgents);
             const agents = kpis.map(k => {
                 const identity = getAgentIdentity(k.agentId);
@@ -3287,7 +3268,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
 
         if (path === '/api/observability/metrics' && method === 'GET') {
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const kpis = getAgentKPIs();
             sendJSON(res, 200, {
                 gateway: { status: 'healthy', uptime: process.uptime(), memoryMb: Math.round(process.memoryUsage().heapUsed / 1_000_000 * 100) / 100, wsClients: getWSClientCount() },
@@ -3366,10 +3347,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // ACP Executions
         // -----------------------------------------------------------------------
         if (path === '/api/acp/executions' && method === 'GET') {
-            // Real execution data — show recent executions with agent flow
-            const allExecs = getAllExecutions()
-              .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
-              .slice(0, 10);
+            // Real execution data — show recent executions with agent flow, scoped
+            // like /api/executions: only runs the caller may read, and durable runs
+            // from the repository rather than this replica's working copies.
+            const allExecs = runRepository && authUser
+              ? (await runRepository.list(authUser.tenantId, enforceExecutionOwnership() ? userId : undefined, 10, 0, { personas: ['engineering', 'product', 'marketing', 'hr', 'ta', 'program', 'executive', 'design', 'learning'].filter(value => requirePersonaAccess(authUser, value)) })).executions as unknown as ReturnType<typeof getAllExecutions>
+              : getAllExecutions()
+                .filter(canReadExecution)
+                .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+                .slice(0, 10);
 
             const executions = allExecs.map(exec => {
               const agentSet = new Map<string, { id: string; name: string; persona: string; model: string }>();
@@ -3770,7 +3756,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/governance/costs' && method === 'GET') {
             if (guardRole('operator')) return;
             // Real cost attribution from actual execution data
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const now = new Date();
             const period = `${now.toLocaleString('en', { month: 'long' })} ${now.getFullYear()}`;
             const breakdown = Object.entries(execStats.byPersona).map(([persona, data]) => ({
@@ -5568,14 +5554,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/aar' && method === 'GET') {
             const persona = url.searchParams.get('persona') ?? undefined;
             const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
-            sendJSON(res, 200, { reports: listAfterActionReports(persona, limit) });
+            sendJSON(res, 200, { reports: listAfterActionReports(canReadExecution, persona, limit) });
             return;
         }
 
         // GET /api/aar/:executionId — get AAR for a specific execution
         if (path.match(/^\/api\/aar\/[^/]+$/) && method === 'GET') {
             const executionId = decodeURIComponent(path.split('/')[3]!);
-            const aar = getAfterActionReport(executionId);
+            // Not found and not readable answer alike, so ids of other users' runs do not leak.
+            const aar = getAfterActionReport(executionId, canReadExecution);
             if (!aar) { sendJSON(res, 404, { error: 'No After-Action Report for this execution' }); return; }
             sendJSON(res, 200, { report: aar });
             return;
@@ -5794,7 +5781,10 @@ attachWebSocket(server, {
         if (!current) return false;
         user = current;
         if (channel.startsWith('chat:')) return Boolean(await getChatSession(channel.slice(5), { userId: user.id, tenantId: user.tenantId }));
-        const id = channel.startsWith('execution:') ? channel.slice(10) : channel;
+        // Agent status spans every principal's runs (current run ids and skills), so
+        // it is operator telemetry, like /api/metrics; others are refused, not dropped.
+        if (channel === 'agents') return user.role === 'admin' || user.role === 'operator' ? true : 'denied';
+        const id = streamChannelKey(channel);
         const execution = runRepository ? await runRepository.get(user.tenantId, id) : getPersonaExecution(id, user.tenantId);
         return Boolean(execution && requirePersonaAccess(user, execution.persona) && (!Array.isArray(execution.requiredPersonas) || execution.requiredPersonas.every(persona => typeof persona === 'string' && requirePersonaAccess(user, persona))) && canReadStreamResource(user, execution));
     },

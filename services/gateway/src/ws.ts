@@ -9,7 +9,10 @@
  *                   { type: 'subscribe', channel: string }
  *                   { type: 'unsubscribe', sessionId: string }
  *                   { type: 'unsubscribe', channel: string }
- *   Server sends:   StreamEvent JSON
+ *   Server sends:   StreamEvent JSON; 'stream.subscribed' acknowledges a
+ *                   subscription under the key its events carry (the bare run
+ *                   id for 'execution:<id>'), 'stream.denied' refuses a role-gated
+ *                   channel such as 'agents'
  *
  * Backpressure:
  *   - Each client has a writableLength threshold (1 MB).
@@ -66,7 +69,7 @@ interface WSClient {
     socket: Duplex;
     user: AuthUser;
     expiresAt: number;
-    authorize: (user: AuthUser, channel: string) => boolean | Promise<boolean>;
+    authorize: (user: AuthUser, channel: string) => StreamVerdict | Promise<StreamVerdict>;
     /** Legacy session-ID subscriptions (kept for backwards compatibility) */
     subscriptions: Set<string>;
     /** New channel-based subscriptions (agents, chat:<id>, execution:<id>) */
@@ -105,9 +108,26 @@ let totalDisconnectedForSlow = 0;
 /**
  * Attach WebSocket handling to an existing HTTP server.
  */
+/**
+ * true grants a channel. false refuses it and drops the socket: a single-use
+ * ticket per probe keeps resource ids from being enumerated. 'denied' refuses a
+ * known channel the principal lacks the role for, and keeps the socket and its
+ * other subscriptions.
+ */
+export type StreamVerdict = boolean | 'denied';
+
 export interface StreamAuthOptions {
     authenticate: (req: http.IncomingMessage) => Promise<AuthUser | undefined>;
-    authorize: (user: AuthUser, channel: string) => boolean | Promise<boolean>;
+    authorize: (user: AuthUser, channel: string) => StreamVerdict | Promise<StreamVerdict>;
+}
+
+/**
+ * The key a subscription is delivered under. Execution events are broadcast
+ * with the bare run id as sessionId, so 'execution:<id>' is stored as '<id>';
+ * kept under its prefixed name it could never match an event.
+ */
+export function streamChannelKey(channel: string): string {
+    return channel.startsWith('execution:') ? channel.slice('execution:'.length) : channel;
 }
 
 export function attachWebSocket(server: http.Server, options: StreamAuthOptions = { authenticate: async () => undefined, authorize: () => false }): void {
@@ -211,17 +231,26 @@ export function attachWebSocket(server: http.Server, options: StreamAuthOptions 
                     };
                     if (msg.type === 'subscribe') {
                         const channel = msg.channel ?? msg.sessionId;
-                        if (typeof channel !== 'string' || !channel || channel === '*' || client.expiresAt <= Date.now() ||
-                            !(await client.authorize(client.user, channel)) || client.channels.size + client.subscriptions.size >= 64) {
+                        const verdict = typeof channel === 'string' && channel && channel !== '*' && client.expiresAt > Date.now()
+                            ? await client.authorize(client.user, channel) : false;
+                        if (verdict === 'denied' && typeof channel === 'string') {
+                            // A control reply for this client only, so it bypasses the
+                            // subscription filter that event delivery applies.
+                            const denied = JSON.stringify({ type: 'stream.denied', tenantId: client.user.tenantId, sessionId: channel, data: {} });
+                            scheduleDelivery(client, async () => { client.socket.write(encodeFrame(0x1, denied)); });
+                            return;
+                        }
+                        if (verdict !== true || typeof channel !== 'string' || client.channels.size + client.subscriptions.size >= 64) {
                             removeClient(client);
                             return;
                         }
-                        if (msg.sessionId) client.subscriptions.add(channel);
-                        if (msg.channel) client.channels.add(channel);
-                        writeToClient(client, JSON.stringify({ type: 'stream.subscribed', tenantId: client.user.tenantId, sessionId: channel, data: {} }));
+                        const key = streamChannelKey(channel);
+                        if (msg.sessionId) client.subscriptions.add(key);
+                        if (msg.channel) client.channels.add(key);
+                        writeToClient(client, JSON.stringify({ type: 'stream.subscribed', tenantId: client.user.tenantId, sessionId: key, data: {} }));
                     } else if (msg.type === 'unsubscribe') {
-                        if (msg.sessionId) client.subscriptions.delete(msg.sessionId);
-                        if (msg.channel) client.channels.delete(msg.channel);
+                        if (msg.sessionId) client.subscriptions.delete(streamChannelKey(msg.sessionId));
+                        if (msg.channel) client.channels.delete(streamChannelKey(msg.channel));
                     }
                 } catch {
                     // Ignore malformed messages
@@ -459,7 +488,7 @@ async function canDeliver(client: WSClient, payload: string): Promise<boolean> {
         const event = JSON.parse(payload) as BroadcastEvent;
         const allowed = event.tenantId === client.user.tenantId && typeof event.sessionId === 'string' && event.sessionId !== '*' &&
             (client.subscriptions.has(event.sessionId) || client.channels.has(event.sessionId)) &&
-            await client.authorize(client.user, event.sessionId);
+            await client.authorize(client.user, event.sessionId) === true;
         return allowed && clients.has(client) && client.expiresAt > Date.now();
     } catch { return false; }
 }

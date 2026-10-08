@@ -78,6 +78,42 @@ describe('stream authentication', () => {
     expect(received).not.toContain('foreign-');
     expect(received).not.toContain('revoked-access');
   });
+  it('delivers run events to an execution:<id> subscription', async () => {
+    // Runs broadcast under the bare run id; the prefixed channel used to be
+    // acknowledged and then never matched an event.
+    const authorize = vi.fn(async (_principal: AuthUser, channel: string) => channel === 'execution:run-1' || channel === 'run-1');
+    await handshake('Bearer valid', authorize);
+    const socket = sockets.at(-1)!;
+    let received = '';
+    socket.on('data', data => { received += data.toString(); });
+    socket.write(frame({ type: 'subscribe', channel: 'execution:run-1' }));
+    await vi.waitFor(() => expect(received).toContain('stream.subscribed'));
+    broadcastEvent('run-1', 'execution.step.completed', { text: 'run-event' }, user.tenantId);
+    await vi.waitFor(() => expect(received).toContain('run-event'));
+    socket.write(frame({ type: 'unsubscribe', channel: 'execution:run-1' }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    broadcastEvent('run-1', 'execution.step.completed', { text: 'after-unsubscribe' }, user.tenantId);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(received).not.toContain('after-unsubscribe');
+  });
+  it('refuses a role-gated channel without dropping the socket', async () => {
+    const authorize = vi.fn(async (_principal: AuthUser, channel: string) => channel === 'agents' ? 'denied' as const : channel === 'owned');
+    await handshake('Bearer valid', authorize);
+    const socket = sockets.at(-1)!;
+    let received = '';
+    let closed = false;
+    socket.on('data', data => { received += data.toString(); });
+    socket.on('close', () => { closed = true; });
+    socket.write(frame({ type: 'subscribe', channel: 'owned' }));
+    await vi.waitFor(() => expect(received).toContain('stream.subscribed'));
+    socket.write(frame({ type: 'subscribe', channel: 'agents' }));
+    await vi.waitFor(() => expect(received).toContain('stream.denied'));
+    broadcastEvent('agents', 'agent.status.changed', { text: 'agent-status' }, user.tenantId);
+    broadcastEvent('owned', 'test', { text: 'still-subscribed' }, user.tenantId);
+    await vi.waitFor(() => expect(received).toContain('still-subscribed'));
+    expect(received).not.toContain('agent-status');
+    expect(closed).toBe(false);
+  });
   it('invalidates pending tickets on logout or credential revocation', () => {
     const ticket = issueStreamTicket(user);
     disconnectStreamUser(user);

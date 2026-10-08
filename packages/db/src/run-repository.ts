@@ -210,6 +210,28 @@ export class PostgresRunRepository {
     });
   }
 
+  /**
+   * Live-run totals for cost governance and observability. Workers evict a
+   * run's in-process working copy once its lease ends, so these totals must
+   * come from the committed snapshots rather than any replica's memory.
+   * Zero cost and zero quality count as "not measured", matching the
+   * in-memory aggregation.
+   */
+  async stats(tenantId: string): Promise<{ byPersona: Array<{ persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>; activeAgents: string[] }> {
+    return this.transaction(tenantId, async client => {
+      const cost = "CASE WHEN jsonb_typeof(snapshot->'totalTokenCost')='number' THEN (snapshot->>'totalTokenCost')::float8 END";
+      const quality = "CASE WHEN jsonb_typeof(snapshot->'avgQualityScore')='number' AND (snapshot->>'avgQualityScore')::float8<>0 THEN (snapshot->>'avgQualityScore')::float8 END";
+      const personas = await client.query(`SELECT persona, count(*) AS runs, COALESCE(sum(${cost}),0) AS cost, COALESCE(sum(${quality}),0) AS quality_sum, count(${quality}) AS quality_count FROM runtime_runs WHERE tenant_id=$1 AND mode='live' GROUP BY persona ORDER BY persona`, [tenantId]);
+      // A step only counts as active while its run is running: a lease lost
+      // mid-step leaves the step row 'running' on a run that has since ended.
+      const agents = await client.query("SELECT DISTINCT s.data->>'agent' AS agent FROM runtime_steps s JOIN runtime_runs r ON r.tenant_id=s.tenant_id AND r.id=s.run_id WHERE s.tenant_id=$1 AND s.status='running' AND r.status='running' AND r.mode='live' AND s.data->>'agent' IS NOT NULL ORDER BY 1", [tenantId]);
+      return {
+        byPersona: personas.rows.map(row => ({ persona: String(row.persona), count: Number(row.runs), totalCost: Number(row.cost), qualitySum: Number(row.quality_sum), qualityCount: Number(row.quality_count) })),
+        activeAgents: agents.rows.map(row => String(row.agent)),
+      };
+    });
+  }
+
   private async expireApprovals(client: RuntimeClient, tenantId: string): Promise<void> {
     const expired = await client.query("SELECT a.run_id,a.step_id,a.attempt FROM runtime_approvals a JOIN runtime_jobs j ON j.tenant_id=a.tenant_id AND j.run_id=a.run_id WHERE a.tenant_id=$1 AND a.status='pending' AND a.expires_at<NOW() AND j.status='waiting' FOR UPDATE OF j SKIP LOCKED", [tenantId]);
     for (const approval of expired.rows) {

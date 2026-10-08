@@ -254,6 +254,43 @@ async function main() {
     assert.equal((await repository.claimEvents(a, 'event-worker')).length, 0);
     console.log('PASS durable cancellation, worker-free approval wait, rejection persistence and tenant-scoped outbox');
 
+    // Cost governance and observability totals come from committed snapshots:
+    // workers evict each run's in-process copy when its lease ends.
+    const statsTenant = `fixture-stats-${suffix}`;
+    await pool.query('INSERT INTO tenants (id,name) VALUES ($1,$2)', [statsTenant, 'M2 stats fixture']);
+    await pool.query("INSERT INTO users (id,email,name,role,tenant_id) VALUES ($1,$2,'Fixture','user',$3)", [`user-${statsTenant}`, `${statsTenant}@example.invalid`, statsTenant]);
+    const foreignStats = await repository.stats(b);
+    assert.deepEqual(await repository.stats(statsTenant), { byPersona: [], activeAgents: [] });
+    const claimLive = async (tenant: string) => {
+      const run = { ...snapshot(tenant), mode: 'live' };
+      await repository.submit(run as any, definition, { priority: 100 });
+      const claimed = await repository.claim(tenant, `stats-${run.id}`);
+      assert.equal(claimed?.snapshot.id, run.id);
+      return { run, lease: claimed!.lease };
+    };
+    const completed = await claimLive(statsTenant);
+    await repository.checkpoint(completed.lease, { ...completed.run, status: 'running', steps: [{ ...completed.run.steps[0], status: 'running' }] } as any);
+    assert.deepEqual((await repository.stats(statsTenant)).activeAgents, ['code-reviewer']);
+    await repository.checkpoint(completed.lease, { ...completed.run, status: 'completed', totalTokenCost: 0.02, avgQualityScore: 8, outputs: { result: 'fixture' }, steps: [{ ...completed.run.steps[0], status: 'completed', provenance: 'live' }] } as any);
+    const failed = await claimLive(statsTenant);
+    await repository.fail(failed.lease, { ...failed.run, status: 'failed', totalTokenCost: 0.01, avgQualityScore: 0, steps: [{ ...failed.run.steps[0], status: 'failed', error: 'Fixture failure' }] } as any, 'Fixture failure', false);
+    const simulated = snapshot(statsTenant);
+    await repository.submit(simulated as any, definition, {});
+    // A step row left 'running' on a run that has since ended is not active work.
+    const abandoned = await claimLive(statsTenant);
+    await repository.fail(abandoned.lease, { ...abandoned.run, status: 'failed', steps: [{ ...abandoned.run.steps[0], status: 'running' }] } as any, 'Fixture lease loss', false);
+    const totals = await repository.stats(statsTenant);
+    assert.equal(totals.byPersona.length, 1);
+    assert.deepEqual({ ...totals.byPersona[0], totalCost: Math.round(totals.byPersona[0]!.totalCost * 1e6) / 1e6 }, { persona: 'engineering', count: 3, totalCost: 0.03, qualitySum: 8, qualityCount: 1 });
+    assert.deepEqual(totals.activeAgents, []);
+    assert.deepEqual(await repository.stats(b), foreignStats);
+    await repository.cancel(statsTenant, simulated.id, simulated.userId);
+    // The deployment-tenant governance routes read the same aggregate (checked once the gateway runs).
+    await pool.query("INSERT INTO users (id,email,name,role,tenant_id) VALUES ('user-default','user-default@example.invalid','Fixture','user','default') ON CONFLICT DO NOTHING");
+    const deploymentRun = await claimLive('default');
+    await repository.checkpoint(deploymentRun.lease, { ...deploymentRun.run, status: 'completed', totalTokenCost: 0.04, outputs: { result: 'fixture' }, steps: [{ ...deploymentRun.run.steps[0], status: 'completed', provenance: 'live' }] } as any);
+    console.log('PASS live-run cost and execution totals from committed snapshots, simulation excluded, tenant scoped');
+
     const { compileDefinition } = await import('../services/gateway/dist/definition-registry.js');
     const reviewDefinition = compileDefinition({
       id: 'fixture-approval', slug: 'fixture-approval', name: 'Fixture approval', description: 'Fixture', icon: '', persona: 'engineering',
@@ -371,6 +408,14 @@ async function main() {
     assert.equal((await request(a, `/api/executions/${resuming.id}/approve/step`, {})).status, 200);
     const resumed = await waitStatus(a, resuming.id, 'completed');
     assert.equal(resumed.outputs.result, 'Fixture approved output');
+    // Finished durable runs are no longer in any replica's memory; the totals still count them.
+    const deploymentTotals = (await repository.stats('default')).byPersona.reduce((sum, row) => ({ count: sum.count + row.count, cost: sum.cost + row.totalCost }), { count: 0, cost: 0 });
+    assert.ok(deploymentTotals.count >= 1 && deploymentTotals.cost >= 0.04);
+    const costs = await request('default', '/api/governance/costs');
+    assert.equal(costs.status, 200);
+    assert.equal(costs.data.totalExecutions, deploymentTotals.count);
+    assert.equal(costs.data.totalCost, Math.round(deploymentTotals.cost * 10000) / 10000);
+    assert.ok(costs.data.breakdown.some((row: any) => row.persona === 'Engineering' && row.skillsUsed >= 1));
     console.log('PASS compiled gateway two-tenant execution, idempotency, quarantine, restart reads and approval continuation without re-running the provider');
     const { verifyOperatingApi } = await import('./m6.operations-contract.js');
     await verifyOperatingApi({ base, tenantId: a, foreignTenant: b, token: token(a), request, waitStatus, sourceRunId: submittedA.data.execution.id });
