@@ -96,7 +96,7 @@ import { submitChatExecution } from './orchestration-adapters.js';
 import { isEntrypointRoute, entrypointRequest } from './entrypoint-api.js';
 import { getFsSkills, reloadFsSkills, getAllFsSkills, warmAllFsSkills } from './skill-fs-loader.js';
 import { adoptedSkillPersona, synthesizeAdoptedSkill } from './adopted-skills.js';
-import { runReviewPipeline, getReviewChain } from './review-pipeline.js';
+import { runReviewPipeline, getReviewChain, REVIEW_DEADLINE_MS } from './review-pipeline.js';
 import { ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT_PLACEHOLDERS } from './prompts/orchestrator-prompt.js';
 import type { AfterActionReport, RetrainingFlag } from './persona-api.js';
 import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey, listPricedModels } from './llm-provider.js';
@@ -1330,9 +1330,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const roles = Array.isArray(body.roles) ? (body.roles as string[]).map(String) : undefined;
             const provider = body.provider as string | undefined;
             const modelId = body.modelId as string | undefined;
+            // The verdict is delivered in this response, so stop calling providers
+            // once nobody can receive it: the caller (or the web proxy in front of
+            // it) disconnected, or the deadline every hop in front is sized for passed.
+            const abandoned = new AbortController();
+            res.on('close', () => { if (!res.writableEnded) abandoned.abort(); });
+            const signal = AbortSignal.any([abandoned.signal, AbortSignal.timeout(REVIEW_DEADLINE_MS)]);
             try {
-                const result = await runReviewPipeline(artifact, { roles, provider, modelId, simulate: resolveSimulate(body.simulate) });
+                const result = await runReviewPipeline(artifact, { roles, provider, modelId, simulate: resolveSimulate(body.simulate), signal });
+                // Audited even when abandoned: the reviewers that did run were billed.
                 recordAudit(userId, 'review.run', `autoplan review → ${result.finalVerdict} (${result.reviewers.length} reviewers)`);
+                if (abandoned.signal.aborted) return;
                 sendJSON(res, 200, result);
             } catch (err) {
                 sendJSON(res, 500, { error: (err as Error).message });

@@ -114,16 +114,19 @@ function MainContent({ section }: { section: string }) {
     case 'prompts':                 return <PromptLibrary />;
 
     // Operations
+    // Sections that share PlatformConsole are keyed by section: they render at the
+    // same tree position, and initialTab only seeds the console's state, so without
+    // a key React reuses the mounted console and keeps the previous section's tab.
     case 'ops-integrations':        return <ToolsRegistry />;
-    case 'ops-notifications':       return <PlatformConsole initialTab="notifications" />;
+    case 'ops-notifications':       return <PlatformConsole key={section} initialTab="notifications" />;
     case 'ops-executions':          return <OpsExecutionsView />;
     case 'ops-discussions':         return <DiscussionForum />;
     case 'ops-blog':                return <BlogEditor />;
 
     // Admin
-    case 'admin-governance':        return <PlatformConsole initialTab="registry" />;
-    case 'admin-evals':             return <PlatformConsole initialTab="evaluations" />;
-    case 'admin-usage':             return <PlatformConsole />;
+    case 'admin-governance':        return <PlatformConsole key={section} initialTab="registry" />;
+    case 'admin-evals':             return <PlatformConsole key={section} initialTab="evaluations" />;
+    case 'admin-usage':             return <PlatformConsole key={section} />;
     case 'admin-settings':          return <SettingsPanel />;
 
     // About / Platform info (reached from Settings → About → View)

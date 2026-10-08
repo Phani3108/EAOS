@@ -12,7 +12,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { callLLM, hasAnyLLMKey } from './llm-provider.js';
+import { callLLM, hasAnyLLMKey, PROVIDER_CALL_TIMEOUT_MS } from './llm-provider.js';
 
 export type ReviewVerdict = 'approve' | 'changes_requested' | 'inconclusive' | 'simulated';
 
@@ -99,6 +99,15 @@ function simulatedReview(roleDef: ReviewRoleDef): ReviewerResult {
   };
 }
 
+/**
+ * Wall-clock budget for one synchronous review: one provider attempt per
+ * reviewer. The route answers inside the request, so without a bound a chain
+ * that keeps falling back across providers could outlive every proxy and
+ * browser in front of it. Reviewers left when it elapses are reported as
+ * inconclusive rather than run.
+ */
+export const REVIEW_DEADLINE_MS = DEFAULT_REVIEW_CHAIN.length * PROVIDER_CALL_TIMEOUT_MS;
+
 /** The configured review chain (role + lens + persona). */
 export function getReviewChain(): Array<{ role: string; label: string; persona: string; available: boolean }> {
   return DEFAULT_REVIEW_CHAIN.map(r => ({ role: r.role, label: r.label, persona: r.persona, available: true }));
@@ -106,7 +115,7 @@ export function getReviewChain(): Array<{ role: string; label: string; persona: 
 
 export async function runReviewPipeline(
   artifact: string,
-  opts: { roles?: string[]; provider?: string; modelId?: string; simulate?: boolean } = {}
+  opts: { roles?: string[]; provider?: string; modelId?: string; simulate?: boolean; signal?: AbortSignal } = {}
 ): Promise<ReviewPipelineResult> {
   const chain = DEFAULT_REVIEW_CHAIN.filter(r => !opts.roles || opts.roles.includes(r.role));
   const simulate = opts.simulate === true;
@@ -116,6 +125,21 @@ export async function runReviewPipeline(
   for (const roleDef of chain) {
     if (simulate) {
       reviewers.push(simulatedReview(roleDef));
+      continue;
+    }
+
+    // Deadline elapsed or caller gone: every further call would be billed for
+    // a verdict nobody can receive, so the remaining roles are not run.
+    if (opts.signal?.aborted) {
+      reviewers.push({
+        role: roleDef.role,
+        label: roleDef.label,
+        persona: roleDef.persona,
+        verdict: 'inconclusive',
+        summary: `Review was not run: ${abortReason(opts.signal)}`,
+        findings: [],
+        simulated: false,
+      });
       continue;
     }
 
@@ -145,6 +169,7 @@ export async function runReviewPipeline(
         userPrompt,
         maxTokens: 1500,
         temperature: 0.3,
+        signal: opts.signal,
       });
       totalCost += res.cost;
       const parsed = parseVerdictJson(res.content);
@@ -168,7 +193,7 @@ export async function runReviewPipeline(
         label: roleDef.label,
         persona: roleDef.persona,
         verdict: 'inconclusive',
-        summary: `Review could not complete: ${(err as Error).message}`,
+        summary: `Review could not complete: ${opts.signal?.aborted ? abortReason(opts.signal) : (err as Error).message}`,
         findings: [],
         simulated: false,
       });
@@ -189,4 +214,10 @@ export async function runReviewPipeline(
     simulated: simulate,
     totalCost,
   };
+}
+
+function abortReason(signal: AbortSignal): string {
+  return signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError'
+    ? `the ${REVIEW_DEADLINE_MS / 1000}s review deadline elapsed`
+    : 'the request was abandoned';
 }
