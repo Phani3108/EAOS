@@ -53,6 +53,23 @@ jobs:
         run: pnpm lint
         continue-on-error: false
 
+      - name: Production compose configuration
+        # Renders deploy/docker-compose.production.yml with the real Compose CLI, which
+        # catches schema errors the contract test (services/gateway/src/
+        # production-compose.test.ts) cannot. The untouched template must be refused:
+        # the stack has no default passwords.
+        shell: bash
+        run: |
+          if docker compose --env-file deploy/.env.example -f deploy/docker-compose.production.yml config --quiet 2>/dev/null; then
+            echo '::error title=Production compose::the blank deploy/.env.example renders, so the stack would start without its secrets'
+            exit 1
+          fi
+          env_file="$(mktemp)"
+          secret="$(openssl rand -hex 32)"
+          sed -E "s/^(POSTGRES_PASSWORD|EAOS_APP_DB_PASSWORD|REDIS_PASSWORD|JWT_SECRET|GRAFANA_PASSWORD)=\$/\1=${secret}/" deploy/.env.example > "$env_file"
+          docker compose --env-file "$env_file" -f deploy/docker-compose.production.yml config --quiet
+          echo 'Production compose renders once every required secret is set'
+
       - name: Build
         run: pnpm build
 
@@ -81,16 +98,48 @@ jobs:
           pnpm test:browser
 
       - name: Gateway smoke test
+        # Boots the compiled gateway as the production image does (NODE_ENV=production,
+        # signed tokens, a throwaway signing key, file store in a scratch directory) and
+        # fails unless /api/ready answers 200 within the deadline and SIGTERM stops it
+        # cleanly. `shell: bash` runs this with -eo pipefail. The default shell is
+        # `bash -e` without pipefail, which is how the old `curl ... | tee` stayed green
+        # with no gateway running. services/gateway/src/ci-smoke-step.test.ts runs this
+        # script against a gateway that crashes, one that never becomes ready, one that
+        # does not stop cleanly and a healthy one.
+        shell: bash
+        env:
+          NODE_ENV: production
+          PORT: '3000'
+          GATEWAY_READY_TIMEOUT_SECONDS: '60'
         run: |
-          pnpm --filter @agentos/gateway start &
-          GATEWAY_PID=$!
-          # Wait up to 30 s for the health endpoint
-          for i in $(seq 1 30); do
-            if curl -sf http://localhost:3000/api/health > /dev/null; then
-              echo "Gateway healthy after ${i}s"; break
-            fi
+          JWT_SECRET="$(openssl rand -hex 32)"
+          DATA_DIR="$(mktemp -d)"
+          export JWT_SECRET DATA_DIR
+          log="$(mktemp)"
+          pnpm --filter @agentos/gateway start > "$log" 2>&1 &
+          gateway_pid=$!
+          fail() {
+            echo "::error title=Gateway smoke test::$1"
+            echo '--- gateway output ---'
+            cat "$log"
+            kill "$gateway_pid" 2>/dev/null || true
+            exit 1
+          }
+          ready=false
+          for ((elapsed = 0; elapsed < GATEWAY_READY_TIMEOUT_SECONDS; elapsed++)); do
+            kill -0 "$gateway_pid" 2>/dev/null || fail 'the gateway exited before it became ready'
+            if curl -fs --max-time 2 -o /dev/null "http://127.0.0.1:${PORT}/api/ready"; then ready=true; break; fi
             sleep 1
           done
-          curl -sf http://localhost:3000/api/health | tee /tmp/health.json
-          kill $GATEWAY_PID || true
+          [ "$ready" = true ] || fail "/api/ready did not answer 200 within ${GATEWAY_READY_TIMEOUT_SECONDS}s"
+          echo "Gateway ready after ${elapsed}s"
+          curl -fsS --max-time 5 "http://127.0.0.1:${PORT}/api/health" || fail '/api/health did not answer 200 after readiness'
+          echo
+          kill -TERM "$gateway_pid"
+          for ((waited = 0; waited < 20; waited++)); do
+            kill -0 "$gateway_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$gateway_pid" 2>/dev/null; then fail 'the gateway was still running 20s after SIGTERM'; fi
+          wait "$gateway_pid" || fail 'the gateway did not shut down cleanly after SIGTERM'
         continue-on-error: false
