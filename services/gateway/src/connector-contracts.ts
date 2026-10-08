@@ -8,13 +8,26 @@ const sha = z.string().regex(/^[a-f0-9]{40}$/);
 const issueKey = z.string().regex(/^[A-Z][A-Z0-9_]*-[1-9][0-9]*$/);
 const channel = z.string().regex(/^[CG][A-Z0-9]{2,40}$/);
 const ts = z.string().regex(/^\d{10,}\.\d+$/);
+/** Slack stores &, < and > as these entities, and they are the only entities it decodes for display. */
+const SLACK_ESCAPED: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;' };
+const SLACK_DECODED: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>' };
+const slackEscape = (value: string) => value.replace(/[&<>]/g, char => SLACK_ESCAPED[char]!);
+/** One pass, so '&amp;lt;' decodes to the literal text '&lt;' and not to '<'. */
+export const slackDisplayText = (value: string) => value.replace(/&(?:amp|lt|gt);/g, entity => SLACK_DECODED[entity]!);
+/**
+ * Slack truncates a message over 40,000 characters. A truncated message can never be
+ * verified, so anything Slack would cut short is refused before dispatch — measured
+ * in Slack's escaped storage form, which is the longer one.
+ */
+export const SLACK_MESSAGE_LIMIT = 40_000;
+const slackText = z.string().min(1).max(SLACK_MESSAGE_LIMIT).refine(value => slackEscape(value).length <= SLACK_MESSAGE_LIMIT, `Message exceeds Slack's ${SLACK_MESSAGE_LIMIT}-character limit once escaped`);
 const description = z.object({ type: z.literal('doc'), version: z.literal(1), content: z.array(z.json()).max(10_000) }).strict().nullable();
 export const actionSchemas = {
   'github:read:pull_request': z.object({ repository: repositoryName, number: z.number().int().positive() }).strict(),
   'github:comment:pull_request': z.object({ repository: repositoryName, number: z.number().int().positive(), body: text }).strict(),
   'jira:read:issue': z.object({ key: issueKey }).strict(),
   'jira:create:issue': z.object({ project: z.string().regex(/^[A-Z][A-Z0-9_]*$/), summary: z.string().min(1).max(255), description: text, issueType: z.enum(['Task','Story','Epic']).default('Task'), parent: issueKey.optional() }).strict(),
-  'slack:create:message': z.object({ channel, text }).strict(),
+  'slack:create:message': z.object({ channel, text: slackText }).strict(),
   'slack:read:message': z.object({ channel, ts }).strict(),
 };
 export const outputSchemas = {

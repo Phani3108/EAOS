@@ -8,6 +8,28 @@ export function integrationDigest(value: unknown): string {
   return createHash('sha256').update(stable(value)).digest('hex');
 }
 export interface InputArtifact extends WorkspaceOwner { id: string; filename: string; mimeType: string; digest: string; bytes: Buffer; text: string; createdAt?: string }
+export interface ArtifactQuota { files: number; bytes: number }
+/**
+ * What an upload counts against, and how long it lives.
+ *
+ * `owner` bounds each owner's LIVE artifacts. Archiving drops an artifact's content
+ * (see RETIRE), so an archived upload stops occupying storage and must stop occupying
+ * quota — counting it forever made the quota a lifetime cap that locked owners out.
+ *
+ * `ephemeral` uploads also share one tenant-wide `pool` and expire after `ttlSeconds`.
+ * That is for owners who are free to mint: every public demo session is a new owner,
+ * so a per-owner quota alone bounds nothing in aggregate. The pool is the bound.
+ */
+export interface ArtifactRetention { owner: ArtifactQuota; ephemeral?: { ttlSeconds: number; pool: ArtifactQuota } }
+export const OWNER_ARTIFACT_RETENTION: ArtifactRetention = { owner: { files: 1000, bytes: 64_000_000 } };
+const LIVE_ARTIFACT = 'archived_at IS NULL AND (expires_at IS NULL OR expires_at>NOW())';
+/**
+ * Retiring (archive or expiry) keeps the row — id, owner, filename and digest, which
+ * runtime_input_artifacts pins as a run's lineage — and drops the bytes and text, which
+ * nothing reads once an artifact is archived. It is an UPDATE, not a DELETE, because
+ * the application role is granted no DELETE on this table (README grants).
+ */
+const RETIRE = "archived_at=NOW(),bytes=''::bytea,extracted_text=''";
 export interface ActionProof { connectorId: string; connectionVersion: number; secretVersion: string; bindingHash: string; requestHash: string; inputHash: string; adapterHash?: string }
 export interface ConnectorManifest { schemaVersion: 2; id: string; actions: string[]; adapterVersion: string; adapterHash: string }
 export interface ConnectorObservation { actionId: string; adapterHash: string; requestHash: string; resultHash: string; transport: 'native_transport' | 'custom_transport' }
@@ -16,20 +38,34 @@ export class PostgresIntegrationRepository {
   async audit(owner: WorkspaceOwner, action: string, resource: string, success: boolean): Promise<void> {
     await tenantTransaction(this.pool, owner.tenantId, async client => { await client.query('INSERT INTO integration_audit (tenant_id,user_id,id,action,resource,success) VALUES ($1,$2,$3,$4,$5,$6)', [owner.tenantId, owner.userId, randomUUID(), action, resource, success]); });
   }
-  async putArtifact(owner: WorkspaceOwner, value: Omit<InputArtifact, 'tenantId' | 'userId' | 'id'>): Promise<InputArtifact> {
+  async putArtifact(owner: WorkspaceOwner, value: Omit<InputArtifact, 'tenantId' | 'userId' | 'id'>, retention: ArtifactRetention = OWNER_ARTIFACT_RETENTION): Promise<InputArtifact> {
     const id = `artifact-${randomUUID()}`;
-    await tenantTransaction(this.pool, owner.tenantId, async client => {
+    const { ephemeral } = retention;
+    const exceeds = (row: Record<string, any>, quota: ArtifactQuota) => Number(row.count) >= quota.files || Number(row.bytes) + value.bytes.length > quota.bytes;
+    // A refusal is returned rather than thrown, so the expiry below still commits.
+    const refused = await tenantTransaction(this.pool, owner.tenantId, async client => {
+      if (ephemeral) {
+        // Pool lock before owner lock on every path that takes both, so uploads cannot deadlock.
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`artifact-pool:${owner.tenantId}`]);
+        // Expired uploads are retired here, under the pool lock, so the pool frees itself without a sweeper.
+        await client.query(`UPDATE input_artifacts SET ${RETIRE} WHERE tenant_id=$1 AND expires_at<=NOW() AND archived_at IS NULL`, [owner.tenantId]);
+        const pool = (await client.query('SELECT count(*) AS count,COALESCE(sum(octet_length(bytes)),0) AS bytes FROM input_artifacts WHERE tenant_id=$1 AND expires_at IS NOT NULL AND archived_at IS NULL', [owner.tenantId])).rows[0]!;
+        if (exceeds(pool, ephemeral.pool)) return 'Shared demo artifact storage is full; try again later';
+      }
       await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`artifact-quota:${owner.tenantId}:${owner.userId}`]);
-      const quota = (await client.query('SELECT count(*) AS count,COALESCE(sum(octet_length(bytes)),0) AS bytes FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2', [owner.tenantId, owner.userId])).rows[0]!;
-      if (Number(quota.count) >= 1000 || Number(quota.bytes) + value.bytes.length > 64_000_000) throw new RuntimeConflictError('Artifact owner quota exceeded');
-      await client.query('INSERT INTO input_artifacts (tenant_id,user_id,id,filename,mime_type,digest,bytes,extracted_text) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [owner.tenantId, owner.userId, id, value.filename, value.mimeType, value.digest, value.bytes, value.text]); });
+      const quota = (await client.query('SELECT count(*) AS count,COALESCE(sum(octet_length(bytes)),0) AS bytes FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2 AND archived_at IS NULL', [owner.tenantId, owner.userId])).rows[0]!;
+      if (exceeds(quota, retention.owner)) return 'Artifact owner quota exceeded';
+      await client.query("INSERT INTO input_artifacts (tenant_id,user_id,id,filename,mime_type,digest,bytes,extracted_text,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW()+$9::integer*INTERVAL '1 second')", [owner.tenantId, owner.userId, id, value.filename, value.mimeType, value.digest, value.bytes, value.text, ephemeral?.ttlSeconds ?? null]);
+      return undefined;
+    });
+    if (refused) throw new RuntimeConflictError(refused);
     return { ...owner, ...value, id };
   }
   async getArtifact(owner: WorkspaceOwner, id: string): Promise<InputArtifact | undefined> {
-    return tenantTransaction(this.pool, owner.tenantId, async client => (await client.query('SELECT tenant_id AS "tenantId",user_id AS "userId",id,filename,mime_type AS "mimeType",digest,bytes,extracted_text AS text,created_at AS "createdAt" FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND archived_at IS NULL', [owner.tenantId, owner.userId, id])).rows[0] as InputArtifact | undefined);
+    return tenantTransaction(this.pool, owner.tenantId, async client => (await client.query(`SELECT tenant_id AS "tenantId",user_id AS "userId",id,filename,mime_type AS "mimeType",digest,bytes,extracted_text AS text,created_at AS "createdAt" FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND ${LIVE_ARTIFACT}`, [owner.tenantId, owner.userId, id])).rows[0] as InputArtifact | undefined);
   }
   async archiveArtifact(owner: WorkspaceOwner, id: string): Promise<boolean> {
-    return tenantTransaction(this.pool, owner.tenantId, async client => (await client.query('UPDATE input_artifacts SET archived_at=NOW() WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND archived_at IS NULL RETURNING id', [owner.tenantId, owner.userId, id])).rows.length === 1);
+    return tenantTransaction(this.pool, owner.tenantId, async client => (await client.query(`UPDATE input_artifacts SET ${RETIRE} WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND archived_at IS NULL RETURNING id`, [owner.tenantId, owner.userId, id])).rows.length === 1);
   }
   private async lock(client: RuntimeClient, owner: WorkspaceOwner, lease: RuntimeLease): Promise<void> {
     if (owner.tenantId !== lease.tenantId) throw new LeaseLostError();

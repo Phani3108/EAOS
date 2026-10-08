@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as connectors from './connector-service.js';
+import { SLACK_MESSAGE_LIMIT, slackDisplayText } from './connector-contracts.js';
 import type { ConnectionRecord, PostgresWorkspaceRepository } from '@agentos/db/workspace-repository';
 import type { PostgresIntegrationRepository } from '@agentos/db/integration-repository';
 import type { JsonRequest, JsonReply } from './outbound-http.js';
@@ -167,5 +168,66 @@ describe('native connector conformance', () => {
     await expect(context.execute('slack:create:message', AbortSignal.abort())).rejects.toThrow();
     expect(context.posts()).toBe(0);
     expect(context.observations).toHaveLength(0);
+  });
+});
+
+describe('vendor normalisation in effect readback', () => {
+  const run = (context: Awaited<ReturnType<typeof fixture>>, connector: string, action: string, resource: string, params: Record<string, unknown>) =>
+    context.service.prepare(owner, connector, action, resource, params).then(proof => context.service.execute(owner, lease, 'step', action, resource, params, proof, new AbortController().signal));
+  const slackHistory = (stored: string) => (request: JsonRequest, reply: JsonReply): JsonReply =>
+    new URL(request.url).pathname === '/api/conversations.history' ? { status: 200, data: { ok: true, messages: [{ ts: '1700000000.001', text: stored }] } } : reply;
+  const text = 'R&D -> <done> & shipped';
+
+  it('decodes only the entities Slack decodes, in a single pass', () => {
+    expect(slackDisplayText('R&amp;D -&gt; &lt;done&gt;')).toBe('R&D -> <done>');
+    expect(slackDisplayText('&amp;lt; &quot;')).toBe('&lt; &quot;');
+  });
+  it('verifies a Slack message stored in its escaped form, posted with parse=none', async () => {
+    const context = await fixture('slack', slackHistory('R&amp;D -&gt; &lt;done&gt; &amp; shipped'));
+    expect(await run(context, 'slack', 'create', 'message', { channel: 'C123', text })).toMatchObject({ verified: true, text: 'R&amp;D -&gt; &lt;done&gt; &amp; shipped' });
+    expect(context.requests.find(request => request.method === 'POST')?.body).toMatchObject({ channel: 'C123', text, parse: 'none' });
+    expect(context.observations).toHaveLength(1);
+  });
+  it.each(['R&amp;D -&gt; done', `${text}!`, 'R&amp;amp;D -&gt; &lt;done&gt; &amp; shipped', '<https://example.invalid|R&D> -> <done> & shipped'])('does not confirm or replay a Slack message stored as %s', async stored => {
+    const context = await fixture('slack', slackHistory(stored));
+    await expect(run(context, 'slack', 'create', 'message', { channel: 'C123', text })).rejects.toMatchObject({ outcome: 'inconclusive' });
+    await expect(run(context, 'slack', 'create', 'message', { channel: 'C123', text })).rejects.toThrow();
+    expect(context.posts()).toBe(1);
+    expect(context.observations).toHaveLength(0);
+  });
+  it('refuses Slack text that Slack would truncate before anything is sent', async () => {
+    const context = await fixture('slack');
+    const before = context.requests.length;
+    await expect(context.service.prepare(owner, 'slack', 'create', 'message', { channel: 'C123', text: 'x'.repeat(SLACK_MESSAGE_LIMIT + 1) })).rejects.toThrow();
+    // Under the limit as written, over it once Slack stores each '&' as '&amp;'.
+    await expect(context.service.prepare(owner, 'slack', 'create', 'message', { channel: 'C123', text: '&'.repeat(SLACK_MESSAGE_LIMIT / 5 + 1) })).rejects.toThrow();
+    await expect(context.service.prepare(owner, 'slack', 'create', 'message', { channel: 'C123', text: '&'.repeat(SLACK_MESSAGE_LIMIT / 5) })).resolves.toMatchObject({ connectorId: 'slack' });
+    expect(context.requests).toHaveLength(before);
+    expect(context.posts()).toBe(0);
+  });
+  const canonical = (issueUrl: string) => (request: JsonRequest, reply: JsonReply): JsonReply => {
+    const path = new URL(request.url).pathname;
+    if (path === '/repos/org/fixture') return { status: 200, data: { id: 18, full_name: 'Org/Fixture' } };
+    if (path.includes('/issues/comments/')) return { status: 200, data: { ...(reply.data as object), issue_url: issueUrl } };
+    return reply;
+  };
+  it('verifies a comment that GitHub reports under the canonical repository casing', async () => {
+    const context = await fixture('github', canonical('https://api.github.com/repos/Org/Fixture/issues/1'));
+    expect(context.connection().status).toBe('verified');
+    expect(await context.execute('github:comment:pull_request')).toMatchObject({ verified: true, repository: 'org/fixture' });
+    expect(context.observations).toHaveLength(1);
+  });
+  it.each([
+    'https://api.github.com/repos/Org/Fixtures/issues/1',
+    'https://api.github.com/repos/Org/Fixture/issues/12',
+    'https://api.github.com/repos/Org/Fixture/pulls/1',
+    'https://api.github.com/repos/Org/Fixture/x/issues/1',
+    'https://api.github.com/repos/org/fıxture/issues/1',
+    'https://other.example/repos/org/fixture/issues/1',
+  ])('does not confirm or replay a comment GitHub reports on %s', async issueUrl => {
+    const context = await fixture('github', canonical(issueUrl));
+    await expect(context.execute('github:comment:pull_request')).rejects.toMatchObject({ outcome: 'inconclusive' });
+    await expect(context.execute('github:comment:pull_request')).rejects.toThrow();
+    expect(context.posts()).toBe(1);
   });
 });

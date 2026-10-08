@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { RuntimePool, PostgresRunRepository, RuntimeSnapshot } from '../packages/db/dist/run-repository.js';
 
 export async function verifyIntegrationEvidence(pool: RuntimePool, runs: PostgresRunRepository, tenantId: string, foreignTenant: string) {
@@ -14,7 +14,7 @@ export async function verifyIntegrationEvidence(pool: RuntimePool, runs: Postgre
   let comment = '', message = '', issue: any;
   const service = new ConnectorService(workspace, evidence, async (context, ref) => {
     assert.equal(context.tenantId, tenantId);
-    assert.ok(ref.path.startsWith(`${owner.tenantId}/${owner.userId}/`));
+    assert.ok(ref.path.startsWith(`${context.tenantId}/${context.userId}/`));
     return { value: secrets.get(ref.path.split('/').at(-1)!)!, version, backend: 'fixture-vault' };
   }, () => async request => {
     const url = new URL(request.url);
@@ -44,6 +44,20 @@ export async function verifyIntegrationEvidence(pool: RuntimePool, runs: Postgre
     assert.equal(await workspace.getConnection(stranger, connector), undefined);
     assert.equal(JSON.stringify(publicConnection((await workspace.getConnection(owner, connector))!)).includes('fixture-github-token'), false);
   }
+  const { tenantTransaction } = await import('../packages/db/dist/tenant-transaction.js');
+  const sql = (text: string, values: unknown[] = []) => tenantTransaction(pool, tenantId, client => client.query(text, values));
+  // SSO principals are `oidc:<sha256(iss, sub)>`: they connect through the API in their verbatim
+  // namespace on PostgreSQL, and cannot reach another owner's. An operator, so the tenant's
+  // admin count (which later contracts rely on) is unchanged.
+  const { integrationRequest } = await import('../services/gateway/dist/integration-api.js');
+  const sso = { tenantId, userId: `oidc:${createHash('sha256').update(`fixture-issuer\u0000${tenantId}`).digest('hex')}` };
+  await sql("INSERT INTO users (id,email,name,role,tenant_id) VALUES ($1,$2,'SSO fixture','operator',$3)", [sso.userId, `sso-${tenantId}@example.invalid`, tenantId]);
+  const ssoConnect = (path: string) => integrationRequest(workspace, evidence, service, { id: sso.userId, tenantId, role: 'operator', email: 'sso@example.invalid', name: 'SSO fixture', teams: [], personaScopes: ['*'] }, new URL('http://localhost/api/connections/github/connect'), 'POST', async () => ({ secretRef: { provider: 'vault', path, key: 'token' }, config: { repositories: ['org/fixture'] } }));
+  assert.equal((await ssoConnect(`${tenantId}/${owner.userId}/github`)).status, 400);
+  assert.equal((await ssoConnect(`${tenantId}/${sso.userId}/github`)).status, 200);
+  assert.equal((await service.probe(sso, 'github')).status, 'verified');
+  assert.equal((await workspace.getConnection(owner, 'github'))?.secretRef.path, `${tenantId}/${owner.userId}/github`);
+  assert.equal(await workspace.getConnection({ ...sso, tenantId: foreignTenant }, 'github'), undefined);
   const execute = async (connector: string, action: string, resource: string, params: Record<string, unknown>, inconclusive = false) => {
     const proof = await service.prepare(owner, connector, action, resource, params);
     const kind = action === 'read' ? 'tool_read' : 'tool_effect';
@@ -91,6 +105,43 @@ export async function verifyIntegrationEvidence(pool: RuntimePool, runs: Postgre
   await assert.rejects(resolveArtifactContext(evidence, stranger, { source: { artifactId: artifact.id } }));
   assert.equal(await evidence.archiveArtifact(owner, artifact.id), true);
   await assert.rejects(resolveArtifactContext(evidence, owner, { source: { artifactId: artifact.id } }));
+  // Archiving frees quota and storage: the row and digest stay for run lineage, the content does not.
+  const brief = (content: string) => extractArtifact('Brief (final) — v2.md', 'text/markdown', Buffer.from(content));
+  const tombstone = async (id: string) => {
+    const row = (await sql('SELECT digest,octet_length(bytes) AS size,extracted_text,archived_at FROM input_artifacts WHERE tenant_id=$1 AND id=$2', [tenantId, id])).rows[0];
+    return row && { digest: row.digest, size: Number(row.size), text: row.extracted_text, archived: Boolean(row.archived_at) };
+  };
+  const single = { owner: { files: 1, bytes: 1_000_000 } };
+  const referenced = await evidence.putArtifact(owner, brief('Fixture lineage brief'), single);
+  assert.equal(referenced.filename, 'Brief (final) — v2.md');
+  await assert.rejects(evidence.putArtifact(owner, brief('Fixture second brief'), single), /Artifact owner quota exceeded/);
+  const lineageHash = integrationDigest(['artifact-lineage']);
+  const lineage = (userId: string, artifactId: string): RuntimeSnapshot => ({ tenantId, userId, id: randomUUID(), persona: 'engineering', status: 'queued', mode: 'simulation', definitionHash: lineageHash, inputs: { source: { artifactId } }, outputs: {}, steps: [{ stepId: 'step', agent: 'code-reviewer', status: 'pending', outputKey: 'result', provenance: 'none' }] });
+  const lineageDefinition = { id: 'artifact-lineage', version: '1', definitionHash: lineageHash, steps: [{ id: 'step', outputKey: 'result' }] };
+  const lineageRun = lineage(owner.userId, referenced.id);
+  await runs.submit(lineageRun, lineageDefinition, {});
+  await runs.cancel(tenantId, lineageRun.id, owner.userId);
+  assert.equal(await evidence.archiveArtifact(owner, referenced.id), true);
+  assert.deepEqual(await tombstone(referenced.id), { digest: referenced.digest, size: 0, text: '', archived: true });
+  assert.equal((await sql('SELECT digest FROM runtime_input_artifacts WHERE tenant_id=$1 AND run_id=$2', [tenantId, lineageRun.id])).rows[0]?.digest, referenced.digest);
+  const second = await evidence.putArtifact(owner, brief('Fixture second brief'), single);
+  assert.equal(await evidence.archiveArtifact(owner, second.id), true);
+  assert.deepEqual(await tombstone(second.id), { digest: second.digest, size: 0, text: '', archived: true });
+  assert.equal(await evidence.archiveArtifact(owner, second.id), false);
+  // Public demo visitors are minted per session, so their uploads share one pool and expire.
+  const visitors = [randomUUID(), randomUUID()].map(id => ({ tenantId, userId: `demo:${id}` }));
+  for (const visitor of visitors) await sql("INSERT INTO users (id,email,name,role,tenant_id) VALUES ($1,$2,'Demo visitor','user',$3)", [visitor.userId, `${visitor.userId.slice(5)}@demo.invalid`, tenantId]);
+  const demo = { owner: { files: 5, bytes: 1_000_000 }, ephemeral: { ttlSeconds: 3600, pool: { files: 2, bytes: 1_000_000 } } };
+  const visitorUpload = await evidence.putArtifact(visitors[0]!, brief('Fixture demo upload'), demo);
+  const ownerUpload = await evidence.putArtifact(owner, brief('Fixture ephemeral owner upload'), demo);
+  await assert.rejects(evidence.putArtifact(visitors[1]!, brief('Fixture fresh identity'), demo), /Shared demo artifact storage is full/);
+  const ordinary = await evidence.putArtifact(owner, brief('Fixture ordinary uploads stay outside the full demo pool'));
+  assert.equal(await evidence.archiveArtifact(owner, ordinary.id), true);
+  await sql("UPDATE input_artifacts SET expires_at=NOW()-INTERVAL '1 second' WHERE tenant_id=$1 AND id=ANY($2::text[])", [tenantId, [visitorUpload.id, ownerUpload.id]]);
+  assert.equal(await evidence.getArtifact(visitors[0]!, visitorUpload.id), undefined);
+  await assert.rejects(runs.submit(lineage(owner.userId, ownerUpload.id), lineageDefinition, {}), /Input artifact is unavailable/);
+  await evidence.putArtifact(visitors[1]!, brief('Fixture fresh identity'), demo);
+  for (const expired of [visitorUpload, ownerUpload]) assert.deepEqual(await tombstone(expired.id), { digest: expired.digest, size: 0, text: '', archived: true });
   corrupt = false;
   await service.probe(owner, 'github');
   const { compileDefinition } = await import('../services/gateway/dist/definition-registry.js');
