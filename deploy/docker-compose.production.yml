@@ -3,8 +3,14 @@
 # Enterprise Agent Operating System
 #
 # Usage:
-#   cp deploy/.env.example deploy/.env  # Fill in secrets
+#   cp deploy/.env.example deploy/.env  # then fill in every blank value
 #   docker compose -f deploy/docker-compose.production.yml up -d
+#
+# Startup order: postgres → migrate (schema, as the database owner) →
+# app-role (the gateway's separate non-owner login and its grants) → gateway →
+# web. Compose refuses to start while a required secret is unset; nothing here
+# has a default password. First sign-in: open the web origin, choose Go to
+# Dashboard, then First-time administrator setup, and enter EAOS_SETUP_TOKEN.
 #
 # @author Phani Marupaka
 # @copyright © 2026 Phani Marupaka. All rights reserved.
@@ -20,10 +26,32 @@ services:
       dockerfile: deploy/Dockerfile
     command: ['node', 'packages/db/dist/migrate.js']
     environment:
-      - DATABASE_URL=${MIGRATION_DATABASE_URL:?Set MIGRATION_DATABASE_URL for the migration owner}
+      # The database owner. Only this step and app-role use it; the gateway never does.
+      - DATABASE_URL=postgresql://eaos:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD (see deploy/.env.example)}@postgres:5432/eaos
     depends_on:
       postgres:
         condition: service_healthy
+    restart: 'no'
+
+  # ── Gateway database login ────────────────────────────────────
+  # Production refuses to run the gateway as the owner, a superuser or a BYPASSRLS
+  # role, because row-level security does not apply to them. This step creates the
+  # separate `eaos_app` login and re-applies its grants after every migration run,
+  # so `up` yields a gateway that can pass that check. See deploy/postgres/app-role.sql.
+  app-role:
+    image: pgvector/pgvector:pg16
+    command: ['psql', '--no-psqlrc', '-v', 'ON_ERROR_STOP=1', '-f', '/eaos/app-role.sql']
+    environment:
+      - PGHOST=postgres
+      - PGDATABASE=eaos
+      - PGUSER=eaos
+      - PGPASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD (see deploy/.env.example)}
+      - EAOS_APP_DB_PASSWORD=${EAOS_APP_DB_PASSWORD:?Set EAOS_APP_DB_PASSWORD, the password of the gateway database login (see deploy/.env.example)}
+    volumes:
+      - ./postgres/app-role.sql:/eaos/app-role.sql:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: 'no'
 
   gateway:
@@ -41,9 +69,9 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      # Database
-      - DATABASE_URL=${DATABASE_URL:?Set DATABASE_URL for a non-owner application role}
-      - REDIS_URL=redis://redis:6379
+      # Database: the non-owner login provisioned by app-role, never the owner.
+      - DATABASE_URL=postgresql://eaos_app:${EAOS_APP_DB_PASSWORD:?Set EAOS_APP_DB_PASSWORD, the password of the gateway database login (see deploy/.env.example)}@postgres:5432/eaos
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD (see deploy/.env.example)}@redis:6379
       - SEED_DEMO=false
       # Auth
       - JWT_SECRET=${JWT_SECRET:?Set JWT_SECRET}
@@ -81,6 +109,8 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      app-role:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -123,8 +153,11 @@ services:
   # ── PostgreSQL + pgvector ─────────────────────────────────────
   postgres:
     image: pgvector/pgvector:pg16
+    # Loopback only: the stack reaches Postgres over the compose network, and the
+    # owner login has no business being reachable from other machines. Use an SSH
+    # tunnel (or `docker compose exec postgres psql -U eaos eaos`) for admin work.
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     environment:
       - POSTGRES_USER=eaos
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD — the production stack has no default database password}
@@ -143,15 +176,23 @@ services:
           memory: 512M
 
   # ── Redis ─────────────────────────────────────────────────────
+  # Not published on the host, and password-protected. Redis carries every
+  # tenant's cross-replica stream events, the shared rate-limit and spend counters
+  # and OIDC login state; the official image runs with protected mode off, so a
+  # published port without a password let anyone who could reach the host read
+  # those events and publish forged ones. Only the gateway connects, over the
+  # compose network, with the password in REDIS_URL.
   redis:
     image: redis:7-alpine
-    ports:
-      - '6379:6379'
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    command: redis-server --requirepass "${REDIS_PASSWORD:?Set REDIS_PASSWORD (see deploy/.env.example)}" --maxmemory 128mb --maxmemory-policy allkeys-lru
+    environment:
+      # Read by redis-cli, so the healthcheck authenticates without the password on its command line.
+      - REDISCLI_AUTH=${REDIS_PASSWORD:?Set REDIS_PASSWORD (see deploy/.env.example)}
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      # A NOAUTH error reply must not count as healthy, whatever redis-cli's exit code.
+      test: ['CMD-SHELL', 'redis-cli ping | grep -q PONG']
       interval: 10s
       timeout: 5s
       retries: 5

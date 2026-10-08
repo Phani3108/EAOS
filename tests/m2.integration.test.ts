@@ -4,6 +4,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { productionGrants } from './production-grants.js';
 
 async function main() {
   const url = process.env.EAOS_TEST_DATABASE_URL;
@@ -27,8 +28,9 @@ async function main() {
     await runMigrations(pool);
     const role = 'eaos_m2_app';
     if (!(await pool.query('SELECT 1 FROM pg_roles WHERE rolname=$1', [role])).rows.length) await pool.query(`CREATE ROLE ${role} NOLOGIN`);
-    await pool.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
-    await pool.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+    // Exactly the grants production gives the gateway's login, not blanket table
+    // access, so a table the gateway needs but the grant script misses fails here.
+    for (const grant of productionGrants(role)) await pool.query(grant);
     const appUrl = new URL(url);
     appUrl.searchParams.set('options', `-c role=${role}`);
     const scopedPool = {

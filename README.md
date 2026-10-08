@@ -68,7 +68,8 @@ cp .env.example .env
 # ▶️ Run gateway + frontend
 pnpm dev
 
-# 🐳 Or use Docker
+# 🐳 Or use Docker — fill in every blank REQUIRED value in deploy/.env first
+cp deploy/.env.example deploy/.env
 docker compose -f deploy/docker-compose.production.yml up -d
 ```
 
@@ -80,28 +81,17 @@ docker compose -f deploy/docker-compose.production.yml up -d
 
 - Canonical execution uses versioned definitions, stable identities and explicit live/simulated/unsupported outcomes. PostgreSQL mode uses transactional run/job admission, fenced worker leases, durable approval continuations and a tenant-scoped outbox. The broader capability inventory remains unverified until its adapters and business workflows pass conformance checks.
 - Set `JWT_SECRET` and `EAOS_SETUP_TOKEN` before first startup. Open the browser sign-in screen, choose first-time administrator setup, and save the API key shown once. Anonymous access is off by default.
-- Docker requires `POSTGRES_PASSWORD`, `GRAFANA_PASSWORD`, a migration-owner `MIGRATION_DATABASE_URL`, and a separate application-role `DATABASE_URL`. It runs tracked migrations before the gateway. Production refuses owner/superuser/BYPASSRLS application roles. Provision the application login through your database administrator after migrations; use TLS for a public deployment.
+- Docker (`deploy/docker-compose.production.yml`, configured by `deploy/.env`) requires `POSTGRES_PASSWORD`, `EAOS_APP_DB_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET` and `GRAFANA_PASSWORD`, and has no default passwords. It runs tracked migrations as the database owner, then provisions the gateway's separate `eaos_app` login and its grants (`deploy/postgres/app-role.sql`) before the gateway starts; the gateway connects only as that login. Production refuses owner/superuser/BYPASSRLS application roles. Redis is not published on the host and requires its password; Postgres is published on loopback only. Use TLS for a public deployment.
 - `EAOS_TENANT_ID` binds legacy state and bootstrap configuration, not ownership of other tenants' canonical runs. Canonical APIs enforce verified tenant/owner scope. In PostgreSQL mode, unmigrated legacy writes are rejected and snapshot restoration is read-only. `GET /api/runtime/quarantine` provides an administrator-only dry-run summary; existing data is never reassigned automatically.
 - Browser traffic uses the same-origin `/_/gateway` proxy. Set `FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` to the public web origin; set `GATEWAY_URL` to that origin plus `/_/gateway`. Organization sign-in also needs the OIDC variables and an `OIDC_REDIRECT_URI` ending in `/_/gateway/api/auth/oidc/callback` on the web origin.
 - Sign-in, demo and SSO calls are rate limited per client. The `/_/gateway` proxy adds no `X-Forwarded-For`, so the gateway sees the web server's address for every visitor; until a TLS terminator in front of the web tier sets that header and the web tier is listed in `EAOS_TRUSTED_PROXIES` (IPs or CIDR blocks), a visitor's first calls share one bucket for the whole deployment. Those calls are budgeted for that: `GET /api/auth/config` is not limited, and starting the demo or SSO allows 60 a minute; other unauthenticated calls allow 10. The bundled compose file passes `EAOS_TRUSTED_PROXIES` through but trusts nobody by default, because trusting the web tier without such an edge lets any client name any address.
 - `pnpm dev` runs `EAOS_DEMO_MODE=local` with both servers bound to 127.0.0.1 (`HOST`). Local demo mode honours a credential-less request only from this machine — loopback client, localhost `Host`, no foreign browser `Origin`. Demo identities stop working when their mode is turned off.
 - API-key rotation/revocation ends the owner's issued sessions. Save the replacement before signing back in. Keep an independent `API_KEY_HASH_SECRET` for long-lived key hashes when rotating JWT signing keys; keys issued before it was set keep working and move onto it on first use. A key, or a session minted from one, cannot mint a credential that outlives the key's `expiresAt`.
 
-Application-role grants after migration (replace `eaos_app` with the separately provisioned login; do not give it schema ownership):
+Application-role grants after migration live in `deploy/postgres/app-role.sql`, which Docker runs after every migration. For a database you provision yourself, run it as the migration owner with psql 15 or newer; it creates or re-keys the login (never the owner), strips any RLS-bypassing attribute and applies only the grants the gateway needs. Do not give that login schema ownership.
 
-```sql
-GRANT USAGE ON SCHEMA public TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON tenants, users, setup_state, deployment_identity, browser_auth_sessions TO eaos_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON api_keys TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON runtime_definitions, runtime_runs, runtime_jobs, runtime_steps, runtime_attempts, runtime_approvals, runtime_artifacts, runtime_events TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON workspace_records, workspace_chat_sessions, workspace_chat_messages, workspace_connections TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON runtime_usage_budgets, runtime_usage_reservations, runtime_step_attempts, runtime_artifact_parents, runtime_schedules, runtime_trigger_receipts, runtime_deliveries, runtime_agent_leases, runtime_children TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON input_artifacts, runtime_input_artifacts, runtime_tool_receipts TO eaos_app;
-GRANT SELECT, INSERT ON integration_audit, platform_audit, runtime_connector_observations TO eaos_app;
-GRANT SELECT, INSERT, UPDATE ON platform_http_metrics, platform_datasets, platform_evaluations, platform_registry_packages, platform_registry_versions, platform_record_reviews, platform_memberships, platform_event_offsets TO eaos_app;
-GRANT SELECT ON kv_store TO eaos_app;
-GRANT SELECT, INSERT ON audit_log TO eaos_app;
-GRANT EXECUTE ON FUNCTION authenticate_api_key(TEXT), touch_api_key(TEXT), runtime_ancestors_active(TEXT,TEXT), runtime_actor_active(TEXT,TEXT,JSONB) TO eaos_app;
+```bash
+EAOS_APP_DB_PASSWORD=... psql "<owner connection URL>" -v ON_ERROR_STOP=1 -v app_role=eaos_app -f deploy/postgres/app-role.sql
 ```
 
 File-backed mode remains an isolated local-development fallback, not a multi-worker durability guarantee. Canonical orchestration requires PostgreSQL and migrations through 025. Workers execute bounded parallel DAG nodes with serialized, fenced checkpoints; a coordinator parks only after active siblings settle. Completed nodes cannot move backwards, and interrupted unknown effects require reconciliation rather than automatic replay. Supported text uploads resolve through owner-scoped artifact records. Nonmigrated connector effects and unsupported file formats remain explicitly unsupported rather than borrowing credentials or fabricating extracted content.
