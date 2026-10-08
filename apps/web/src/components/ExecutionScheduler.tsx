@@ -12,6 +12,7 @@ type JobStatus = 'active' | 'paused' | 'failed' | 'completed' | 'pending';
 
 interface ScheduledJob {
   id: string;
+  version?: number;
   name: string;
   skillId: string;
   skillName: string;
@@ -22,6 +23,8 @@ interface ScheduledJob {
   eventTrigger?: string;
   oneTimeAt?: string;
   status: JobStatus;
+  /** Why the runtime last paused or failed this schedule, as recorded by the server. */
+  lastError?: string;
   lastRun?: string;
   nextRun?: string;
   runCount: number;
@@ -212,10 +215,10 @@ function JobDetail({ job, onClose, onToggle, onRun }: {
         {/* Stats */}
         <div className="grid grid-cols-2 gap-2">
           {[
-            { label: 'Total Runs', value: String(job.runCount) },
-            { label: 'Success Rate', value: `${successRate}%` },
-            { label: 'Successes', value: String(job.successCount) },
-            { label: 'Failures', value: String(job.failureCount) },
+            { label: 'Total Runs', value: String(job.runCount ?? '—') },
+            { label: 'Success Rate', value: job.runCount > 0 ? `${successRate}%` : '—' },
+            { label: 'Successes', value: String(job.successCount ?? '—') },
+            { label: 'Failures', value: String(job.failureCount ?? '—') },
           ].map((s) => (
             <div key={s.label} className="bg-slate-50 rounded-xl p-3">
               <div className="text-[11px] text-slate-400">{s.label}</div>
@@ -223,6 +226,10 @@ function JobDetail({ job, onClose, onToggle, onRun }: {
             </div>
           ))}
         </div>
+
+        {job.lastError && job.status !== 'active' && (
+          <div role="status" className="text-xs p-3 rounded-xl bg-red-50 text-red-700">{job.lastError}</div>
+        )}
 
         {/* Config */}
         <div className="space-y-2">
@@ -455,6 +462,7 @@ function NewJobModal({ onClose, onSave }: { onClose: () => void; onSave: (job: P
 
 export function ExecutionScheduler() {
   const [jobs, setJobs] = useState<ScheduledJob[]>([]);
+  const [error, setError] = useState<string | null>(null);
   const [selectedJob, setSelectedJob] = useState<ScheduledJob | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [filter, setFilter] = useState<JobStatus | 'all'>('all');
@@ -463,10 +471,12 @@ export function ExecutionScheduler() {
   const [apiStats, setApiStats] = useState<{ total: number; active: number; paused: number; failed: number } | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval>>();
 
+  const loadJobs = () => getScheduledJobs().then((d) => {
+    setJobs((d.jobs || []).map((j) => ({ ...j, logs: (j as unknown as ScheduledJob).logs || [] })));
+  }).catch(() => {});
+
   useEffect(() => {
-    getScheduledJobs().then((d) => {
-      setJobs((d.jobs || []).map((j) => ({ ...j, logs: (j as unknown as ScheduledJob).logs || [] })));
-    }).catch(() => {});
+    void loadJobs();
     getSchedulerStats().then((d) => {
       const s = d as Record<string, unknown>;
       if (s && typeof s.total === 'number') {
@@ -490,19 +500,17 @@ export function ExecutionScheduler() {
   });
 
   const handleToggle = (jobId: string) => {
-    toggleJob(jobId).then(({ job: updated }) => {
+    setError(null);
+    toggleJob(jobId, jobs.find(job => job.id === jobId)?.version).then(({ job: updated }) => {
       const mapped: ScheduledJob = { ...updated, logs: (updated as unknown as ScheduledJob).logs || [] };
       setJobs((prev) => prev.map((j) => (j.id === jobId ? { ...mapped, logs: j.logs } : j)));
       if (selectedJob?.id === jobId) {
         setSelectedJob((prev) => prev ? { ...prev, status: mapped.status } : prev);
       }
-    }).catch(() => {
-      setJobs((prev) => prev.map((j) =>
-        j.id === jobId ? { ...j, status: j.status === 'active' ? 'paused' : 'active' } : j
-      ));
-      if (selectedJob?.id === jobId) {
-        setSelectedJob((prev) => prev ? { ...prev, status: prev.status === 'active' ? 'paused' : 'active' } : prev);
-      }
+    }).catch(cause => {
+      setError(cause instanceof Error ? cause.message : 'Schedule update failed');
+      // A conflict means this view is stale; reload so the next click carries the current version.
+      void loadJobs();
     });
   };
 
@@ -523,17 +531,21 @@ export function ExecutionScheduler() {
           return { ...prev, ...updated, logs: newLogs };
         });
       }
-    }).catch(() => {
+    }).catch(cause => {
       setRunningJobs((prev) => { const s = new Set(prev); s.delete(jobId); return s; });
+      setError(cause instanceof Error ? cause.message : 'Scheduled run was not accepted');
     });
   };
 
   const handleDelete = (jobId: string) => {
     if (!confirm('Delete this scheduled job?')) return;
-    deleteScheduledJob(jobId).then(() => {
+    deleteScheduledJob(jobId, jobs.find(job => job.id === jobId)?.version).then(() => {
       setJobs((prev) => prev.filter((j) => j.id !== jobId));
       if (selectedJob?.id === jobId) setSelectedJob(null);
-    }).catch(() => {});
+    }).catch(cause => {
+      setError(cause instanceof Error ? cause.message : 'Schedule was not archived');
+      void loadJobs();
+    });
   };
 
   const handleNewJob = (data: Partial<ScheduledJob>) => {
@@ -550,35 +562,12 @@ export function ExecutionScheduler() {
       timeout: data.timeout ?? 120,
       retries: data.retries ?? 2,
       tags: data.tags ?? [],
+      inputs: data.inputs ?? {},
     };
     createScheduledJob(payload).then(({ job: created }) => {
       const mapped: ScheduledJob = { ...created, logs: [] };
       setJobs((prev) => [mapped, ...prev]);
-    }).catch(() => {
-      const fallback: ScheduledJob = {
-        id: `job-${Date.now()}`,
-        name: payload.name,
-        skillId: payload.skillId,
-        skillName: payload.skillName,
-        personaId: payload.personaId,
-        scheduleType: data.scheduleType ?? 'cron',
-        cronExpression: data.cronExpression,
-        intervalMs: data.intervalMs,
-        eventTrigger: data.eventTrigger,
-        oneTimeAt: data.oneTimeAt,
-        status: 'active',
-        runCount: 0,
-        successCount: 0,
-        failureCount: 0,
-        createdAt: new Date().toISOString(),
-        timeout: payload.timeout,
-        retries: payload.retries,
-        tags: payload.tags,
-        logs: [],
-        nextRun: new Date(Date.now() + 3600000).toISOString(),
-      };
-      setJobs((prev) => [fallback, ...prev]);
-    });
+    }).catch(cause => { setError(cause instanceof Error ? cause.message : 'Schedule was not created'); });
   };
 
   const localStats = {
@@ -591,6 +580,7 @@ export function ExecutionScheduler() {
 
   return (
     <div className="h-full flex flex-col bg-white overflow-hidden" data-testid="execution-scheduler">
+      {error && <div role="alert" className="p-3 text-sm text-red-700 bg-red-50">{error}</div>}
       {/* Header */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-slate-100 flex-shrink-0">
         <div>

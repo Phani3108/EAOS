@@ -29,6 +29,16 @@ export interface ExecutionRecord {
   // ── Data-moat enrichment (v2) ──────────────────────────────────
   // Populated when available; backward-compatible (all optional) so
   // existing callers keep working while new code paths fill these in.
+  /**
+   * Set when the run failed for an infrastructure reason (provider outage,
+   * missing credential, budget cap, open circuit) rather than because the skill
+   * itself performed badly.
+   *
+   * Such a run measures the provider, not the skill. Letting it into the
+   * benchmark corpus or a skill success rate would attribute our downtime to the
+   * skill's quality.
+   */
+  infraFailure?: boolean;
   modelProvider?: string;     // e.g. 'anthropic' | 'openai' | 'azure-openai'
   modelId?: string;           // e.g. 'claude-3-5-sonnet-20241022'
   promptTokens?: number;

@@ -15,6 +15,7 @@ interface Props {
 }
 
 const STATUS_LABELS: Record<string, { label: string; color: string }> = {
+  'configured':      { label: 'Configured, not verified', color: 'text-amber-600 bg-amber-50 border-amber-200' },
   'connected':       { label: 'Connected',          color: 'text-emerald-600 bg-emerald-50 border-emerald-200' },
   'not-connected':   { label: 'Not Connected',       color: 'text-slate-500 bg-slate-50 border-slate-200' },
   'expired':         { label: 'Expired',             color: 'text-amber-600 bg-amber-50 border-amber-200' },
@@ -27,18 +28,25 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
 
 export function ConnectorModal({ connector, currentState, onClose }: Props) {
   const { setConnectionStatus } = useConnectionsStore();
-  const [formValues, setFormValues] = useState<Record<string, string>>({});
+  const [formValues, setFormValues] = useState<Record<string, string>>({ provider: 'vault' });
+  const [resourcePolicy, setResourcePolicy] = useState('{}');
   const [showSecrets, setShowSecrets] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState<'connect' | 'test' | 'disconnect' | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error' | 'info'; text: string } | null>(null);
 
-  const isConnected = currentState.status === 'connected' || currentState.status === 'sandbox' || currentState.status === 'partial';
+  const isConnected = currentState.status === 'connected' || currentState.status === 'configured' || currentState.status === 'sandbox' || currentState.status === 'partial';
   const statusMeta = STATUS_LABELS[currentState.status] ?? STATUS_LABELS['not-connected'];
 
   const setValue = (key: string, val: string) => setFormValues(prev => ({ ...prev, [key]: val }));
   const toggleShow = (key: string) => setShowSecrets(prev => ({ ...prev, [key]: !prev[key] }));
 
-  const allRequiredFilled = connector.requiredFields
+  const referenceFields: ConnectorDef['requiredFields'] = [
+    { key: 'provider', label: 'Secret provider', type: 'text', required: true, placeholder: 'vault, aws, gcp or azure' },
+    { key: 'path', label: 'Tenant/user scoped secret path', type: 'text', required: true, placeholder: 'tenant-id/user-id/connector' },
+    { key: 'key', label: 'Key within the secret', type: 'text', required: false, placeholder: 'Optional key' },
+    { key: 'version', label: 'Secret version', type: 'text', required: false, placeholder: 'Optional version' },
+  ];
+  const allRequiredFilled = referenceFields
     .filter(f => f.required)
     .every(f => (formValues[f.key] ?? '').trim().length > 0);
 
@@ -50,29 +58,28 @@ export function ConnectorModal({ connector, currentState, onClose }: Props) {
     setLoading('connect');
     setMessage(null);
     try {
-      const res = await fetch(`/api/connections/${connector.id}/connect`, {
+      const res = await fetch(`/_/gateway/api/connections/${encodeURIComponent(connector.id)}/connect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ credentials: formValues }),
+        body: JSON.stringify({ secretRef: Object.fromEntries(Object.entries(formValues).filter(([, value]) => value.trim())), config: JSON.parse(resourcePolicy) }),
       });
       if (res.ok) {
         const data = await res.json();
-        if (data.status === 'connected') {
-          setConnectionStatus(connector.id, { status: 'connected', connectedAt: new Date().toISOString(), error: undefined });
-          setMessage({ type: 'success', text: `Connected to ${connector.name} successfully.` });
+        if (data.status === 'configured') {
+          setConnectionStatus(connector.id, { status: 'configured', connectedAt: undefined, error: undefined });
+          setMessage({ type: 'info', text: 'Secret reference saved. Vendor connectivity has not been verified.' });
         } else {
           setConnectionStatus(connector.id, { status: 'error', error: data.error ?? 'Connection failed' });
           setMessage({ type: 'error', text: data.error ?? 'Connection failed. Check your credentials and try again.' });
         }
       } else {
-        // API endpoint not available — save connection locally
-        setConnectionStatus(connector.id, { status: 'connected', connectedAt: new Date().toISOString(), error: undefined });
-        setMessage({ type: 'success', text: `Connected to ${connector.name}. Credentials saved locally.` });
+        // A rejected write must not create a local connection
+        const data = await res.json().catch(() => ({}));
+        setMessage({ type: 'error', text: data.error ?? `Connection was not saved (${res.status}).` });
       }
     } catch {
-      // Gateway unreachable — save connection locally so the flow works
-      setConnectionStatus(connector.id, { status: 'connected', connectedAt: new Date().toISOString(), error: undefined });
-      setMessage({ type: 'success', text: `Connected to ${connector.name}. Credentials saved locally.` });
+      // An unavailable gateway cannot confirm a saved connection
+      setMessage({ type: 'error', text: 'Gateway unavailable. No connection was confirmed.' });
     } finally {
       setLoading(null);
     }
@@ -82,7 +89,7 @@ export function ConnectorModal({ connector, currentState, onClose }: Props) {
     setLoading('test');
     setMessage(null);
     try {
-      const res = await fetch(`/api/connections/${connector.id}/test`, { method: 'POST' });
+      const res = await fetch(`/_/gateway/api/connections/${encodeURIComponent(connector.id)}/test`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         if (data.ok) {
@@ -92,14 +99,13 @@ export function ConnectorModal({ connector, currentState, onClose }: Props) {
           setMessage({ type: 'error', text: data.error ?? 'Test failed — credentials may be invalid or expired.' });
         }
       } else {
-        // No test endpoint — mark as tested locally
-        setConnectionStatus(connector.id, { status: 'connected', lastTestedAt: new Date().toISOString() });
-        setMessage({ type: 'success', text: 'Connection verified locally.' });
+        // Verification requires a successful server-side probe
+        const data = await res.json().catch(() => ({}));
+        setMessage({ type: 'error', text: data.error ?? `Connection was not verified (${res.status}).` });
       }
     } catch {
-      // No gateway — mark as tested locally
-      setConnectionStatus(connector.id, { status: 'connected', lastTestedAt: new Date().toISOString() });
-      setMessage({ type: 'success', text: 'Connection verified locally.' });
+      // An unavailable gateway cannot verify a connection
+      setMessage({ type: 'error', text: 'Gateway unavailable. Connection was not verified.' });
     } finally {
       setLoading(null);
     }
@@ -109,9 +115,13 @@ export function ConnectorModal({ connector, currentState, onClose }: Props) {
     setLoading('disconnect');
     setMessage(null);
     try {
-      await fetch(`/api/connections/${connector.id}/disconnect`, { method: 'POST' }).catch(() => {});
-    } catch { /* ignore */ }
-    // Always update local state
+      const response = await fetch(`/_/gateway/api/connections/${encodeURIComponent(connector.id)}/disconnect`, { method: 'POST' });
+      if (!response.ok) throw new Error('Revocation was not acknowledged');
+    } catch { /* Keep server state authoritative */
+      setMessage({ type: 'error', text: 'Revocation failed. The saved reference was not changed.' });
+      setLoading(null); return;
+    }
+    // Update local state only after acknowledged revocation
     setConnectionStatus(connector.id, { status: 'not-connected', connectedAt: undefined, error: undefined });
     setMessage({ type: 'info', text: `Disconnected from ${connector.name}.` });
     setLoading(null);
@@ -186,10 +196,15 @@ export function ConnectorModal({ connector, currentState, onClose }: Props) {
             {connector.docsUrl && <a href={connector.docsUrl} target="_blank" rel="noreferrer" className="text-blue-500 hover:underline">Docs →</a>}
           </div>
 
+          {!isConnected && <label className="block text-xs text-slate-600">
+            Resource policy (JSON; no credentials)
+            <textarea className="w-full border rounded p-2 mt-1 font-mono" value={resourcePolicy} onChange={event => setResourcePolicy(event.target.value)} placeholder={'{"repositories":["org/repo"],"actions":["read:pull_request","comment:pull_request"]}'} />
+            <span>GitHub uses repositories; Jira uses endpoint/projects; Slack uses channels. Explicitly list allowed actions. Vault KV v2 is the implemented resolver.</span>
+          </label>}
           {/* Credential fields */}
-          {!isConnected && connector.requiredFields.length > 0 && (
+          {!isConnected && referenceFields.length > 0 && (
             <div className="space-y-3">
-              {connector.requiredFields.map(field => (
+              {referenceFields.map(field => (
                 <div key={field.key}>
                   <label className="block text-[13px] font-medium text-slate-700 mb-1">
                     {field.label}

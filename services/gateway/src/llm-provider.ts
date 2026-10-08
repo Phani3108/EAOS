@@ -16,7 +16,26 @@
 
 export type LLMProviderId = 'anthropic' | 'openai' | 'azure-openai' | 'gemini' | 'ollama';
 
+/**
+ * Ceiling on a single provider attempt. Exported because callers that answer
+ * synchronously (review, chat) and the web tier's gateway proxy derive their
+ * own deadlines from it: a proxy that gives up first turns a slow but healthy
+ * call into an opaque 500 while the gateway keeps paying for it.
+ */
+export const PROVIDER_CALL_TIMEOUT_MS = 60_000;
+
 export interface LLMRequest {
+  signal?: AbortSignal;
+  /**
+   * Durable budget ledger. Each provider attempt reserves before dispatch; a
+   * success settles its observed cost, and an attempt that provably produced
+   * no billable completion is released (see `attemptWasNotBilled`).
+   */
+  usage?: {
+    reserve: (request: LLMRequest) => Promise<string>;
+    settle: (id: string, response: LLMResponse) => Promise<void>;
+    release: (id: string) => Promise<void>;
+  };
   provider?: LLMProviderId;
   model?: string;
   systemPrompt: string;
@@ -44,33 +63,107 @@ export interface ProviderConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Errors
+//
+// `callLLM` throws. It used to swallow every provider failure and return
+// placeholder prose, which made an outage indistinguishable from a successful
+// run: the step was marked completed, KPIs and the After-Action Report ingested
+// the placeholder, and the circuit breaker in model-router.ts could never open
+// because its catch block was unreachable.
+// ---------------------------------------------------------------------------
+
+/** A single provider attempt failed. Carries the HTTP status when there was one. */
+export class ProviderCallError extends Error {
+  readonly name = 'ProviderCallError';
+  constructor(
+    readonly providerId: LLMProviderId,
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
+}
+
+/** One attempt in a fallback chain, as reported to the caller. */
+export interface ProviderAttempt {
+  id: LLMProviderId;
+  status?: number;
+  message: string;
+}
+
+/**
+ * No provider has credentials configured. This is an operator error, not a
+ * runtime failure — it is not retryable and must not be billed.
+ */
+export class LLMNotConfiguredError extends Error {
+  readonly name = 'LLMNotConfiguredError';
+  constructor() {
+    super(
+      'No LLM provider configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, ' +
+        'GEMINI_API_KEY, AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_KEY, or OLLAMA_BASE_URL.',
+    );
+  }
+}
+
+/**
+ * Every configured provider was attempted and every one failed. Retryable.
+ * `providersTried` is what the run surface renders and what the operator needs.
+ */
+export class LLMUnavailableError extends Error {
+  readonly name = 'LLMUnavailableError';
+  constructor(readonly providersTried: ProviderAttempt[]) {
+    super(
+      `All ${providersTried.length} configured LLM provider(s) failed: ` +
+        providersTried
+          .map(a => `${a.id}${a.status ? ` (${a.status})` : ''}: ${a.message}`)
+          .join('; '),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Cost estimates per 1M tokens (input / output)
 // ---------------------------------------------------------------------------
 
-const COST_TABLE: Record<string, { input: number; output: number }> = {
+interface ModelPrice { input: number; output: number }
+
+const COST_TABLE: Record<string, ModelPrice & { provider: LLMProviderId }> = {
   // Anthropic Claude 4.x (current)
-  'claude-opus-4-7': { input: 15, output: 75 },
-  'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-haiku-4-5-20251001': { input: 0.8, output: 4 },
+  'claude-opus-4-7': { provider: 'anthropic', input: 15, output: 75 },
+  'claude-sonnet-4-6': { provider: 'anthropic', input: 3, output: 15 },
+  'claude-haiku-4-5-20251001': { provider: 'anthropic', input: 0.8, output: 4 },
   // Anthropic Claude 3.x (legacy)
-  'claude-3-5-sonnet-20241022': { input: 3, output: 15 },
-  'claude-3-opus-20240229': { input: 15, output: 75 },
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  'claude-3-5-sonnet-20241022': { provider: 'anthropic', input: 3, output: 15 },
+  'claude-3-opus-20240229': { provider: 'anthropic', input: 15, output: 75 },
+  'claude-3-haiku-20240307': { provider: 'anthropic', input: 0.25, output: 1.25 },
   // OpenAI
-  'gpt-4o': { input: 2.5, output: 10 },
-  'gpt-4o-mini': { input: 0.15, output: 0.6 },
-  'gpt-4-turbo': { input: 10, output: 30 },
-  'o1': { input: 15, output: 60 },
-  'o1-mini': { input: 3, output: 12 },
+  'gpt-4o': { provider: 'openai', input: 2.5, output: 10 },
+  'gpt-4o-mini': { provider: 'openai', input: 0.15, output: 0.6 },
+  'gpt-4-turbo': { provider: 'openai', input: 10, output: 30 },
+  'o1': { provider: 'openai', input: 15, output: 60 },
+  'o1-mini': { provider: 'openai', input: 3, output: 12 },
   // Gemini
-  'gemini-1.5-pro': { input: 1.25, output: 5 },
-  'gemini-1.5-flash': { input: 0.075, output: 0.3 },
-  'gemini-2.0-flash': { input: 0.1, output: 0.4 },
+  'gemini-1.5-pro': { provider: 'gemini', input: 1.25, output: 5 },
+  'gemini-1.5-flash': { provider: 'gemini', input: 0.075, output: 0.3 },
+  'gemini-2.0-flash': { provider: 'gemini', input: 0.1, output: 0.4 },
   // Ollama / local — free
-  'llama3.2': { input: 0, output: 0 },
-  'mistral': { input: 0, output: 0 },
-  'phi-3': { input: 0, output: 0 },
+  'llama3.2': { provider: 'ollama', input: 0, output: 0 },
+  'mistral': { provider: 'ollama', input: 0, output: 0 },
+  'phi-3': { provider: 'ollama', input: 0, output: 0 },
 };
+
+/**
+ * The rate a request is billed at, by the same rule its recorded cost uses:
+ * Ollama is local and free (callOllama records 0), and every Azure deployment
+ * is costed at gpt-4o rates (callAzureOpenAI) — so an operator's own deployment
+ * name or OLLAMA_MODEL is priced even though it is not a table key. Other
+ * providers are priced by model; `undefined` means no known price.
+ */
+function priceOf(provider: LLMProviderId | undefined, model: string | undefined): ModelPrice | undefined {
+  if (provider === 'ollama') return { input: 0, output: 0 };
+  if (provider === 'azure-openai') return COST_TABLE['gpt-4o'];
+  return model ? COST_TABLE[model] : undefined;
+}
 
 function estimateCost(model: string, inputTokens: number, outputTokens: number): number {
   const rates = COST_TABLE[model] ?? { input: 2, output: 10 };
@@ -83,13 +176,14 @@ function estimateCost(model: string, inputTokens: number, outputTokens: number):
 
 async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('anthropic', 'ANTHROPIC_API_KEY not set');
 
   const model = req.model || 'claude-sonnet-4-6';
   const start = Date.now();
 
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'x-api-key': apiKey,
@@ -106,7 +200,7 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Anthropic API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('anthropic', `Anthropic API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -130,13 +224,14 @@ async function callAnthropic(req: LLMRequest): Promise<LLMResponse> {
 
 async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error('OPENAI_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('openai', 'OPENAI_API_KEY not set');
 
   const model = req.model || 'gpt-4o';
   const start = Date.now();
 
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${apiKey}`,
@@ -154,7 +249,7 @@ async function callOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`OpenAI API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('openai', `OpenAI API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -180,13 +275,14 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
   const endpoint = process.env.AZURE_OPENAI_ENDPOINT;
   const apiKey = process.env.AZURE_OPENAI_KEY;
   const deployment = req.model || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4o';
-  if (!endpoint || !apiKey) throw new Error('AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY required');
+  if (!endpoint || !apiKey) throw new ProviderCallError('azure-openai', 'AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY required');
 
   const start = Date.now();
   const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=2024-02-15-preview`;
 
   const res = await fetch(url, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: {
       'Content-Type': 'application/json',
       'api-key': apiKey,
@@ -203,7 +299,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Azure OpenAI error ${res.status}: ${errText}`);
+    throw new ProviderCallError('azure-openai', `Azure OpenAI error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -227,7 +323,7 @@ async function callAzureOpenAI(req: LLMRequest): Promise<LLMResponse> {
 
 async function callGemini(req: LLMRequest): Promise<LLMResponse> {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
+  if (!apiKey) throw new ProviderCallError('gemini', 'GEMINI_API_KEY not set');
 
   const model = req.model || 'gemini-1.5-pro';
   const start = Date.now();
@@ -235,6 +331,7 @@ async function callGemini(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(url, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       systemInstruction: { parts: [{ text: req.systemPrompt }] },
@@ -248,7 +345,7 @@ async function callGemini(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Gemini API error ${res.status}: ${errText}`);
+    throw new ProviderCallError('gemini', `Gemini API error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -277,6 +374,7 @@ async function callOllama(req: LLMRequest): Promise<LLMResponse> {
 
   const res = await fetch(`${baseUrl}/api/chat`, {
     method: 'POST',
+    signal: req.signal ? AbortSignal.any([req.signal, AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS)]) : AbortSignal.timeout(PROVIDER_CALL_TIMEOUT_MS),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model,
@@ -294,7 +392,7 @@ async function callOllama(req: LLMRequest): Promise<LLMResponse> {
 
   if (!res.ok) {
     const errText = await res.text();
-    throw new Error(`Ollama error ${res.status}: ${errText}`);
+    throw new ProviderCallError('ollama', `Ollama error ${res.status}: ${errText}`, res.status);
   }
 
   const data = (await res.json()) as {
@@ -385,6 +483,70 @@ export function hasAnyLLMKey(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Priced models — what a live run may request
+// ---------------------------------------------------------------------------
+
+export interface PricedModel {
+  id: string;
+  provider: LLMProviderId;
+  /** USD per 1M tokens: the rate budget is reserved at and cost is recorded at. */
+  inputUsdPerMTok: number;
+  outputUsdPerMTok: number;
+  /** The provider's model when a run names none. */
+  providerDefault: boolean;
+  /** The provider has credentials on this gateway. */
+  available: boolean;
+}
+
+/**
+ * Every model a live run may name: each provider's priced models, plus the
+ * operator's Azure deployment and Ollama model (priced by provider, see
+ * `priceOf`). A live run reserves budget at its model's price before dispatch,
+ * so a model without one could never run — it is refused at submission
+ * (`admitModel`) instead of failing at its first step.
+ */
+export function listPricedModels(): PricedModel[] {
+  return getAvailableProviders().flatMap(config => {
+    // Azure routes to a named deployment, and only the configured one is known to exist.
+    const ids = config.id === 'azure-openai'
+      ? [config.defaultModel]
+      : [...new Set([...Object.keys(COST_TABLE).filter(id => COST_TABLE[id]!.provider === config.id), config.defaultModel])];
+    return ids.flatMap(id => {
+      const price = priceOf(config.id, id);
+      return price ? [{ id, provider: config.id, inputUsdPerMTok: price.input, outputUsdPerMTok: price.output, providerDefault: id === config.defaultModel, available: config.available }] : [];
+    });
+  });
+}
+
+/** A live run named a model this gateway has no price for. 400: the request is fixable. */
+export class UnpricedModelError extends Error {
+  readonly name = 'UnpricedModelError';
+  readonly statusCode = 400;
+  constructor(readonly model: string, readonly provider: LLMProviderId | undefined, readonly allowedModels: string[]) {
+    super(
+      `Model "${model}"${provider ? ` is not a priced ${provider} model` : ' has no known price'}, so a live run cannot reserve budget for it. ` +
+        `Choose one of: ${allowedModels.join(', ')} — or omit modelId to use the provider default.`,
+    );
+  }
+}
+
+/**
+ * Admit a client-chosen model for a live run. With no provider named, the run
+ * goes to the provider that prices the model (preferring a configured one), so
+ * `gpt-4o` is not sent to whichever provider happens to be the default.
+ *
+ * @throws {UnpricedModelError} the model is unknown, or not one of `provider`'s
+ */
+export function admitModel(provider: LLMProviderId | undefined, model: string | undefined): { provider?: LLMProviderId; model?: string } {
+  if (!model) return { provider, model };
+  const candidates = listPricedModels().filter(entry => !provider || entry.provider === provider);
+  const matches = candidates.filter(entry => entry.id === model);
+  const match = matches.find(entry => entry.available) ?? matches[0];
+  if (!match) throw new UnpricedModelError(model, provider, [...new Set(candidates.map(entry => entry.id))]);
+  return { provider: match.provider, model };
+}
+
+// ---------------------------------------------------------------------------
 // Unified call — the single entry point for all LLM calls in the gateway
 // ---------------------------------------------------------------------------
 
@@ -397,66 +559,113 @@ const PROVIDER_DISPATCH: Record<LLMProviderId, (req: LLMRequest) => Promise<LLMR
 };
 
 /**
+ * Upper bound, in micro-USD, of what one provider attempt can cost: every input
+ * byte counted as a token plus the full output allowance. Reserved before
+ * dispatch, so a tenant budget is never overrun by requests in flight.
+ *
+ * Throws only for a model with no known price — never invented. Submission
+ * refuses such models (`admitModel`), so reaching this means a run admitted
+ * before that check existed.
+ */
+export function estimateRequestMicros(request: LLMRequest): number {
+  const config = getAvailableProviders().find(provider => provider.id === request.provider);
+  const model = request.model ?? config?.defaultModel;
+  const price = priceOf(request.provider, model);
+  if (!price) throw new Error(`Model "${model ?? 'unspecified'}" has no known price, so usage cannot be reserved for it`);
+  const inputBound = Buffer.byteLength(request.systemPrompt + request.userPrompt, 'utf8') + 256;
+  return Math.ceil(inputBound * price.input + (request.maxTokens ?? 4096) * price.output);
+}
+
+/**
+ * Gateway timeouts: the provider stopped answering, not refused — the request
+ * may still have completed, and been billed, upstream.
+ */
+const UNCERTAIN_HTTP_STATUSES = new Set([504, 524]);
+/** Connection-setup failures: the request never reached the provider. */
+const NEVER_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+
+/**
+ * True when a failed attempt cannot have produced a billable completion, so its
+ * reservation can go back to the budget: the provider answered with an error
+ * status, the request was refused before dispatch (a missing credential), or the
+ * connection was never established. Everything else — an abort or reset after
+ * the request was sent, or a 2xx body that could not be read — may have been
+ * billed, and keeps its reservation rather than inventing zero cost.
+ */
+function attemptWasNotBilled(err: unknown): boolean {
+  if (err instanceof ProviderCallError) return err.status === undefined || !UNCERTAIN_HTTP_STATUSES.has(err.status);
+  const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return typeof code === 'string' && NEVER_SENT_CODES.has(code);
+}
+
+/**
  * Unified LLM call with automatic fallback chain.
  *
  * 1. Try the requested provider (or default)
  * 2. If it fails, try each remaining available provider in priority order
- * 3. If ALL providers fail, return sandbox placeholder
+ * 3. If ALL providers fail, THROW
+ *
+ * This function throws. It does not return placeholder content under any
+ * circumstances. Callers that want simulated output must ask for it explicitly
+ * via the `simulate` flag on the execution request, which routes to
+ * `generateSandboxOutput()` in persona-api.ts and stamps the result as
+ * synthetic — so a simulated run is never mistaken for a measured one.
+ *
+ * @throws {LLMNotConfiguredError} no provider has credentials — not retryable
+ * @throws {LLMUnavailableError}   every configured provider failed — retryable
  */
 export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
+  req.signal?.throwIfAborted();
   const providers = getAvailableProviders();
-  const anyAvailable = providers.some(p => p.available);
+  const availableIds = providers.filter(p => p.available).map(p => p.id);
 
-  if (!anyAvailable) {
-    return {
-      content: generatePlaceholder(req.userPrompt),
-      provider: req.provider ?? 'anthropic',
-      model: 'sandbox',
-      inputTokens: 0,
-      outputTokens: 0,
-      latencyMs: 0,
-      cost: 0,
-    };
+  if (availableIds.length === 0) {
+    throw new LLMNotConfiguredError();
   }
 
   // Build ordered fallback chain: requested provider first, then others by priority
   const requestedId = req.provider ?? getDefaultProvider();
-  const availableIds = providers.filter(p => p.available).map(p => p.id);
 
-  // Put requested provider first, then others
-  const chain = [requestedId, ...availableIds.filter(id => id !== requestedId)];
+  // The requested provider only leads the chain if it is actually available;
+  // otherwise it would be skipped mid-loop and never reported as an attempt.
+  const chain = availableIds.includes(requestedId)
+    ? [requestedId, ...availableIds.filter(id => id !== requestedId)]
+    : availableIds;
+
+  const attempts: ProviderAttempt[] = [];
 
   for (const providerId of chain) {
     const handler = PROVIDER_DISPATCH[providerId];
     if (!handler) continue;
 
-    // Check if this provider is actually available
-    const providerConfig = providers.find(p => p.id === providerId);
-    if (!providerConfig?.available) continue;
-
+    // For fallback providers, clear the model so they use their default
+    const callReq = providerId === requestedId ? { ...req, provider: providerId } : { ...req, provider: providerId, model: undefined };
+    const reservation = await req.usage?.reserve(callReq);
+    let response: LLMResponse;
     try {
-      // For fallback providers, clear the model so they use their default
-      const callReq = providerId === requestedId ? req : { ...req, provider: providerId, model: undefined };
-      return await handler(callReq);
+      response = await handler(callReq);
     } catch (err) {
-      console.warn(`[llm-provider] ${providerId} failed: ${(err as Error).message}${chain.indexOf(providerId) < chain.length - 1 ? ' — trying next provider' : ''}`);
+      req.signal?.throwIfAborted();
+      const status = err instanceof ProviderCallError ? err.status : undefined;
+      const message = (err as Error).message;
+      attempts.push({ id: providerId, status, message });
+      // Before the next provider reserves its own share: a fallback chain that
+      // kept every refused attempt's reservation would drain the budget with
+      // calls that cost nothing — permanently, since reservations do not expire.
+      if (reservation !== undefined && attemptWasNotBilled(err)) await req.usage!.release(reservation);
+      const isLast = providerId === chain[chain.length - 1];
+      console.warn(
+        `[llm-provider] ${providerId} failed: ${message}${isLast ? '' : ' — trying next provider'}`,
+      );
+      continue;
     }
+    if (reservation !== undefined) await req.usage!.settle(reservation, response);
+    return response;
   }
 
-  // All providers failed — return sandbox placeholder
-  console.error('[llm-provider] All providers failed. Returning sandbox output.');
-  return {
-    content: generatePlaceholder(req.userPrompt),
-    provider: requestedId,
-    model: 'sandbox-fallback',
-    inputTokens: 0,
-    outputTokens: 0,
-    latencyMs: 0,
-    cost: 0,
-  };
-}
-
-function generatePlaceholder(prompt: string): string {
-  const topic = prompt.slice(0, 120).trim();
-  return `# AI-Generated Output\n\n*No LLM provider configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, AZURE_OPENAI_ENDPOINT+KEY, or OLLAMA_BASE_URL.*\n\n**Task:** ${topic}\n\n> This is sandbox output. Configure an LLM provider to get real AI-generated content.\n\n*Generated by AgentOS LLM Provider*`;
+  // Every configured provider failed. Throwing here is what allows
+  // recordCircuitFailure() in model-router.ts to fire, the step to be marked
+  // failed instead of completed, and the run to be excluded from KPIs.
+  console.error(`[llm-provider] All ${attempts.length} provider(s) failed.`);
+  throw new LLMUnavailableError(attempts);
 }

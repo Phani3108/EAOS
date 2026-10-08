@@ -15,7 +15,8 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { PersistentStore } from './persistent-store.js';
+import type { Store } from './connection.js';
+import { readAll } from './create-store.js';
 
 // ---------------------------------------------------------------------------
 // Serialisable snapshot (Maps replaced with plain objects)
@@ -59,10 +60,20 @@ function objectToMap<V>(o: Record<string, V>): Map<string, V> {
 const WORKFLOW_TABLE = 'pipeline_executions';
 
 export class WorkflowStore {
-  private store: PersistentStore;
+  private store: Store;
 
-  constructor(dataDir?: string) {
-    this.store = new PersistentStore(dataDir);
+  /**
+   * Takes the process-wide Store rather than constructing its own.
+   *
+   * It previously did `new PersistentStore(dataDir)` with `dataDir` undefined,
+   * which resolved to the same `<cwd>/.agentos-data/store.json` that server.ts
+   * already had open. Each instance held a private table map and serialised only
+   * its own tables over the whole file, so whichever debounce fired last silently
+   * deleted the other's data — which is why `store.json` on disk contains no
+   * `pipeline_executions` table at all.
+   */
+  constructor(store: Store) {
+    this.store = store;
   }
 
   /**
@@ -115,9 +126,15 @@ export class WorkflowStore {
     return this.rowToSnapshot(row);
   }
 
-  list(limit = 50): WorkflowSnapshot[] {
-    return this.store
-      .all(WORKFLOW_TABLE)
+  /**
+   * Async because `PostgresStore.all()` throws by design — callers must go
+   * through `allAsync()`. This method was synchronous and is reached from
+   * `initWorkflowStore()` at boot, so it was a ninth way that setting
+   * DATABASE_URL crashed the gateway during module evaluation.
+   */
+  async list(limit = 50): Promise<WorkflowSnapshot[]> {
+    const rows = await readAll(this.store, WORKFLOW_TABLE);
+    return rows
       .map(r => this.rowToSnapshot(r))
       .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
       .slice(0, limit);

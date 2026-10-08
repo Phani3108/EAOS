@@ -133,7 +133,7 @@ export class AgentEvalsStore {
   private alerts: EvalAlert[] = [];
 
   constructor() {
-    this.seed();
+    if (process.env.SEED_DEMO === 'true' && !process.env.DATABASE_URL) this.seed();
   }
 
   private seed(): void {

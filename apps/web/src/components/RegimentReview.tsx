@@ -11,13 +11,13 @@ interface Reviewer {
   role: string;
   label: string;
   persona: string;
-  verdict: 'approve' | 'changes_requested';
+  verdict: 'approve' | 'changes_requested' | 'inconclusive' | 'simulated';
   summary: string;
   findings: string[];
   simulated: boolean;
 }
 interface ReviewResult {
-  finalVerdict: 'approve' | 'changes_requested';
+  finalVerdict: 'approve' | 'changes_requested' | 'inconclusive' | 'simulated';
   reviewers: Reviewer[];
   consolidatedFindings: string[];
   simulated: boolean;
@@ -97,7 +97,7 @@ export function RegimentReview() {
           <div className="space-y-3">
             <div className="flex items-center gap-3">
               <span className={`text-sm font-semibold px-3 py-1 rounded-full border ${verdictBadge(result.finalVerdict)}`}>
-                {result.finalVerdict === 'approve' ? '✓ Approved' : '✎ Changes Requested'}
+                {result.finalVerdict === 'approve' ? 'Approved' : result.finalVerdict === 'changes_requested' ? 'Changes Requested' : result.finalVerdict === 'simulated' ? 'Simulated — not an approval' : 'Inconclusive — review incomplete'}
               </span>
               {result.simulated && <span className="text-xs text-slate-400">simulated (set an LLM key for real reviews)</span>}
             </div>
@@ -107,7 +107,7 @@ export function RegimentReview() {
                   <span className="font-semibold text-slate-900">{rv.label}</span>
                   <span className="text-[11px] text-slate-400">{rv.persona}</span>
                   <span className={`ml-auto text-[11px] font-medium px-2 py-0.5 rounded-full border ${verdictBadge(rv.verdict)}`}>
-                    {rv.verdict === 'approve' ? 'approve' : 'changes requested'}
+                    {rv.verdict.replace(/_/g, ' ')}
                   </span>
                 </div>
                 <p className="text-sm text-slate-600 mb-2">{rv.summary}</p>

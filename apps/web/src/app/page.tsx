@@ -16,6 +16,7 @@ import { EngineeringHub } from '../components/EngineeringHub';
 import { ProductHub } from '../components/ProductHub';
 import { HRHub } from '../components/HRHub';
 import { OpsExecutionsView } from '../components/OpsExecutionsView';
+import { PlatformConsole } from '../components/PlatformConsole';
 
 import { AdminUsageView } from '../components/AdminUsageView';
 import GovernanceDashboard from '../components/GovernanceDashboard';
@@ -51,7 +52,9 @@ import { ToastViewport } from '../components/ui';
 import FirstRunFlow from '../components/firstrun/FirstRunFlow';
 import { PromptLibrary } from '../components/PromptLibrary';
 import AboutPage from '../components/AboutPage';
+import AuthGate from '../components/AuthGate';
 import { hasCompletedOnboarding } from '../lib/storage';
+import { resolveInitialSection, takeSsoReturn } from '../lib/initial-section';
 
 function MainContent({ section }: { section: string }) {
   // Dynamic connector detail pages: connector-detail-{connectorId}
@@ -111,16 +114,19 @@ function MainContent({ section }: { section: string }) {
     case 'prompts':                 return <PromptLibrary />;
 
     // Operations
+    // Sections that share PlatformConsole are keyed by section: they render at the
+    // same tree position, and initialTab only seeds the console's state, so without
+    // a key React reuses the mounted console and keeps the previous section's tab.
     case 'ops-integrations':        return <ToolsRegistry />;
-    case 'ops-notifications':       return <NotificationCenter />;
+    case 'ops-notifications':       return <PlatformConsole key={section} initialTab="notifications" />;
     case 'ops-executions':          return <OpsExecutionsView />;
     case 'ops-discussions':         return <DiscussionForum />;
     case 'ops-blog':                return <BlogEditor />;
 
     // Admin
-    case 'admin-governance':        return <GovernanceDashboard />;
-    case 'admin-evals':             return <AgentEvalsPanel />;
-    case 'admin-usage':             return <AdminUsageView />;
+    case 'admin-governance':        return <PlatformConsole key={section} initialTab="registry" />;
+    case 'admin-evals':             return <PlatformConsole key={section} initialTab="evaluations" />;
+    case 'admin-usage':             return <PlatformConsole key={section} />;
     case 'admin-settings':          return <SettingsPanel />;
 
     // About / Platform info (reached from Settings → About → View)
@@ -145,7 +151,6 @@ export default function Home() {
 
   // On mount: read URL path and navigate to the matching section, default to landing
   useEffect(() => {
-    const path = window.location.pathname.replace(/^\/+/, '');
     const knownSections = [
       'home','dashboard','landing',
       'csuite-command','csuite-vision',
@@ -161,11 +166,13 @@ export default function Home() {
       'prompts','about',
     ];
     // Allow connector-detail-{id} dynamic sections to round-trip through URL
-    const isKnown = knownSections.includes(path) || path.startsWith('connector-detail-');
-    const resolved = isKnown ? path : 'landing';
-    // Returning users (completed onboarding) skip the Landing splash → straight to Home
-    const finalSection = resolved === 'landing' && hasCompletedOnboarding() ? 'home' : resolved;
-    setActiveSection(finalSection);
+    const isKnown = (section: string) => knownSections.includes(section) || section.startsWith('connector-detail-');
+    // An SSO sign-in (?login_code) always opens the app shell, where AuthGate exchanges the code.
+    const signingIn = new URLSearchParams(window.location.search).has('login_code');
+    setActiveSection(resolveInitialSection({
+      pathname: window.location.pathname, search: window.location.search, onboarded: hasCompletedOnboarding(), isKnown,
+      ssoReturn: signingIn ? takeSsoReturn() : null,
+    }));
     assertProvenance();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -213,6 +220,7 @@ export default function Home() {
   }
 
   return (
+    <AuthGate>
     <MotionConfig reducedMotion="user">
     <div className="flex h-dscreen md:h-screen bg-white text-slate-900 overflow-hidden">
       <Sidebar mobileOpen={mobileNavOpen} onMobileClose={() => setMobileNavOpen(false)} />
@@ -245,5 +253,6 @@ export default function Home() {
       <FirstRunFlow open={firstRunOpen} onClose={() => setFirstRunOpen(false)} />
     </div>
     </MotionConfig>
+    </AuthGate>
   );
 }

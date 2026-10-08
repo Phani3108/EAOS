@@ -28,6 +28,8 @@ Thumbs.db
 # Test & Coverage
 coverage/
 .vitest/
+test-results/
+playwright-report/
 
 # Docker
 docker-volumes/
@@ -48,3 +50,4 @@ logs/
 **/src/**/*.js
 !**/*.config.js
 !**/next.config.*
+.claude/worktrees/

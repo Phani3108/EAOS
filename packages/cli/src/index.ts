@@ -10,7 +10,7 @@
  *   eaos logs [service]        Tail service logs
  *   eaos exec <goal>           Execute a goal
  *   eaos skills                List available skills
- *   eaos skills:test <id>      Test a skill
+ *   eaos validate <file>       Validate a workflow without executing
  *   eaos workers               List active workers
  *   eaos workflows             List workflows
  *   eaos capabilities          Show system capabilities
@@ -19,170 +19,92 @@
  *   eaos config                Show configuration
  */
 
-import { execSync, spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GatewayWorkflowClient, PlatformClient } from '@agentos/sdk';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../../..');
 const DEPLOY = resolve(ROOT, 'deploy');
-
-const GATEWAY_URL = process.env.GATEWAY_URL ?? 'http://localhost:3000';
+const GATEWAY_URL = (process.env.GATEWAY_URL ?? 'http://localhost:3000').replace(/\/$/, '');
+const client = new GatewayWorkflowClient({ baseUrl: GATEWAY_URL, headers: async (): Promise<Record<string, string>> => {
+    const credential = process.env.EAOS_TOKEN || process.env.EAOS_API_KEY;
+    if (credential && !/^[\x21-\x7e]{1,8192}$/.test(credential)) throw new Error('Invalid authentication credential format');
+    if (process.env.EAOS_TOKEN) return { Authorization: `Bearer ${process.env.EAOS_TOKEN}` };
+    if (process.env.EAOS_API_KEY) return { 'X-API-Key': process.env.EAOS_API_KEY };
+    throw new Error('Set EAOS_TOKEN or EAOS_API_KEY for authenticated commands');
+} });
+const platform = new PlatformClient(client);
+const print = (value: unknown) => console.log(JSON.stringify(value, null, 2));
+const required = (args: string[], index: number, usage: string) => { const value = args[index]; if (!value || value.startsWith('--')) throw new Error(usage); return value; };
+const json = async (path: string): Promise<any> => { const text = await readFile(resolve(path), 'utf8'); if (text.length > 1_000_000) throw new Error('Input file exceeds 1 MB'); return JSON.parse(text); };
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 const commands: Record<string, (args: string[]) => Promise<void>> = {
-    up: async () => {
-        console.log('🚀 Starting EAOS...\n');
-        execSync('docker compose up -d', { cwd: DEPLOY, stdio: 'inherit' });
-        console.log('\n✅ EAOS is running');
-        console.log(`   Gateway:          ${GATEWAY_URL}`);
-        console.log('   Grafana:          http://localhost:3003');
-        console.log('   Prometheus:       http://localhost:9090');
-        console.log('   NATS Monitor:     http://localhost:8222');
+    up: async () => { execFileSync('docker', ['compose','-f','docker-compose.production.yml','up','-d'], { cwd: DEPLOY, stdio: 'inherit' }); },
+    down: async () => { execFileSync('docker', ['compose','-f','docker-compose.production.yml','down'], { cwd: DEPLOY, stdio: 'inherit' }); },
+    logs: async args => {
+        if (args[0] && !/^[a-z][a-z0-9-]{0,40}$/.test(args[0])) throw new Error('Invalid service name');
+        const proc = spawn('docker', ['compose','-f','docker-compose.production.yml','logs','-f', ...(args[0] ? [args[0]] : [])], { cwd: DEPLOY, stdio: 'inherit' });
+        await new Promise<void>((done, reject) => { proc.once('error', reject); proc.once('close', code => { process.exitCode = code ?? 1; done(); }); });
     },
-
-    down: async () => {
-        console.log('🛑 Stopping EAOS...');
-        execSync('docker compose down', { cwd: DEPLOY, stdio: 'inherit' });
-        console.log('✅ EAOS stopped');
+    status: async () => { const response = await fetch(`${GATEWAY_URL}/api/ready`, { redirect: 'error', signal: AbortSignal.timeout(10_000) }); print(await response.json()); if (!response.ok) process.exitCode = 1; },
+    health: async () => commands.status([]),
+    config: async () => print({ gateway: GATEWAY_URL, authenticationConfigured: Boolean(process.env.EAOS_TOKEN || process.env.EAOS_API_KEY) }),
+    skills: async () => print(await client.platform('/api/catalog')),
+    capabilities: async () => print(await client.platform('/api/certification')),
+    workers: async () => print((await platform.summary()).jobs),
+    workflows: async () => print(await platform.packages()),
+    ops: async () => print(await platform.summary()),
+    recovery: async () => print(await platform.recovery()),
+    exec: async args => { const description = args.join(' '); if (!description) throw new Error('Usage: eaos exec <goal>'); print(await client.platform('/api/orchestrator/goal', 'POST', { description })); },
+    run: async args => {
+        const workflow = await json(required(args, 0, 'Usage: eaos run workflow.json [inputs.json] [--live] [--workflow-engine]'));
+        const variables = args[1] && !args[1].startsWith('--') ? await json(args[1]) : {};
+        print(await client.submit(args.includes('--workflow-engine') ? 'workflow-engine' : 'sdk', workflow, variables, !args.includes('--live')));
     },
-
-    status: async () => {
-        console.log('📊 EAOS Service Status\n');
-        const services = [
-            { name: 'Gateway', port: 3000 },
-            { name: 'Orchestrator', port: 3001 },
-            { name: 'Memory', port: 3002 },
-            { name: 'Skills Runtime', port: 3004 },
-            { name: 'Cognitive Engine', port: 3005 },
-            { name: 'Reliability', port: 3006 },
-            { name: 'Learning Engine', port: 3007 },
-        ];
-
-        for (const svc of services) {
-            try {
-                const res = await fetch(`http://localhost:${svc.port}/health`);
-                const status = res.ok ? '✅' : '⚠️';
-                console.log(`  ${status}  ${svc.name.padEnd(20)} :${svc.port}  ${res.ok ? 'healthy' : res.status}`);
-            } catch {
-                console.log(`  ❌  ${svc.name.padEnd(20)} :${svc.port}  unreachable`);
-            }
+    validate: async args => {
+        const path = required(args, 0, 'Usage: eaos validate workflow.json|workflow.yaml');
+        const result = /\.ya?ml$/i.test(path) ? await client.platform<any>('/api/workflows/inspect-yaml', 'POST', { source: await readFile(resolve(path), 'utf8') }) : await client.platform<any>('/api/workflows/validate', 'POST', { format: args.includes('--workflow-engine') ? 'workflow-engine' : 'sdk', workflow: await json(path), variables: {}, simulate: true });
+        print(result);
+        if (result.definitions?.some((definition: { status: string }) => definition.status !== 'compiled')) process.exitCode = 1;
+    },
+    get: async args => { const result = await client.snapshot(required(args, 0, 'Usage: eaos get <run-id>')); if (!result) throw new Error('Run not found'); print(result); },
+    trace: async args => print(await client.trace(required(args, 0, 'Usage: eaos trace <run-id>'))),
+    export: async args => { const id = required(args, 0, 'Usage: eaos export <run-id>'); print({ execution: await client.snapshot(id), trace: await client.trace(id) }); },
+    watch: async args => {
+        const id = required(args, 0, 'Usage: eaos watch <run-id>');
+        let previous = '';
+        for (;;) {
+            const run = await client.snapshot(id);
+            if (!run) throw new Error('Run not found');
+            const state = JSON.stringify({ id: run.id, status: run.status, steps: run.steps.map(step => ({ id: step.stepId, status: step.status })) });
+            if (state !== previous) { console.log(state); previous = state; }
+            if (!['queued','running','paused'].includes(run.status)) { if (!['completed','simulated'].includes(run.status)) process.exitCode = 1; break; }
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
     },
-
-    logs: async (args) => {
-        const service = args[0] ?? '';
-        const cmd = service ? `docker compose logs -f ${service}` : 'docker compose logs -f';
-        const proc = spawn('sh', ['-c', cmd], { cwd: DEPLOY, stdio: 'inherit' });
-        proc.on('close', () => { });
-    },
-
-    exec: async (args) => {
-        const goal = args.join(' ');
-        if (!goal) {
-            console.error('Usage: eaos exec <goal>');
-            process.exit(1);
-        }
-
-        console.log(`🧠 Executing: "${goal}"\n`);
-
-        try {
-            const res = await fetch(`${GATEWAY_URL}/api/goals`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ goal, options: {} }),
-            });
-
-            const result = await res.json();
-
-            console.log('📋 Result:');
-            console.log(JSON.stringify(result, null, 2));
-        } catch (err) {
-            console.error('Failed to connect to EAOS Gateway:', (err as Error).message);
-            console.error('Run `eaos up` first.');
-        }
-    },
-
-    skills: async () => {
-        console.log('🧩 Available Skills\n');
-        try {
-            const res = await fetch(`${GATEWAY_URL}/api/skills/domains`);
-            const domains = await res.json();
-
-            for (const [domain, skills] of Object.entries(domains as Record<string, unknown[]>)) {
-                console.log(`  📂 ${domain}`);
-                for (const skill of skills as Array<{ name: string; id: string }>) {
-                    console.log(`     └─ ${skill.name} (${skill.id})`);
-                }
-                console.log();
-            }
-        } catch {
-            console.log('  Could not connect to Skills Runtime. Run `eaos up` first.');
-        }
-    },
-
-    workers: async () => {
-        console.log('🤖 Active Workers\n');
-        try {
-            const res = await fetch(`${GATEWAY_URL}/api/workers`);
-            const workers = await res.json() as Array<{ id: string; state: string; cluster: string }>;
-
-            for (const w of workers) {
-                const icon = w.state === 'executing' ? '🔄' : w.state === 'idle' ? '💤' : '⚡';
-                console.log(`  ${icon}  ${w.id.padEnd(30)} ${w.state.padEnd(15)} ${w.cluster}`);
-            }
-        } catch {
-            console.log('  Could not connect. Run `eaos up` first.');
-        }
-    },
-
-    capabilities: async () => {
-        console.log('🎯 EAOS Capabilities\n');
-        try {
-            const res = await fetch(`${GATEWAY_URL}/api/capabilities`);
-            const caps = await res.json() as Record<string, Array<{ name: string; description: string }>>;
-
-            for (const [domain, items] of Object.entries(caps)) {
-                console.log(`  📋 ${domain}`);
-                for (const item of items) {
-                    console.log(`     • ${item.name} — ${item.description}`);
-                }
-                console.log();
-            }
-        } catch {
-            console.log('  Could not connect. Run `eaos up` first.');
-        }
-    },
-
-    trace: async (args) => {
-        const traceId = args[0];
-        if (!traceId) {
-            console.error('Usage: eaos trace <execution-id>');
-            process.exit(1);
-        }
-
-        try {
-            const res = await fetch(`${GATEWAY_URL}/api/cognitive/trace/${traceId}`);
-            const trace = await res.json();
-            console.log(JSON.stringify(trace, null, 2));
-        } catch {
-            console.log('  Could not retrieve trace. Run `eaos up` first.');
-        }
-    },
-
-    health: async () => {
-        await commands.status([]);
-    },
-
-    config: async () => {
-        console.log('⚙️  EAOS Configuration\n');
-        console.log(`  Gateway:        ${GATEWAY_URL}`);
-        console.log(`  Deploy dir:     ${DEPLOY}`);
-        console.log(`  Root dir:       ${ROOT}`);
-    },
+    approve: async args => { await client.decide(required(args, 0, 'Usage: eaos approve <run> <step> [confirmations.json]'), required(args, 1, 'Step ID required'), true, args[2] ? await json(args[2]) : {}); print({ accepted: true }); },
+    reject: async args => { await client.decide(required(args, 0, 'Usage: eaos reject <run> <step>'), required(args, 1, 'Step ID required'), false); print({ accepted: true }); },
+    cancel: async args => print({ cancelled: await client.cancel(required(args, 0, 'Usage: eaos cancel <run-id>')) }),
+    retry: async args => print(await client.platform(`/api/operations/runs/${encodeURIComponent(required(args, 0, 'Usage: eaos retry <run-id>'))}/retry`, 'POST', {})),
+    events: async args => print(await platform.events(args[0] ?? '0')),
+    'dataset-create': async args => print(await platform.createDataset(await json(required(args, 0, 'Usage: eaos dataset-create dataset.json')))),
+    evaluate: async args => print(await platform.evaluate(await json(required(args, 0, 'Usage: eaos evaluate evidence.json')))),
+    'connector-contracts': async () => print(await platform.connectorContracts()),
+    conformance: async args => { const report = await platform.connectorConformance(required(args, 0, 'Package ID required'), required(args, 1, 'Manifest hash required')); print(report); if (!report.activationEligible) process.exitCode = 1; },
+    stage: async args => print(await platform.stage(await json(required(args, 0, 'Usage: eaos stage candidate.json')))),
+    'prompt-stage': async args => print(await client.platform('/api/prompts', 'POST', await json(required(args, 0, 'Prompt request JSON required')))),
+    preview: async args => print(await platform.preview(required(args, 0, 'Package ID required'), required(args, 1, 'Candidate hash required'), await json(required(args, 2, 'Input JSON file required')), !args.includes('--live'), crypto.randomUUID())),
+    review: async args => print(await client.platform(`/api/registry/packages/${encodeURIComponent(required(args, 0, 'Package ID required'))}/review`, 'POST', await json(required(args, 1, 'Review JSON file required')))),
+    activate: async args => print(await platform.activate(required(args, 0, 'Package ID required'), required(args, 1, 'Version hash required'), Number(required(args, 2, 'Expected revision required')))),
+    members: async () => print(await platform.members()),
+    'member-update': async args => print(await client.platform(`/api/admin/members/${encodeURIComponent(required(args, 0, 'Member ID required'))}`, 'PATCH', await json(required(args, 1, 'Member update JSON required')))),
 };
 
 // ---------------------------------------------------------------------------
@@ -191,38 +113,12 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
 
 async function main() {
     const [, , command, ...args] = process.argv;
-
     if (!command || command === '--help') {
-        console.log(`
-🧠 eaos — Enterprise Agent Operating System CLI
-
-Commands:
-  up                    Start all EAOS services
-  down                  Stop all services
-  status                Show service health
-  logs [service]        Tail logs
-  exec <goal>           Execute a goal through EAOS
-  skills                List available skills
-  workers               List active workers
-  capabilities          Show system capabilities
-  trace <id>            Inspect execution trace
-  health                Health check
-  config                Show configuration
-`);
+        console.log(`eaos — authenticated EAOS CLI\n\nCommands: ${Object.keys(commands).join(', ')}\n\nSet GATEWAY_URL and EAOS_TOKEN or EAOS_API_KEY.\nWorkflow runs default to simulation; --live is explicit.\nJSON output can be redirected for evidence export. External writes still require server-side approval.`);
         return;
     }
-
-    const handler = commands[command.replace(':', '_')];
-    if (!handler) {
-        console.error(`Unknown command: ${command}`);
-        console.error('Run `eaos --help` for available commands.');
-        process.exit(1);
-    }
-
+    const handler = commands[command];
+    if (!handler) throw new Error(`Unknown command: ${command}`);
     await handler(args);
 }
-
-main().catch((err) => {
-    console.error(err);
-    process.exit(1);
-});
+main().catch(error => { console.error(error instanceof Error ? error.message : 'CLI operation failed'); process.exitCode = 1; });

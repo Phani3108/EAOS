@@ -5,9 +5,7 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-interface SkillInputField { id: string; label: string; type: string; required?: boolean; placeholder?: string; section?: string; helpText?: string; options?: string[]; multiple?: boolean; accept?: string }
-interface SkillStep { id: string; order: number; name: string; agent: string; tool?: string; outputKey: string; requiresApproval?: boolean }
-interface ProgramSkillDef { id: string; slug: string; name: string; description: string; icon: string; persona: string; executableType: string; cluster: string; complexity: 'simple' | 'moderate' | 'complex'; estimatedTime: string; inputs: SkillInputField[]; steps: SkillStep[]; outputs: string[]; requiredTools: string[]; optionalTools: string[]; tags: string[] }
+import type { UnifiedSkillDef as ProgramSkillDef } from '@agentos/skills/schema';
 
 export const PROGRAM_SKILLS: ProgramSkillDef[] = [
   {

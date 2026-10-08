@@ -5,10 +5,8 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-// Inline type to avoid cross-package import issues
-interface SkillInputField { id: string; label: string; type: string; required?: boolean; placeholder?: string; section?: string; helpText?: string; options?: string[]; multiple?: boolean; accept?: string; dependsOn?: string }
-interface SkillStep { id: string; order: number; name: string; agent: string; tool?: string; outputKey: string; requiresApproval?: boolean; capability?: string }
-interface TASkillDef { id: string; slug: string; name: string; description: string; icon: string; persona: string; executableType: string; cluster: string; complexity: 'simple' | 'moderate' | 'complex'; estimatedTime: string; inputs: SkillInputField[]; steps: SkillStep[]; outputs: string[]; requiredTools: string[]; optionalTools: string[]; tags: string[] }
+// Shared schema keeps catalog validation aligned across personas
+import type { UnifiedSkillDef as TASkillDef } from '@agentos/skills/schema';
 
 export const TA_SKILLS: TASkillDef[] = [
   {

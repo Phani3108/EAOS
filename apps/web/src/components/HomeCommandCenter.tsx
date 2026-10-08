@@ -23,7 +23,7 @@ import { getPreference, setPreference } from '../lib/storage';
 
 interface RecentExec {
   id: string; skill: string; persona: string; workspace: string;
-  status: 'completed' | 'running' | 'failed'; duration: string; time: string;
+  status: import('@agentos/skills/schema').ExecutionStatus; duration: string; time: string;
 }
 
 // ── Seed data ───────────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ export default function HomeCommandCenter() {
 
   const mapExec = (e: any, persona: string, ws: string): RecentExec => ({
     id: e.id, skill: e.workflowName || e.skillName || 'Unknown', persona, workspace: ws,
-    status: (e.status === 'completed' ? 'completed' : e.status === 'failed' ? 'failed' : 'running') as RecentExec['status'],
+    status: e.status as RecentExec['status'],
     duration: e.completedAt ? `${((new Date(e.completedAt).getTime() - new Date(e.startedAt).getTime()) / 1000).toFixed(1)}s` : '—',
     time: e.startedAt,
   });

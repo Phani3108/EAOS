@@ -8,6 +8,9 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { notify } from '../lib/notify';
+import { submitExecution } from '../lib/execution-client';
+import { isTerminalExecutionStatus } from '@agentos/skills/schema';
+import type { ExecutionRequest } from '@agentos/gateway/execution-api-contract';
 import { useEngineeringStore, type PersonaExecutionStep } from '../store/persona-store';
 import { useConnectionsStore } from '../store/connections-store';
 import { useEAOSStore } from '../store/eaos-store';
@@ -120,7 +123,7 @@ function EngineeringCommandCenter({ initialSkillSlug }: { initialSkillSlug?: str
 
   // Poll active execution
   useEffect(() => {
-    if (!activeExecution || ['completed', 'failed'].includes(activeExecution.status)) {
+    if (!activeExecution || isTerminalExecutionStatus(activeExecution.status)) {
       if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
       return;
     }
@@ -135,7 +138,7 @@ function EngineeringCommandCenter({ initialSkillSlug }: { initialSkillSlug?: str
         for (const step of execution.steps ?? []) {
           updateExecutionStep(activeExecution.id, step.stepId, { status: step.status, startedAt: step.startedAt, completedAt: step.completedAt, outputPreview: step.outputPreview, error: step.error, agentCallSign: step.agentCallSign, agentRank: step.agentRank, qualityScore: step.qualityScore, latencyMs: step.latencyMs });
         }
-        if (['completed', 'failed'].includes(execution.status)) {
+        if (isTerminalExecutionStatus(execution.status)) {
           if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
         }
       } catch { /* ignore */ }
@@ -143,17 +146,15 @@ function EngineeringCommandCenter({ initialSkillSlug }: { initialSkillSlug?: str
     return () => { if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; } };
   }, [activeExecution?.id, activeExecution?.status]);
 
-  const handleExecute = async (inputs: Record<string, string>, simulate: boolean, customPrompt?: string, modelId?: string, provider?: string) => {
+  const handleExecute = async (inputs: Record<string, unknown>, simulate: boolean, customPrompt?: string, modelId?: string, provider?: string) => {
     if (!selectedSkill) return;
     setExecuting(true);
     try {
-      const res = await fetch(`${GATEWAY_URL}/api/engineering/execute`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skillId: selectedSkill.id, inputs, simulate, customPrompt, provider, modelId }),
+      // Canonical path: typed inputs, server-side validation messages surface in the toast.
+      const execution = await submitExecution({
+        persona: 'engineering', skillId: selectedSkill.id, inputs, simulate, customPrompt,
+        provider: provider as ExecutionRequest['provider'], modelId,
       });
-      if (!res.ok) throw new Error('Execution failed');
-      const { execution } = await res.json();
       const stepEvents = (execution.steps ?? []).map((s: { stepId: string; stepName: string; agent: string; tool?: string; status: string; outputKey?: string }) => ({
         id: `evt-${s.stepId}`,
         stepId: s.stepId,

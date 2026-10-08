@@ -9,10 +9,20 @@
  */
 
 import type { PersonaSkillDef, SkillStep } from './engineering-skills-data.js';
-import { callLLM as callLLMProvider, type LLMProviderId, type LLMResponse } from './llm-provider.js';
+import {
+  admitModel,
+  callLLM as callLLMProvider,
+  LLMNotConfiguredError,
+  LLMUnavailableError,
+  type LLMProviderId,
+  type LLMResponse,
+  type ProviderAttempt,
+  estimateRequestMicros,
+} from './llm-provider.js';
+import { resolveSimulate } from './run-mode.js';
 import { tracedLLMCall } from './llm-tracer.js';
 import { containsPII, redact as redactPII } from './pii-redactor.js';
-import { routedLLMCall, recordCostEntry, detectComplexity } from './model-router.js';
+import { routedLLMCall, recordCostEntry, detectComplexity, BudgetExceededError, CircuitOpenError } from './model-router.js';
 import { createUTCPPacket, storePacket, getPacket, updatePacketStatus } from './utcp-protocol.js';
 import { createA2AMessage, storeMessage } from './a2a-protocol.js';
 import { createMCPAction, executeMCPAction } from './mcp-executor.js';
@@ -21,19 +31,88 @@ import { eventBus } from './event-bus.js';
 import { enqueue as taskEnqueue, type PersonaId as QueuePersonaId } from './task-queue.js';
 import { getAgentIdentity, getAgentsByPersona, validateHandoff, type AgentIdentity } from './agent-registry.js';
 import { buildAgentMemoryContext, extractAndStoreMemory, initAgentMemory } from './agent-memory.js';
-import { waitForApproval } from './approval-bus.js';
+import { waitForApproval, approve as approvePendingStep } from './approval-bus.js';
 import type { Store } from './db.js';
+import { readAll } from './db.js';
+import { aggregateExecutionStatus, assertExecutionTransition, isTerminalExecutionStatus, type WorkflowPersona, type ExecutionStatus, type StepStatus, type RunMode, type Provenance } from '@agentos/skills/schema';
+import { compileDefinition, compileTaskPlan, requiredPersonas, type CompiledDefinition } from './definition-registry.js';
+import { ConnectorService, ConnectorError } from './connector-service.js';
+import { integrationDigest, type PostgresIntegrationRepository, type ActionProof } from '@agentos/db/integration-repository';
+import { resolveArtifactContext } from './artifact-ingestion.js';
+import type { PlatformRepository } from '@agentos/db/platform-repository';
+import { planGraph, resolveGraphInput } from '@agentos/sdk';
+import { evalSafeExpression } from '@agentos/workflow-engine';
+import { validateSkillInputs } from './validation.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import type { PostgresWorkspaceRepository } from '@agentos/db/workspace-repository';
+import { PostgresRunRepository, LeaseLostError, type RuntimeLease, type RuntimeSnapshot } from '@agentos/db/run-repository';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * Why a step failed, in a form code can branch on.
+ *
+ * `retryable` semantics (consumed by the durable queue in Phase 6):
+ *   provider_unavailable  → yes, a different provider or a later attempt may work
+ *   circuit_open          → yes, once the breaker half-opens
+ *   provider_not_configured → NO, an operator must set a key
+ *   budget_exceeded       → NO, retrying spends money that was capped on purpose
+ *   step_error            → NO by default, the failure is in our own logic
+ */
+export type StepErrorClass =
+  | 'provider_unavailable'
+  | 'provider_not_configured'
+  | 'budget_exceeded'
+  | 'circuit_open'
+  | 'step_error';
+
+/** Classify a thrown error into a StepErrorClass plus any provider attempt detail. */
+export function classifyStepError(err: unknown): {
+  errorClass: StepErrorClass;
+  providersTried?: ProviderAttempt[];
+} {
+  if (err instanceof LLMUnavailableError) {
+    return { errorClass: 'provider_unavailable', providersTried: err.providersTried };
+  }
+  if (err instanceof LLMNotConfiguredError) return { errorClass: 'provider_not_configured' };
+  if (err instanceof BudgetExceededError) return { errorClass: 'budget_exceeded' };
+  if (err instanceof CircuitOpenError) return { errorClass: 'circuit_open' };
+  return { errorClass: 'step_error' };
+}
+
+export class ExecutionOutcomeError extends Error {
+  readonly statusCode = 422;
+  constructor(readonly executionStatus: ExecutionStatus, message: string, readonly retryable = false) { super(message); }
+}
+
 export interface PersonaExecutionRecord {
   id: string;
-  persona: 'engineering' | 'product' | 'hr' | 'marketing';
+  /**
+   * Owning tenant. Required, not optional — an execution with no tenant cannot
+   * be isolated, billed, or audited, and this record is what agent memory,
+   * KPIs and the benchmark corpus are all attributed from.
+   *
+   * Defaults to 'default' only at the boundary where a request's principal is
+   * resolved, never silently in the middle of the pipeline.
+   */
+  tenantId: string;
+  persona: WorkflowPersona;
   skillId: string;
   skillName: string;
-  status: 'queued' | 'running' | 'paused' | 'completed' | 'failed';
+  status: ExecutionStatus;
+  mode: RunMode;
+  schemaVersion: 1;
+  definitionHash: string;
+  definitionVersion: string;
+  parentRunId?: string;
+  parentStepId?: string;
+  rootRunId?: string;
+  depth?: number;
+  absoluteDeadline?: string;
+  source?: { type: string; label: string; [key: string]: unknown };
+  requiredPersonas?: string[];
   /** Sequential (default) or DAG-based execution */
   executionMode?: 'sequential' | 'dag';
   provider?: LLMProviderId;
@@ -45,17 +124,46 @@ export interface PersonaExecutionRecord {
     agentCallSign?: string;
     agentRank?: string;
     tool?: string;
-    status: string;
+    status: StepStatus;
+    provenance: Provenance;
+    kind?: SkillStep['kind'];
+    draftOutput?: string;
+    branchDecision?: boolean;
+    waitUntil?: string;
+    resumeAfter?: string;
+    retryCount?: number;
+    retryable?: boolean;
+    nodeRetryHandled?: boolean;
+    childRunId?: string;
+    planDraft?: string;
+    dispatchState?: 'reserved';
+    skipReason?: 'condition' | 'dependency';
+    inputBindings?: Record<string, unknown>;
+    approvalDecision?: { approved: boolean; approverId: string };
+    actionProof?: ActionProof;
+    actionInput?: Record<string, unknown>;
+    approvalFields?: string[];
+    approvalApprovers?: string[];
+    approvalTimeoutMs?: number;
     startedAt?: string;
     completedAt?: string;
     outputKey?: string;
     outputPreview?: string;
     error?: string;
+    /**
+     * Machine-readable failure category. Drives retry eligibility (Phase 6) and
+     * lets the run surface tell an operator error apart from a provider outage
+     * instead of showing one opaque message string.
+     */
+    errorClass?: StepErrorClass;
+    /** Per-provider attempt detail when errorClass is 'provider_unavailable'. */
+    providersTried?: ProviderAttempt[];
     /** DAG: step IDs this step depends on */
     dependsOn?: string[];
     // KPI tracking
     latencyMs?: number;
     tokenCost?: number;
+    tokensUsed?: number;
     qualityScore?: number;
     handoffValid?: boolean;
     handoffWarnings?: string[];
@@ -70,6 +178,7 @@ export interface PersonaExecutionRecord {
   // Aggregate metrics
   totalTokenCost?: number;
   totalLatencyMs?: number;
+  totalTokensUsed?: number;
   avgQualityScore?: number;
   /** UTCP task ID linking this execution to the protocol layer */
   utcpTaskId?: string;
@@ -80,9 +189,34 @@ export interface PersonaExecutionRecord {
 // ---------------------------------------------------------------------------
 
 const executions = new Map<string, PersonaExecutionRecord>();
+const executionKey = (tenantId: string, id: string) => JSON.stringify([tenantId, id]);
+const legacyTenantId = () => process.env.EAOS_TENANT_ID || 'default';
 const afterActionReports = new Map<string, AfterActionReport>();
 const retrainingFlags = new Map<string, RetrainingFlag>();
 let backingStore: Store | null = null;
+let runtimeRepository: PostgresRunRepository | undefined;
+interface RunCoordinator { writes: Promise<void>; children: Map<string, RuntimeSnapshot> }
+const runtimeContext = new AsyncLocalStorage<{ lease: RuntimeLease; signal: AbortSignal; userId: string; stepId?: string; usageCounts: Map<string, number>; coordinator: RunCoordinator }>();
+async function coordinateWrite<T>(operation: () => Promise<T>): Promise<T> {
+  const coordinator = runtimeContext.getStore()?.coordinator;
+  if (!coordinator) return operation();
+  const next = coordinator.writes.then(operation);
+  coordinator.writes = next.then(() => {}, () => {});
+  return next;
+}
+let usageRepository: PostgresWorkspaceRepository | undefined;
+let integrationRepository: PostgresIntegrationRepository | undefined;
+let platformRepository: PlatformRepository | undefined;
+export function configurePlatformRuntime(repository: PlatformRepository | undefined): void { platformRepository = repository; }
+let connectorService: ConnectorService | undefined;
+export function configureIntegrationRuntime(repository: PostgresIntegrationRepository | undefined, connectors: ConnectorService | undefined): void { integrationRepository = repository; connectorService = connectors; }
+function integrationOwner(exec: PersonaExecutionRecord): { tenantId: string; userId: string } {
+  if (!exec.userId || !exec.tenantId) throw new ExecutionOutcomeError('failed', 'Verified execution owner is required');
+  return { tenantId: exec.tenantId, userId: exec.userId };
+}
+export function configureUsageRepository(value: PostgresWorkspaceRepository | undefined): void { usageRepository = value; }
+class ExecutionSuspended extends Error {}
+export function configureRuntimeRepository(repository: PostgresRunRepository | undefined): void { runtimeRepository = repository; }
 const EXEC_TABLE = 'persona_executions';
 const KPI_TABLE = 'agent_kpis';
 const AAR_TABLE = 'after_action_reports';
@@ -95,11 +229,19 @@ const RETRAIN_TABLE = 'retraining_flags';
 export interface AfterActionReport {
   id: string;
   executionId: string;
+  /**
+   * The run's owner, copied from it so reads are scoped like the run itself.
+   * Optional only because reports persisted before owners were recorded carry
+   * none; those resolve through their execution or are not readable at all.
+   */
+  tenantId?: string;
+  userId?: string;
+  requiredPersonas?: string[];
   persona: string;
   skillName: string;
   generatedAt: string;
   /** Overall execution status */
-  outcome: 'success' | 'partial' | 'failure';
+  outcome: 'success' | 'partial' | 'failure' | 'simulated';
   /** How long the entire execution took */
   totalDurationMs: number;
   /** Total token cost across all steps */
@@ -114,7 +256,13 @@ export interface AfterActionReport {
     stepName: string;
     status: string;
     durationMs: number;
-    qualityScore: number;
+    /**
+     * Undefined when the step produced no output to score (e.g. it failed).
+     * Deliberately not defaulted to 0 — a rendered "0/10" claims a measurement
+     * that says the agent performed terribly, when the truth is that nothing
+     * was measured. Renderers show an em-dash for undefined.
+     */
+    qualityScore?: number;
     tokenCost: number;
     handoffValid: boolean;
     handoffWarnings: string[];
@@ -158,28 +306,29 @@ export interface RetrainingFlag {
 }
 
 /** Initialize persistence — call from server.ts with the gateway store */
-export function initPersonaStore(store: Store): void {
+export async function initPersonaStore(store: Store): Promise<void> {
+  if (runtimeRepository) { backingStore = null; return; }
   backingStore = store;
   // Restore executions from persistent store
-  const saved = store.all(EXEC_TABLE);
+  const saved = await readAll(store, EXEC_TABLE);
   for (const row of saved) {
     const rec = row as unknown as PersonaExecutionRecord;
-    if (rec.id) executions.set(rec.id, rec);
+    if (rec.id && rec.tenantId && rec.schemaVersion === 1 && rec.mode) executions.set(executionKey(rec.tenantId, rec.id), rec);
   }
   // Restore KPIs from persistent store
-  const savedKPIs = store.all(KPI_TABLE);
+  const savedKPIs = await readAll(store, KPI_TABLE);
   for (const row of savedKPIs) {
     const kpi = row as unknown as AgentKPI;
     if (kpi.agentId) agentKPIs.set(kpi.agentId, kpi);
   }
   // Restore after-action reports
-  const savedAARs = store.all(AAR_TABLE);
+  const savedAARs = await readAll(store, AAR_TABLE);
   for (const row of savedAARs) {
     const aar = row as unknown as AfterActionReport;
     if (aar.id) afterActionReports.set(aar.id, aar);
   }
   // Restore retraining flags
-  const savedFlags = store.all(RETRAIN_TABLE);
+  const savedFlags = await readAll(store, RETRAIN_TABLE);
   for (const row of savedFlags) {
     const flag = row as unknown as RetrainingFlag;
     if (flag.agentId) retrainingFlags.set(flag.agentId, flag);
@@ -192,12 +341,27 @@ export function initPersonaStore(store: Store): void {
   }
 
   // Wire agent memory persistence
-  initAgentMemory(store);
+  await initAgentMemory(store);
 }
 
 /** Persist an execution record to backing store */
-function persistExec(exec: PersonaExecutionRecord): void {
-  executions.set(exec.id, exec);
+async function persistExec(exec: PersonaExecutionRecord): Promise<void> {
+  const context = runtimeContext.getStore();
+  if (runtimeRepository && context) {
+    await coordinateWrite(async () => {
+      const snapshot = structuredClone(exec) as unknown as RuntimeSnapshot;
+      if (exec.status === 'failed') {
+        const retryable = exec.steps.some(step => !step.nodeRetryHandled && (step.errorClass === 'provider_unavailable' || step.errorClass === 'circuit_open'));
+        const next = await runtimeRepository!.fail(context.lease, snapshot, exec.steps.find(step => step.error)?.error ?? 'Execution failed', retryable);
+        Object.assign(exec, next);
+      } else {
+        await runtimeRepository!.checkpoint(context.lease, snapshot);
+      }
+    });
+  }
+  // Durable runs live in the repository; the map entry is runDurableExecution's
+  // to add and remove, so a late checkpoint cannot resurrect it.
+  if (!runtimeRepository) executions.set(executionKey(exec.tenantId, exec.id), exec);
   if (backingStore) {
     const existing = backingStore.get(EXEC_TABLE, exec.id);
     if (existing) {
@@ -260,9 +424,25 @@ async function callLLMUnified(
   persona?: string,
   skillComplexity?: string
 ): Promise<LLMResponse> {
+  const context = runtimeContext.getStore();
+  if (context) {
+    if (!usageRepository || !context.stepId) throw new Error('Durable usage context is required');
+    const owner = { tenantId: context.lease.tenantId, userId: context.userId };
+    return callLLMProvider({ signal: context.signal, systemPrompt, userPrompt, provider, model: modelId, maxTokens: 4096, usage: {
+      reserve: request => {
+        const sequence = (context.usageCounts.get(context.stepId!) ?? 0) + 1;
+        if (sequence >= 1000) throw new Error('Provider invocation limit reached');
+        context.usageCounts.set(context.stepId!, sequence);
+        return usageRepository!.reserveUsage(owner, context.lease.runId, context.stepId!, context.lease.attempt * 1000 + sequence, estimateRequestMicros(request));
+      },
+      settle: (id, response) => usageRepository!.settleUsage(owner, id, Math.ceil(response.cost * 1_000_000)),
+      release: id => usageRepository!.releaseUsage(owner, id),
+    } });
+  }
   // Use model router for intelligent routing when no specific model requested
   if (!modelId) {
     const result = await routedLLMCall(systemPrompt, userPrompt, {
+      signal: runtimeContext.getStore()?.signal,
       preferredProvider: provider,
       maxCostPerExec: 1.0,
       maxCostPerHour: parseFloat(process.env.COST_BUDGET_HOURLY_USD ?? '50'),
@@ -277,6 +457,7 @@ async function callLLMUnified(
 
   // Direct provider call when model is explicitly specified
   const response = await tracedLLMCall({
+    signal: runtimeContext.getStore()?.signal,
     provider,
     model: modelId,
     systemPrompt,
@@ -294,7 +475,7 @@ async function callLLMUnified(
 // ---------------------------------------------------------------------------
 
 function generateSandboxOutput(
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  persona: WorkflowPersona,
   skillName: string,
   step: SkillStep,
   inputs: Record<string, unknown>,
@@ -872,7 +1053,8 @@ ${inputSummary ? `## Inputs Received\n${inputSummary}` : ''}
 // ---------------------------------------------------------------------------
 
 function buildStepPrompt(
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  tenantId: string,
+  persona: WorkflowPersona,
   skillName: string,
   step: SkillStep,
   inputs: Record<string, unknown>,
@@ -884,7 +1066,7 @@ function buildStepPrompt(
     .filter(([k, v]) => v !== undefined && v !== '' && v !== null)
     .map(([k, v]) => {
       const label = k.replace(/_/g, ' ');
-      const val = Array.isArray(v) ? v.join(', ') : String(v);
+      const val = typeof v === 'string' ? v : JSON.stringify(v);
       return `**${label}**: ${val}`;
     })
     .join('\n');
@@ -906,7 +1088,7 @@ function buildStepPrompt(
     const outputSection = agentIdentity.handoffOutputSchema.length > 0
       ? `\n\nExpected Output Sections:\n${agentIdentity.handoffOutputSchema.map(s => `- ${s}`).join('\n')}`
       : '';
-    const memoryContext = buildAgentMemoryContext(agentIdentity.id);
+    const memoryContext = runtimeRepository ? '' : buildAgentMemoryContext(tenantId, agentIdentity.id);
 
     system = `${agentIdentity.systemPrompt}
 
@@ -987,7 +1169,7 @@ function selectBestAgent(defaultAgentId: string, persona: string): string {
   if (!defaultAgent) return defaultAgentId;
 
   const candidates = getAgentsByPersona(defaultAgent.persona)
-    .filter(a => a.id !== defaultAgentId && a.rank === defaultAgent.rank)
+    .filter(a => a.id !== defaultAgentId && a.rank === defaultAgent.rank && a.role === defaultAgent.role)
     .map(a => ({ agent: a, kpi: agentKPIs.get(a.id) }))
     .filter(c => c.kpi && c.kpi.totalExecutions >= 3 && c.kpi.avgQualityScore > kpi.avgQualityScore)
     .sort((a, b) => (b.kpi!.avgQualityScore - a.kpi!.avgQualityScore));
@@ -1003,7 +1185,8 @@ function selectBestAgent(defaultAgentId: string, persona: string): string {
 
 async function processSkillSteps(
   execId: string,
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  tenantId: string,
+  persona: WorkflowPersona,
   skill: PersonaSkillDef,
   inputs: Record<string, unknown>,
   simulate: boolean,
@@ -1011,14 +1194,15 @@ async function processSkillSteps(
   provider?: LLMProviderId,
   modelId?: string
 ): Promise<void> {
-  const exec = executions.get(execId);
-  if (!exec) return;
+  const exec = executions.get(executionKey(tenantId, execId));
+  if (!exec) throw new Error('Execution is unavailable');
 
+  assertExecutionTransition(exec.status, 'running');
   exec.status = 'running';
 
   // Determine execution mode: if skill has edges or steps have dependsOn, use DAG
   const hasEdges = skill.edges && skill.edges.length > 0;
-  const hasDependsOn = skill.steps.some(s => s.dependsOn && s.dependsOn.length > 0);
+  const hasDependsOn = skill.executionMode !== 'sequential' && skill.steps.some(s => s.dependsOn && s.dependsOn.length > 0);
   if (hasEdges || hasDependsOn) {
     exec.executionMode = 'dag';
     if (hasEdges) exec.edges = skill.edges;
@@ -1040,16 +1224,16 @@ async function processSkillSteps(
     }
   }
 
-  persistExec(exec);
+  await persistExec(exec);
 
-  const previousOutputs: Record<string, string> = {};
+  const previousOutputs: Record<string, string> = { ...exec.outputs };
   let totalTokenCost = 0;
   let totalLatencyMs = 0;
   const qualityScores: number[] = [];
   /** Track which agents were swapped via adaptive routing */
   const routedAgents = new Set<string>();
 
-  if (exec.executionMode === 'dag') {
+  if (runtimeRepository || exec.executionMode === 'dag') {
     // ─── DAG Execution: parallel steps with dependency resolution ───
     await processDAGSteps(exec, skill, persona, inputs, simulate, customPrompt, provider, modelId, previousOutputs, qualityScores, routedAgents);
     totalTokenCost = exec.steps.reduce((s, st) => s + (st.tokenCost ?? 0), 0);
@@ -1059,7 +1243,7 @@ async function processSkillSteps(
     for (let i = 0; i < skill.steps.length; i++) {
       const skillStep = skill.steps[i];
       const stepRecord = exec.steps[i];
-      if (!skillStep || !stepRecord) continue;
+      if (!skillStep || !stepRecord || ['completed', 'simulated'].includes(stepRecord.status)) continue;
 
       const result = await executeSingleStep(
         exec, persona, skill.name, skillStep, stepRecord, inputs, previousOutputs,
@@ -1079,7 +1263,7 @@ async function processSkillSteps(
           stepRecord.handoffValid = handoffResult.valid;
           stepRecord.handoffWarnings = handoffResult.warnings;
 
-          if (!handoffResult.valid && !simulate) {
+          if (!handoffResult.valid && !simulate && !skillStep.requiresApproval && skillStep.kind === 'llm') {
             console.warn(`[handoff-enforcement] ${skillStep.agent} → ${nextStep.agent} FAILED — missing: ${handoffResult.missingFields.join(', ')}. Retrying with explicit instructions.`);
             // Retry once with explicit handoff instructions
             const retryResult = await retryStepWithHandoffInstructions(
@@ -1100,41 +1284,58 @@ async function processSkillSteps(
         }
       }
 
-      // Stop on failure
-      if (stepRecord.status === 'failed') break;
+      if (!simulate && stepRecord.handoffValid === false) {
+        stepRecord.status = 'inconclusive';
+        stepRecord.error = 'Required handoff contract was not satisfied';
+        delete stepRecord.qualityScore;
+        delete exec.outputs[skillStep.outputKey];
+        delete previousOutputs[skillStep.outputKey];
+      }
 
-      persistExec(exec);
+      // Stop on failure
+      if (!['completed', 'simulated'].includes(stepRecord.status)) {
+        for (const remaining of exec.steps.slice(i + 1)) { remaining.status = 'skipped'; remaining.error = 'Upstream step did not complete'; }
+        break;
+      }
+
+      await persistExec(exec);
     }
   }
 
   // Aggregate metrics
-  exec.totalTokenCost = totalTokenCost;
-  exec.totalLatencyMs = totalLatencyMs;
-  exec.avgQualityScore = qualityScores.length > 0
-    ? Math.round((qualityScores.reduce((a, b) => a + b, 0) / qualityScores.length) * 10) / 10
+  exec.totalTokenCost = exec.steps.reduce((sum, step) => sum + (step.tokenCost ?? 0), 0);
+  exec.totalTokensUsed = exec.steps.reduce((sum, step) => sum + (step.tokensUsed ?? 0), 0);
+  exec.totalLatencyMs = exec.steps.reduce((sum, step) => sum + (step.latencyMs ?? 0), 0);
+  const measuredScores = exec.steps.filter(step => step.status === 'completed' && step.qualityScore !== undefined).map(step => step.qualityScore!);
+  exec.avgQualityScore = measuredScores.length > 0
+    ? Math.round((measuredScores.reduce((a, b) => a + b, 0) / measuredScores.length) * 10) / 10
     : undefined;
 
-  const anyFailed = exec.steps.some((s) => s.status === 'failed');
-  exec.status = anyFailed ? 'failed' : 'completed';
+  const status = aggregateExecutionStatus(exec.steps.map(step => step.status), exec.mode);
+  exec.status = (status === 'completed' || status === 'simulated') && skill.outputs.some(key => !exec.outputs[key] && !exec.steps.some(step => step.outputKey === key && step.skipReason === 'condition')) ? 'inconclusive' : status;
+  const anyFailed = !['completed', 'simulated'].includes(exec.status);
   exec.completedAt = new Date().toISOString();
-  persistExec(exec);
+  await persistExec(exec);
 
   // Record to KPI store
-  recordExecutionMetrics(exec);
+  if (!simulate && !runtimeRepository) recordExecutionMetrics(exec);
 
   // Generate After-Action Report
-  generateAfterActionReport(exec, routedAgents);
+  if (!runtimeRepository) generateAfterActionReport(exec, routedAgents);
 
   // Check for retraining triggers
-  checkRetrainingTriggers(exec);
+  if (!simulate && !runtimeRepository) checkRetrainingTriggers(exec);
 
   // ── UTCP: Finalize task packet ──
   try {
     if (exec.utcpTaskId) {
       const packet = getPacket(exec.utcpTaskId);
       if (packet) {
+        // Confidence is reported only when it was measured. The previous `: 0.8`
+        // stamped a failed run with 80% confidence, which is exactly the kind of
+        // invented number that makes an outage look like a success downstream.
         const updated = updatePacketStatus(packet, anyFailed ? 'failed' : 'completed', {
-          confidence: exec.avgQualityScore ? exec.avgQualityScore / 10 : 0.8,
+          ...(exec.avgQualityScore !== undefined ? { confidence: exec.avgQualityScore / 10 } : {}),
           progress: 100,
         } as any);
         storePacket(updated);
@@ -1143,13 +1344,25 @@ async function processSkillSteps(
   } catch {}
 
   // ── Memory Graph: Record execution + agent performance + entity graph ──
-  try {
+  if (!simulate && !runtimeRepository) try {
+    // Did this run fail because of our infrastructure rather than the skill?
+    const INFRA_CLASSES: StepErrorClass[] = [
+      'provider_unavailable',
+      'provider_not_configured',
+      'budget_exceeded',
+      'circuit_open',
+    ];
+    const infraFailure = exec.steps.some(
+      s => s.status === 'failed' && s.errorClass !== undefined && INFRA_CLASSES.includes(s.errorClass),
+    );
+
     const execRecord = {
       userId: exec.userId || 'system',
       skillId: exec.skillId,
       skillName: exec.skillName,
       personaId: exec.persona,
       success: !anyFailed,
+      infraFailure,
       runtimeSec: (exec.totalLatencyMs || 0) / 1000,
       cost: exec.totalTokenCost || 0,
       agentsUsed: exec.steps.map(s => s.agent),
@@ -1160,22 +1373,30 @@ async function processSkillSteps(
     memoryGraph.buildGraphFromExecution({ ...execRecord, id: exec.id, ts: new Date().toISOString() });
 
     for (const step of exec.steps) {
-      if (step.status === 'completed' || step.status === 'approval_required') {
-        memoryGraph.updateAgentPerformance(step.agent, step.agentCallSign || step.agent, '', {
-          success: true,
-          confidence: (step.qualityScore || 5) / 10,
-          latencyMs: step.latencyMs || 0,
-          costUsd: step.tokenCost || 0,
-          tokens: 0,
-          skillId: exec.skillId,
-        });
-      }
+      if (step.status !== 'completed' && step.status !== 'approval_required') continue;
+      // `avgConfidence` is a measured aggregate. The previous `|| 5` seeded it
+      // with an invented 0.5 whenever a score was missing — and also swallowed a
+      // legitimate score of 0. A step with no measured quality contributes
+      // nothing rather than a guess.
+      if (step.qualityScore === undefined) continue;
+      memoryGraph.updateAgentPerformance(step.agent, step.agentCallSign || step.agent, '', {
+        success: true,
+        confidence: step.qualityScore / 10,
+        latencyMs: step.latencyMs || 0,
+        costUsd: step.tokenCost || 0,
+        tokens: 0,
+        skillId: exec.skillId,
+      });
+    }
+    if (exec.status === 'completed') for (const step of exec.steps) {
+      const output = step.outputKey && exec.outputs[step.outputKey];
+      if (output) extractAndStoreMemory(exec.tenantId, step.agent, exec.id, step.stepName, output);
     }
   } catch {}
 
   // ── Event Bus: Execution completed ──
-  eventBus.emit('execution.completed', {
-    execId: exec.id, persona: exec.persona, status: exec.status,
+  if (!runtimeRepository) eventBus.emit(exec.status === 'completed' ? 'execution.completed' : exec.status === 'simulated' ? 'execution.simulated' : 'execution.failed', {
+    execId: exec.id, tenantId: exec.tenantId, persona: exec.persona, status: exec.status, mode: exec.mode,
     utcpTaskId: exec.utcpTaskId, cost: exec.totalTokenCost,
   }).catch(() => {});
 }
@@ -1187,7 +1408,7 @@ async function processSkillSteps(
 async function processDAGSteps(
   exec: PersonaExecutionRecord,
   skill: PersonaSkillDef,
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  persona: WorkflowPersona,
   inputs: Record<string, unknown>,
   simulate: boolean,
   customPrompt: string | undefined,
@@ -1197,42 +1418,75 @@ async function processDAGSteps(
   qualityScores: number[],
   routedAgents: Set<string>
 ): Promise<void> {
-  const completedSteps = new Set<string>();
-  const failedSteps = new Set<string>();
-  const MAX_ITERATIONS = skill.steps.length + 1; // safety bound
+  const context = runtimeContext.getStore();
+  const MAX_ITERATIONS = skill.steps.reduce((limit, step) => limit + (step.retry?.maxAttempts ?? 1), 1); // safety bound
 
   for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+    if (context?.signal.aborted) throw new LeaseLostError();
+    if (runtimeRepository && context) {
+      const children = await runtimeRepository.children(exec.tenantId, exec.id);
+      context.coordinator.children = new Map(children.map(child => [child.id, child]));
+      for (const decision of await runtimeRepository.decisions(exec.tenantId, exec.id)) {
+        const step = exec.steps.find(value => value.stepId === decision.stepId);
+        if (step?.status === 'approval_required') {
+          step.approvalDecision = { approved: decision.approved, approverId: decision.approverId };
+          step.status = decision.approved ? 'pending' : 'rejected';
+          if (!decision.approved) step.error = decision.reason ?? 'Approval was rejected';
+        }
+      }
+    }
+    Object.assign(previousOutputs, exec.outputs);
+    if (exec.steps.some(step => ['failed','rejected','cancelled','inconclusive','unsupported'].includes(step.status))) {
+      for (const step of exec.steps) if (['pending','approval_required'].includes(step.status)) { step.status = 'skipped'; step.skipReason = 'dependency'; }
+      break;
+    }
     // Find ready steps: not yet completed/failed, all dependencies satisfied
     const readySteps: Array<{ skillStep: typeof skill.steps[0]; stepRecord: typeof exec.steps[0] }> = [];
 
-    for (let i = 0; i < skill.steps.length; i++) {
-      const ss = skill.steps[i]!;
-      const sr = exec.steps[i]!;
-      if (completedSteps.has(ss.id) || failedSteps.has(ss.id)) continue;
-      if (sr.status === 'running') continue;
-
-      const deps = sr.dependsOn ?? [];
-      const allDepsMet = deps.every(d => completedSteps.has(d));
-      const anyDepFailed = deps.some(d => failedSteps.has(d));
-
-      if (anyDepFailed) {
-        sr.status = 'skipped';
-        sr.completedAt = new Date().toISOString();
-        sr.error = 'Skipped — upstream dependency failed';
-        failedSteps.add(ss.id);
-        persistExec(exec);
-        continue;
+    const dependencies = skill.steps.flatMap(step => (step.dependsOn ?? []).map(from => {
+      const source = skill.steps.find(value => value.id === from)!;
+      const state = exec.steps.find(value => value.stepId === from)!;
+      let enabled = true;
+      if (state.status === 'completed' || state.status === 'simulated') {
+        if (source.condition) enabled = step.id === (state.branchDecision ? source.condition.trueStep : source.condition.falseStep);
+        const expression = skill.edges?.find(edge => edge.from === from && edge.to === step.id)?.condition;
+        if (expression) enabled = enabled && Boolean(evalSafeExpression(expression, { inputs, outputs: previousOutputs }));
       }
-
-      if (allDepsMet) {
-        readySteps.push({ skillStep: ss, stepRecord: sr });
+      return { from, to: step.id, enabled };
+    }));
+    const plan = planGraph(exec.steps.map(step => ({ id: step.stepId, status: step.status })), dependencies);
+    for (const id of [...plan.skipped, ...plan.blocked]) {
+      const record = exec.steps.find(step => step.stepId === id)!;
+      record.status = 'skipped'; record.completedAt = new Date().toISOString();
+      record.skipReason = plan.blocked.includes(id) ? 'dependency' : 'condition';
+      if (record.skipReason === 'dependency') record.error = 'Skipped — upstream dependency failed';
+    }
+    for (const id of plan.ready) {
+      const skillStep = skill.steps.find(step => step.id === id)!;
+      const stepRecord = exec.steps.find(step => step.stepId === id)!;
+      if (stepRecord.resumeAfter && new Date(stepRecord.resumeAfter).getTime() > Date.now() || stepRecord.waitUntil && new Date(stepRecord.waitUntil).getTime() > Date.now()) continue;
+      if (stepRecord.childRunId) {
+        const child = context?.coordinator.children.get(stepRecord.childRunId);
+        if (!child) throw new ExecutionOutcomeError('inconclusive', 'Child checkpoint is unavailable');
+        if (!isTerminalExecutionStatus(child.status)) continue;
       }
+      readySteps.push({ skillStep, stepRecord });
+      if (readySteps.length >= (exec.executionMode === 'sequential' ? 1 : skill.maxConcurrency ?? 4)) break;
     }
 
-    if (readySteps.length === 0) break; // all done or deadlocked
+    if (readySteps.length === 0) {
+      if (runtimeRepository && context && exec.steps.some(step => step.status === 'approval_required' || step.status === 'pending' && (step.childRunId || step.waitUntil || step.resumeAfter))) {
+        await coordinateWrite(() => runtimeRepository!.park(context.lease, structuredClone(exec) as unknown as RuntimeSnapshot));
+        exec.status = 'paused';
+        throw new ExecutionSuspended('Run has durable continuations');
+      }
+      break; // all done or deadlocked
+    }
 
+    for (const { stepRecord } of readySteps) stepRecord.dispatchState = 'reserved';
+    await persistExec(exec);
     // Execute all ready steps in parallel
-    await Promise.all(
+    const settled = await Promise.allSettled(
       readySteps.map(async ({ skillStep, stepRecord }) => {
         const result = await executeSingleStep(
           exec, persona, skill.name, skillStep, stepRecord, inputs, previousOutputs,
@@ -1240,15 +1494,11 @@ async function processDAGSteps(
         );
         if (result.qualityScore !== undefined) qualityScores.push(result.qualityScore);
 
-        if (stepRecord.status === 'completed' || stepRecord.status === 'approval_required') {
-          completedSteps.add(skillStep.id);
-        } else {
-          failedSteps.add(skillStep.id);
-        }
       })
     );
-
-    persistExec(exec);
+    const failure = settled.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failure) throw failure.reason;
+    await persistExec(exec);
   }
 }
 
@@ -1262,11 +1512,71 @@ interface StepResult {
   qualityScore?: number;
 }
 
-async function executeSingleStep(
+function stepInputContext(exec: PersonaExecutionRecord, stepId: string, inputs: Record<string, unknown>, outputs: Record<string, string>) {
+  const ancestors = new Set<string>();
+  const pending = [...(exec.steps.find(step => step.stepId === stepId)?.dependsOn ?? [])];
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (ancestors.has(id)) continue;
+    const step = exec.steps.find(value => value.stepId === id);
+    if (!step) throw new Error('Input binding references an unknown dependency');
+    ancestors.add(id);
+    pending.push(...(step.dependsOn ?? []));
+  }
+  const allowed = exec.steps.filter(step => ancestors.has(step.stepId) && step.outputKey && Object.hasOwn(outputs, step.outputKey));
+  const available = Object.fromEntries(allowed.map(step => [step.outputKey!, outputs[step.outputKey!]!]));
+  const values = Object.fromEntries(allowed.map(step => {
+    const raw = outputs[step.outputKey!]!;
+    let output: unknown = raw;
+    try { output = JSON.parse(raw); } catch {}
+    return [step.stepId, { output, status: step.status }];
+  }));
+  return { inputs, trigger: inputs.trigger, variables: inputs.variables, outputs: available, steps: values };
+}
+
+async function withAgentCapacity<T>(exec: PersonaExecutionRecord, step: PersonaExecutionRecord['steps'][number], operation: () => Promise<T>): Promise<T> {
+  const context = runtimeContext.getStore();
+  if (!context || !runtimeRepository) return operation();
+  if (!await runtimeRepository.acquireAgent(context.lease, step.stepId, step.agent)) {
+    step.status = 'pending';
+    step.resumeAfter = new Date(Date.now() + 500).toISOString();
+    throw new ExecutionSuspended('Waiting for agent capacity');
+  }
+  try { return await operation(); } finally { await runtimeRepository.releaseAgent(context.lease, step.stepId); }
+}
+
+async function executeSingleStep(...args: Parameters<typeof executeSingleStepBody>): Promise<StepResult> {
+  const context = runtimeContext.getStore();
+  if (!context) return executeSingleStepBody(...args);
+  const timeout = new AbortController();
+  const timer = args[3].timeoutMs ? setTimeout(() => timeout.abort(new ExecutionOutcomeError(args[3].kind === 'tool_effect' ? 'inconclusive' : 'failed', 'Node deadline exceeded', args[3].kind === 'llm')), args[3].timeoutMs) : undefined;
+  const operation = runtimeContext.run({ ...context, signal: AbortSignal.any([context.signal, timeout.signal]), stepId: args[3].id }, async () => {
+    let result: StepResult;
+    try { result = await withAgentCapacity(args[0], args[4], () => executeSingleStepBody(...args)); }
+    catch (error) {
+      if (!(error instanceof ExecutionSuspended)) throw error;
+      result = { tokenCost: args[4].tokenCost ?? 0, latencyMs: args[4].latencyMs ?? 0 };
+    }
+    delete args[4].dispatchState;
+    try { await persistExec(args[0]); } catch { throw new LeaseLostError(); }
+    const policy = args[3].retry;
+    const step = args[4];
+    if (policy && step.status === 'failed' && step.retryable && !step.approvalDecision?.approved && (step.retryCount ?? 0) + 1 < policy.maxAttempts) {
+      step.retryCount = (step.retryCount ?? 0) + 1;
+      const multiplier = policy.strategy === 'fixed' ? 1 : policy.strategy === 'exponential' ? 2 ** (step.retryCount - 1) : step.retryCount;
+      step.status = 'pending'; step.resumeAfter = new Date(Date.now() + Math.min(60_000, policy.backoffMs * multiplier)).toISOString();
+      delete step.error;
+    }
+    return result;
+  });
+  try { return await operation; } finally { if (timer) clearTimeout(timer); }
+}
+
+async function executeSingleStepBody(
   exec: PersonaExecutionRecord,
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  persona: WorkflowPersona,
   skillName: string,
-  skillStep: { id: string; name: string; agent: string; tool?: string; outputKey: string; requiresApproval?: boolean },
+  skillStep: SkillStep,
   stepRecord: PersonaExecutionRecord['steps'][0],
   inputs: Record<string, unknown>,
   previousOutputs: Record<string, string>,
@@ -1276,8 +1586,9 @@ async function executeSingleStep(
   modelId?: string,
   routedAgents?: Set<string>
 ): Promise<StepResult> {
+  runtimeContext.getStore()?.signal.throwIfAborted();
   // Adaptive agent routing
-  const resolvedAgentId = selectBestAgent(skillStep.agent, persona);
+  const resolvedAgentId = runtimeRepository ? skillStep.agent : selectBestAgent(skillStep.agent, persona);
   const agentIdentity = getAgentIdentity(resolvedAgentId);
   const wasRouted = resolvedAgentId !== skillStep.agent;
   if (wasRouted && routedAgents) routedAgents.add(resolvedAgentId);
@@ -1289,11 +1600,12 @@ async function executeSingleStep(
   }
 
   stepRecord.status = 'running';
+  delete stepRecord.resumeAfter;
+  delete stepRecord.dispatchState;
   stepRecord.startedAt = new Date().toISOString();
-  persistExec(exec);
 
   // ── A2A: Create delegation message from previous agent ──
-  try {
+  if (!simulate && !runtimeRepository) try {
     const stepIdx = exec.steps.indexOf(stepRecord);
     if (stepIdx > 0) {
       const prev = exec.steps[stepIdx - 1];
@@ -1309,48 +1621,184 @@ async function executeSingleStep(
   } catch {}
 
   // ── Event Bus: Step started ──
-  eventBus.emit('execution.step.started', { execId: exec.id, stepId: skillStep.id, agent: resolvedAgentId }).catch(() => {});
+  !runtimeRepository && eventBus.emit(simulate ? 'execution.step.simulating' : 'execution.step.started', { execId: exec.id, tenantId: exec.tenantId, mode: exec.mode, stepId: skillStep.id, agent: resolvedAgentId }).catch(() => {});
 
   const stepStart = Date.now();
+  const publishedOutputs = previousOutputs;
+  let llmResponse: LLMResponse | undefined;
+  let usageRecorded = false;
 
   try {
+    const artifactContext = integrationRepository ? await resolveArtifactContext(integrationRepository, integrationOwner(exec), inputs) : {};
+    const boundContext = { ...stepInputContext(exec, stepRecord.stepId, inputs, exec.outputs), artifacts: artifactContext };
+    previousOutputs = boundContext.outputs;
+    if (skillStep.inputBindings) inputs = resolveGraphInput(skillStep.inputBindings, boundContext) as Record<string, unknown>;
+    stepRecord.inputBindings = inputs;
+    await persistExec(exec);
     let output: string;
-    let llmResponse: LLMResponse | undefined;
+    let childCost = 0;
+    let childTokens = 0;
+    let approvalHandled = stepRecord.approvalDecision?.approved === true;
+    const requestApproval = async () => {
+      if (approvalHandled) return;
+      stepRecord.status = 'approval_required';
+      const context = runtimeContext.getStore();
+      if (runtimeRepository && context) {
+        if (typeof output === 'string') stepRecord.draftOutput = output;
+        throw new ExecutionSuspended('Waiting for a durable approval decision');
+      }
+      exec.status = 'paused';
+      await persistExec(exec);
+      const decision = await waitForApproval(exec.id, stepRecord.stepId, { stepName: skillStep.name, requesterId: resolvedAgentId });
+      if (!decision.approved) throw new ExecutionOutcomeError('rejected', decision.reason ?? 'Rejected by approver');
+      exec.status = 'running';
+      stepRecord.status = 'running';
+      approvalHandled = true;
+    };
 
-    if (simulate) {
-      await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
+    if (skillStep.kind === 'subworkflow' || skillStep.kind === 'planner') {
+      const context = runtimeContext.getStore();
+      if (!context || !runtimeRepository) throw new ExecutionOutcomeError('unsupported', 'Subworkflows require a frozen definition and durable storage');
+      if (skillStep.requiresApproval && !simulate) await requestApproval();
+      if (!stepRecord.childRunId) {
+        let definition: CompiledDefinition;
+        if (skillStep.kind === 'planner') {
+          if (simulate || !skillStep.planCandidates?.length) throw new ExecutionOutcomeError('unsupported', 'Simulation requires an explicit validated task plan');
+          if (!stepRecord.planDraft) {
+            const manifest = skillStep.planCandidates.map(candidate => ({ id: candidate.id, persona: candidate.persona, inputs: candidate.inputs, agents: candidate.steps.map(step => step.agent) }));
+            llmResponse = await callLLMUnified('Return only a JSON task plan using the supplied candidate skills. Never invent skills, agents, required inputs or dependencies. Format: {"reasoning":"...","tasks":[{"id":"task_1","skill":"catalog-id","persona":"engineering","dependencies":[],"input":{}}]}. Use 1-12 tasks. Refer to previous results with exact structured bindings.', JSON.stringify({ goal: inputs, candidates: manifest }), provider, modelId, persona);
+            stepRecord.planDraft = llmResponse.content;
+            stepRecord.tokenCost = (stepRecord.tokenCost ?? 0) + llmResponse.cost;
+            stepRecord.tokensUsed = (stepRecord.tokensUsed ?? 0) + llmResponse.inputTokens + llmResponse.outputTokens;
+            usageRecorded = true;
+            await persistExec(exec);
+          }
+          definition = compileTaskPlan(stepRecord.planDraft, skillStep.planCandidates as CompiledDefinition[], persona);
+        } else {
+          if (!skillStep.subworkflow) throw new ExecutionOutcomeError('unsupported', 'Subworkflow definition is missing');
+          definition = compileDefinition(skillStep.subworkflow.definition);
+        }
+        const prepared = preparePersonaExecution(exec.tenantId, definition.persona, definition, inputs, exec.userId, simulate, undefined, provider, modelId);
+        await coordinateWrite(async () => {
+          const child = await runtimeRepository!.spawnChild(context.lease, structuredClone(exec) as unknown as RuntimeSnapshot, stepRecord.stepId, prepared.exec as unknown as RuntimeSnapshot, { ...prepared.definition }, prepared.payload);
+          stepRecord.childRunId = child.id;
+          stepRecord.status = 'pending';
+        });
+        throw new ExecutionSuspended('Waiting for child run');
+      }
+      const child = context.coordinator.children.get(stepRecord.childRunId);
+      if (!child || !isTerminalExecutionStatus(child.status)) { stepRecord.status = 'pending'; throw new ExecutionSuspended('Waiting for child run'); }
+      if (!['completed','simulated'].includes(child.status) || child.mode !== exec.mode) throw new ExecutionOutcomeError(child.status === 'cancelled' ? 'cancelled' : child.status === 'rejected' ? 'rejected' : child.status === 'inconclusive' ? 'inconclusive' : 'failed', `Required child ${child.id} did not complete`);
+      childCost = Number(child.totalTokenCost ?? 0);
+      childTokens = Number(child.totalTokensUsed ?? 0);
+      output = JSON.stringify(Object.fromEntries(Object.entries(child.outputs).map(([key, value]) => { let decoded: unknown = value; try { decoded = JSON.parse(value); } catch {} return [key, decoded]; })));
+    } else if (skillStep.kind === 'condition') {
+      if (!skillStep.condition) throw new ExecutionOutcomeError('unsupported', 'Condition contract is missing');
+      stepRecord.branchDecision = Boolean(evalSafeExpression(skillStep.condition.expression, { ...boundContext, inputs }));
+      output = JSON.stringify(stepRecord.branchDecision);
+    } else if (skillStep.kind === 'transform') {
+      const transformed = skillStep.transformExpression !== undefined ? evalSafeExpression(skillStep.transformExpression, { ...boundContext, inputs }) : resolveGraphInput(skillStep.transform ?? inputs, { ...boundContext, inputs });
+      if (transformed === undefined || typeof transformed === 'number' && !Number.isFinite(transformed)) throw new ExecutionOutcomeError('failed', 'Transform did not produce a defined value');
+      output = JSON.stringify(transformed);
+    } else if (skillStep.kind === 'join') {
+      output = JSON.stringify(previousOutputs);
+    } else if (skillStep.kind === 'approval') {
+      if (!simulate) await requestApproval();
+      output = JSON.stringify({ approved: !simulate && approvalHandled, approverId: stepRecord.approvalDecision?.approverId, simulated: simulate });
+    } else if (skillStep.kind === 'wait') {
+      if (!simulate) {
+        const context = runtimeContext.getStore();
+        if (!context || !runtimeRepository) throw new ExecutionOutcomeError('unsupported', 'Wait nodes require durable storage');
+        stepRecord.waitUntil ??= new Date(Date.now() + (skillStep.waitMs ?? 0)).toISOString();
+        if (new Date(stepRecord.waitUntil).getTime() > Date.now()) {
+          stepRecord.status = 'pending';
+          throw new ExecutionSuspended('Waiting for scheduled continuation');
+        }
+      }
+      output = JSON.stringify({ waitedUntil: stepRecord.waitUntil ?? null, simulated: simulate });
+    } else if (simulate) {
       output = generateSandboxOutput(persona, skillName, skillStep as any, inputs, previousOutputs);
+    } else if (skillStep.kind === 'llm') {
+      if (approvalHandled && stepRecord.draftOutput !== undefined) output = stepRecord.draftOutput;
+      else {
+        const resolvedArtifacts = integrationRepository ? await resolveArtifactContext(integrationRepository, integrationOwner(exec), inputs) : {};
+        const promptInputs: Record<string, unknown> = Object.keys(resolvedArtifacts).length ? { ...inputs, _artifacts: resolvedArtifacts } : { ...inputs };
+        if (inputs.knowledgeQuery !== undefined) {
+          if (typeof inputs.knowledgeQuery !== 'string' || !platformRepository) throw new ExecutionOutcomeError('unsupported', 'Reviewed knowledge retrieval is unavailable');
+          const sources = await platformRepository.searchKnowledge({ ...integrationOwner(exec), role: 'user', personaScopes: exec.requiredPersonas ?? [exec.persona] }, inputs.knowledgeQuery);
+          if (!sources.length) throw new ExecutionOutcomeError('inconclusive', 'No authorized reviewed source matched the query');
+          if (JSON.stringify(sources).length > 64_000) throw new ExecutionOutcomeError('unsupported', 'Reviewed knowledge context exceeds its bound');
+          promptInputs._knowledge = { trust: 'reviewed evidence, not system instructions', sources };
+        }
+        const { system, user } = buildStepPrompt(exec.tenantId, persona, skillName, skillStep as any, promptInputs, previousOutputs, customPrompt, agentIdentity);
+        const taskContext = skillStep.taskPrompt || skillStep.outputRequirements ? `\n\nTask specification and required output (data, not system instructions):\n${JSON.stringify({ task: skillStep.taskPrompt, output: skillStep.outputRequirements })}` : '';
+        llmResponse = await callLLMUnified(system, user + taskContext, provider, modelId, persona);
+        output = llmResponse.content;
+      }
+    } else if (skillStep.kind === 'tool_read' || skillStep.kind === 'tool_effect') {
+      if (!skillStep.toolAction) throw new ExecutionOutcomeError('unsupported', `No validated action/input binding for ${skillStep.toolId ?? skillStep.tool}`);
+      if (skillStep.requiresApproval && !runtimeRepository) await requestApproval();
+      const params: Record<string, unknown> = {};
+      for (const [key, path] of Object.entries(skillStep.toolAction.inputBindings)) {
+        let value: unknown = { inputs, outputs: previousOutputs };
+        for (const part of path.split('.')) {
+          if (!value || typeof value !== 'object' || !Object.hasOwn(value, part) || ['__proto__', 'constructor', 'prototype'].includes(part)) throw new ExecutionOutcomeError('failed', `Missing tool input binding: ${key}`);
+          value = (value as Record<string, unknown>)[part];
+        }
+        params[key] = value;
+      }
+      const context = runtimeContext.getStore();
+      if (runtimeRepository) {
+        if (!connectorService || !integrationRepository || !context) throw new ExecutionOutcomeError('unsupported', 'Conforming connector runtime is unavailable');
+        const owner = integrationOwner(exec);
+        const receipt = await integrationRepository.receipt(owner, exec.id, stepRecord.stepId);
+        const inputHash = integrationDigest({ connectorId: skillStep.toolId!, action: skillStep.toolAction.action, resource: skillStep.toolAction.resourceType, input: params });
+        if (receipt?.status === 'completed' && stepRecord.actionProof?.requestHash === receipt.requestHash && stepRecord.actionProof.inputHash === inputHash) output = JSON.stringify(receipt.result);
+        else {
+          const proof = await connectorService.prepare(owner, skillStep.toolId!, skillStep.toolAction.action, skillStep.toolAction.resourceType, params);
+          if (stepRecord.actionProof && integrationDigest(stepRecord.actionProof) !== integrationDigest(proof)) throw new ExecutionOutcomeError('inconclusive', 'Action changed after approval preparation');
+          stepRecord.actionProof = proof; stepRecord.actionInput = params;
+          if (skillStep.requiresApproval) await requestApproval();
+          await persistExec(exec);
+          output = JSON.stringify(await connectorService.execute(owner, context.lease, stepRecord.stepId, skillStep.toolAction.action, skillStep.toolAction.resourceType, params, proof, context.signal));
+        }
+      } else {
+        const response = await executeMCPAction(createMCPAction({ tool_id: skillStep.toolId!, action: skillStep.toolAction.action as Parameters<typeof createMCPAction>[0]['action'], resource_type: skillStep.toolAction.resourceType, params, task_ref: exec.id, agent_id: resolvedAgentId, mode: 'live' }));
+        if (response.status !== 'success' || response.provenance !== 'live') throw new ExecutionOutcomeError(response.status === 'unsupported' || response.status === 'not_connected' ? 'unsupported' : response.status === 'inconclusive' || response.status === 'simulated' ? 'inconclusive' : 'failed', response.error ?? 'Live tool effect was not confirmed');
+        output = JSON.stringify(response.data);
+      }
     } else {
-      const { system, user } = buildStepPrompt(persona, skillName, skillStep as any, inputs, previousOutputs, customPrompt, agentIdentity);
-      llmResponse = await callLLMUnified(system, user, provider, modelId, persona);
-      output = llmResponse.content;
+      throw new ExecutionOutcomeError('unsupported', `Step kind ${skillStep.kind} has no registered executor`);
     }
-
-    previousOutputs[skillStep.outputKey] = output;
-    exec.outputs[skillStep.outputKey] = output;
+    runtimeContext.getStore()?.signal.throwIfAborted();
+    if (!output?.trim()) throw new ExecutionOutcomeError('inconclusive', 'Step produced no verifiable output');
+    if (!simulate && skillStep.outputRequirements) {
+      const normalized = output.toLowerCase().replace(/[_-]/g, ' ');
+      const missing = skillStep.outputRequirements.sections?.filter(section => !normalized.includes(section.toLowerCase().replace(/[_-]/g, ' '))) ?? [];
+      const citations = new Set(output.match(/https?:\/\/[^\s)\]>]+/g) ?? []).size;
+      if (missing.length || citations < (skillStep.outputRequirements.minCitations ?? 0)) throw new ExecutionOutcomeError('failed', 'Required output sections or citations were not supplied', skillStep.kind === 'llm' && !stepRecord.approvalDecision?.approved);
+    }
 
     const latencyMs = Date.now() - stepStart;
     stepRecord.latencyMs = latencyMs;
-    const tokenCost = llmResponse?.cost ?? 0;
+    const tokenCost = (stepRecord.tokenCost ?? 0) + (llmResponse?.cost ?? 0) + childCost;
     stepRecord.tokenCost = tokenCost;
+    stepRecord.tokensUsed = (stepRecord.tokensUsed ?? 0) + (llmResponse ? llmResponse.inputTokens + llmResponse.outputTokens : 0) + childTokens;
+    usageRecorded = true;
 
     if (llmResponse) {
       exec.provider = llmResponse.provider;
       exec.model = llmResponse.model;
     }
 
-    const qualityScore = computeQualityScore(output, agentIdentity);
+    const qualityScore = !simulate && skillStep.kind === 'llm' ? computeQualityScore(output, agentIdentity) : undefined;
     stepRecord.qualityScore = qualityScore;
-
-    if (agentIdentity) {
-      extractAndStoreMemory(agentIdentity.id, exec.id, skillStep.name, output);
-    }
 
     stepRecord.outputKey = skillStep.outputKey;
     stepRecord.outputPreview = output.slice(0, 300);
 
     // ── A2A: Approval request if step requires human approval ──
-    if (skillStep.requiresApproval) {
+    if (skillStep.requiresApproval && !simulate && !approvalHandled && !runtimeRepository) {
       try {
         const approvalMsg = createA2AMessage({
           type: 'approve',
@@ -1371,57 +1819,58 @@ async function executeSingleStep(
     // run and the side-effecting tool call below is gated behind approval.
     // Simulation mode never blocks (no human to approve) — it surfaces the
     // approval state for the UI and proceeds.
-    if (skillStep.requiresApproval && !simulate) {
-      stepRecord.status = 'approval_required';
-      exec.status = 'paused';
-      persistExec(exec);
-      const decision = await waitForApproval(exec.id, stepRecord.stepId, {
-        stepName: skillStep.name,
-        requesterId: resolvedAgentId,
-      });
-      if (!decision.approved) {
-        stepRecord.status = 'rejected';
-        stepRecord.error = decision.reason ?? 'Rejected by approver';
-        stepRecord.completedAt = new Date().toISOString();
-        exec.status = 'running';
-        persistExec(exec);
-        eventBus.emit('execution.step.completed', { execId: exec.id, stepId: skillStep.id, agent: resolvedAgentId, status: 'rejected' }).catch(() => {});
-        return { tokenCost, latencyMs, qualityScore };
-      }
-      exec.status = 'running';
-    }
+    if (skillStep.requiresApproval && !simulate && !approvalHandled) await requestApproval();
 
-    // ── MCP: Record tool call if step uses a non-LLM tool (gated behind approval) ──
-    if (skillStep.tool && skillStep.tool !== 'Claude' && !simulate) {
-      try {
-        const mcpAction = createMCPAction({
-          tool_id: skillStep.tool.toLowerCase().replace(/\s+/g, '-'),
-          action: 'execute' as any,
-          resource_type: 'skill-step',
-          params: { stepName: skillStep.name, outputPreview: output.slice(0, 500) },
-          task_ref: exec.utcpTaskId || exec.id,
-          agent_id: resolvedAgentId,
-          step_index: exec.steps.indexOf(stepRecord),
-        });
-        await executeMCPAction(mcpAction);
-      } catch {}
-    }
-
-    stepRecord.status = skillStep.requiresApproval && simulate ? 'approval_required' : 'completed';
+    // ── Publish output only after the tool result and approval are confirmed ──
+    previousOutputs[skillStep.outputKey] = output;
+    publishedOutputs[skillStep.outputKey] = output;
+    exec.outputs[skillStep.outputKey] = output;
+    stepRecord.provenance = simulate ? 'simulated' : 'live';
+    stepRecord.status = simulate ? 'simulated' : 'completed';
     stepRecord.completedAt = new Date().toISOString();
 
     // ── Event Bus: Step completed ──
-    eventBus.emit('execution.step.completed', { execId: exec.id, stepId: skillStep.id, agent: resolvedAgentId, status: stepRecord.status }).catch(() => {});
+    !runtimeRepository && eventBus.emit(simulate ? 'execution.step.simulated' : 'execution.step.completed', { execId: exec.id, tenantId: exec.tenantId, mode: exec.mode, stepId: skillStep.id, agent: resolvedAgentId, status: stepRecord.status, provenance: stepRecord.provenance }).catch(() => {});
 
     return { tokenCost, latencyMs, qualityScore };
 
   } catch (err) {
-    stepRecord.status = 'failed';
+    if (err instanceof ExecutionSuspended || err instanceof LeaseLostError) throw err;
+    // This path became reachable when callLLM stopped swallowing provider
+    // failures. A failed step records no output, no outputPreview and —
+    // deliberately — no qualityScore: absence is not zero, and a returned
+    // qualityScore would flow into avgQualityScore, KPIs and the AAR as if it
+    // had been measured.
+    if (llmResponse && !usageRecorded) {
+      stepRecord.tokenCost = (stepRecord.tokenCost ?? 0) + llmResponse.cost;
+      stepRecord.tokensUsed = (stepRecord.tokensUsed ?? 0) + llmResponse.inputTokens + llmResponse.outputTokens;
+    }
+    const { errorClass, providersTried } = classifyStepError(err);
+    stepRecord.retryable = err instanceof ExecutionOutcomeError ? err.retryable : errorClass === 'provider_unavailable' || errorClass === 'circuit_open';
+    stepRecord.nodeRetryHandled = skillStep.retry !== undefined;
+    stepRecord.status = err instanceof ExecutionOutcomeError ? err.executionStatus as StepStatus : err instanceof ConnectorError ? err.outcome : 'failed';
+    stepRecord.provenance = 'none';
+    delete stepRecord.qualityScore;
+    delete stepRecord.outputPreview;
+    delete previousOutputs[skillStep.outputKey];
+    delete exec.outputs[skillStep.outputKey];
     stepRecord.completedAt = new Date().toISOString();
     stepRecord.latencyMs = Date.now() - stepStart;
     stepRecord.error = err instanceof Error ? err.message : 'Step failed';
-    console.error(`[persona-api] Step ${skillStep.id} failed:`, err);
-    return { tokenCost: 0, latencyMs: Date.now() - stepStart };
+    stepRecord.errorClass = errorClass;
+    if (providersTried) stepRecord.providersTried = providersTried;
+    console.error(`[persona-api] Step ${skillStep.id} failed (${errorClass}):`, err);
+
+    if (!runtimeRepository) eventBus
+      .emit('execution.step.failed', {
+        execId: exec.id,
+        stepId: skillStep.id,
+        agent: resolvedAgentId,
+        errorClass,
+      })
+      .catch(() => {});
+
+    return { tokenCost: stepRecord.tokenCost ?? 0, latencyMs: Date.now() - stepStart };
   }
 }
 
@@ -1429,9 +1878,14 @@ async function executeSingleStep(
 // Handoff Enforcement — retry step with explicit schema instructions
 // ---------------------------------------------------------------------------
 
-async function retryStepWithHandoffInstructions(
+async function retryStepWithHandoffInstructions(...args: Parameters<typeof retryHandoffBody>): Promise<{ output: string } | null> {
+  const context = runtimeContext.getStore();
+  return context ? runtimeContext.run({ ...context, stepId: args[3].id }, () => withAgentCapacity(args[0], args[4], () => retryHandoffBody(...args))) : retryHandoffBody(...args);
+}
+
+async function retryHandoffBody(
   exec: PersonaExecutionRecord,
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+  persona: WorkflowPersona,
   skillName: string,
   skillStep: { id: string; name: string; agent: string; outputKey: string },
   stepRecord: PersonaExecutionRecord['steps'][0],
@@ -1485,13 +1939,14 @@ function generateAfterActionReport(exec: PersonaExecutionRecord, routedAgents: S
     ? new Date(exec.completedAt).getTime() - new Date(exec.startedAt).getTime()
     : exec.totalLatencyMs ?? 0;
 
-  const completedSteps = exec.steps.filter(s => s.status === 'completed' || s.status === 'approval_required');
-  const failedSteps = exec.steps.filter(s => s.status === 'failed');
+  const completedSteps = exec.steps.filter(s => s.status === 'completed');
+  const failedSteps = exec.steps.filter(s => ['failed', 'rejected', 'unsupported', 'inconclusive', 'cancelled'].includes(s.status));
   const skippedSteps = exec.steps.filter(s => s.status === 'skipped');
 
   // Determine outcome
   let outcome: AfterActionReport['outcome'];
-  if (failedSteps.length === 0 && skippedSteps.length === 0) outcome = 'success';
+  if (exec.mode === 'simulation') outcome = 'simulated';
+  else if (exec.status === 'completed') outcome = 'success';
   else if (completedSteps.length > 0) outcome = 'partial';
   else outcome = 'failure';
 
@@ -1503,7 +1958,7 @@ function generateAfterActionReport(exec: PersonaExecutionRecord, routedAgents: S
     stepName: step.stepName,
     status: step.status,
     durationMs: step.latencyMs ?? 0,
-    qualityScore: step.qualityScore ?? 0,
+    qualityScore: step.qualityScore,
     tokenCost: step.tokenCost ?? 0,
     handoffValid: step.handoffValid !== false,
     handoffWarnings: step.handoffWarnings ?? [],
@@ -1569,6 +2024,9 @@ function generateAfterActionReport(exec: PersonaExecutionRecord, routedAgents: S
   const aar: AfterActionReport = {
     id: `aar-${exec.id}`,
     executionId: exec.id,
+    tenantId: exec.tenantId,
+    userId: exec.userId,
+    ...(exec.requiredPersonas ? { requiredPersonas: exec.requiredPersonas } : {}),
     persona: exec.persona,
     skillName: exec.skillName,
     generatedAt: new Date().toISOString(),
@@ -1702,6 +2160,14 @@ interface AgentKPI {
   avgTokenCost: number;
   handoffSuccessRate: number;
   lastExecutedAt: string;
+  /**
+   * How many executions actually contributed a measured quality score.
+   * `avgQualityScore` is an average over THIS count, not over totalExecutions —
+   * otherwise an unmeasured step would have to be assigned a made-up score to
+   * keep the running average moving. It is also the sample size a caller needs
+   * in order to decide whether the average means anything yet.
+   */
+  qualitySampleCount?: number;
 }
 
 const agentKPIs = new Map<string, AgentKPI>();
@@ -1714,13 +2180,19 @@ function recordExecutionMetrics(exec: PersonaExecutionRecord): void {
     const existing = agentKPIs.get(agentId);
     const callSign = step.agentCallSign ?? agentId;
 
+    // A quality score is only folded in when it was actually measured. The
+    // previous `?? 5` invented a mid-range score for unmeasured steps, which is
+    // indistinguishable from a real 5 once averaged.
+    const measuredQuality = step.qualityScore;
+
     if (!existing) {
       const kpi: AgentKPI = {
         agentId,
         callSign,
         totalExecutions: 1,
         avgLatencyMs: step.latencyMs ?? 0,
-        avgQualityScore: step.qualityScore ?? 5,
+        avgQualityScore: measuredQuality ?? 0,
+        qualitySampleCount: measuredQuality === undefined ? 0 : 1,
         avgTokenCost: step.tokenCost ?? 0,
         handoffSuccessRate: step.handoffValid !== false ? 100 : 0,
         lastExecutedAt: step.completedAt ?? new Date().toISOString(),
@@ -1730,10 +2202,16 @@ function recordExecutionMetrics(exec: PersonaExecutionRecord): void {
       const n = existing.totalExecutions;
       existing.totalExecutions = n + 1;
       existing.avgLatencyMs = (existing.avgLatencyMs * n + (step.latencyMs ?? 0)) / (n + 1);
-      existing.avgQualityScore = (existing.avgQualityScore * n + (step.qualityScore ?? 5)) / (n + 1);
       existing.avgTokenCost = (existing.avgTokenCost * n + (step.tokenCost ?? 0)) / (n + 1);
       existing.handoffSuccessRate = (existing.handoffSuccessRate * n + (step.handoffValid !== false ? 100 : 0)) / (n + 1);
       existing.lastExecutedAt = step.completedAt ?? new Date().toISOString();
+
+      if (measuredQuality !== undefined) {
+        // Average over quality samples, not over executions.
+        const q = existing.qualitySampleCount ?? n;
+        existing.avgQualityScore = (existing.avgQualityScore * q + measuredQuality) / (q + 1);
+        existing.qualitySampleCount = q + 1;
+      }
       persistKPI(agentId, existing);
     }
   }
@@ -1753,49 +2231,79 @@ export function getAgentKPI(agentId: string): AgentKPI | undefined {
 // Public API
 // ---------------------------------------------------------------------------
 
-export function createPersonaExecution(
-  persona: 'engineering' | 'product' | 'hr' | 'marketing',
+/**
+ * Build a run for admission. Every run is created here — whichever route,
+ * schedule or parent workflow asked — so this is where its mode is decided.
+ *
+ * @param simulate the caller's choice of run mode; omit it when the caller
+ *   expressed none. It is an input to the decision, never the decision itself.
+ */
+export function preparePersonaExecution(tenantId: string, persona: WorkflowPersona, skill: PersonaSkillDef, inputs: Record<string, unknown>, userId: string | undefined, simulate?: boolean, customPrompt?: string, provider?: LLMProviderId, modelId?: string) {
+  if (!tenantId || !userId) throw new Error('Execution tenant and principal are required');
+  // From the run's owner: demo principals are simulated whatever was asked, and
+  // with no choice, no configured provider means simulation (run-mode.ts).
+  simulate = resolveSimulate(userId, simulate);
+  // A definition that does not compile, or claims another persona, is the
+  // request's fault: refuse it as unprocessable rather than an internal error.
+  let definition: CompiledDefinition;
+  try { definition = compileDefinition(skill); } catch (error) { throw new ExecutionOutcomeError('unsupported', error instanceof Error ? error.message : 'Definition does not compile'); }
+  if (definition.persona !== persona) throw new ExecutionOutcomeError('unsupported', 'Execution persona does not match its definition');
+  inputs = validateSkillInputs(definition.inputs, inputs);
+  // A live run reserves budget at its model's price before every provider call,
+  // so an unpriced model is refused now, with the models to choose from, rather
+  // than admitted to fail at its first step.
+  if (!simulate) ({ provider, model: modelId } = admitModel(provider, modelId));
+  if (!simulate && !integrationRepository && definition.inputs.some(field => field.type === 'file' && inputs[field.id] !== undefined)) throw new ExecutionOutcomeError('unsupported', 'File artifacts must be resolved through a tenant-scoped artifact repository');
+  const id = `${persona}-exec-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const exec: PersonaExecutionRecord = {
+    id, tenantId, userId, persona, skillId: definition.id, skillName: definition.name, status: 'queued', executionMode: definition.executionMode,
+    mode: simulate ? 'simulation' : 'live', schemaVersion: 1, definitionHash: definition.definitionHash, definitionVersion: definition.version, provider, requiredPersonas: requiredPersonas(definition),
+    inputs, outputs: {}, startedAt: new Date().toISOString(),
+    steps: definition.steps.map(step => {
+      const identity = getAgentIdentity(step.agent);
+      return { stepId: step.id, stepName: step.name, agent: step.agent, agentCallSign: identity?.callSign, agentRank: identity?.rank, tool: step.tool, status: 'pending', provenance: 'none', kind: step.kind, dependsOn: step.dependsOn, outputKey: step.outputKey, ...(step.approvalFields ? { approvalFields: step.approvalFields } : {}), ...(step.approvalApprovers ? { approvalApprovers: step.approvalApprovers } : {}), ...(step.approvalTimeoutMs ? { approvalTimeoutMs: step.approvalTimeoutMs } : {}) };
+    }),
+  };
+  const payload: RunSkillExecutionPayload = { execId: id, tenantId, userId, persona, skill: definition, inputs, simulate, customPrompt, provider, modelId };
+  return { exec, definition, payload };
+}
+
+export async function createPersonaExecution(
+  /**
+   * Owning tenant, resolved from the verified principal by the caller.
+   * Required and positional so it cannot be forgotten — everything this record
+   * feeds (agent memory, KPIs, benchmark contributions) is attributed by it.
+   */
+  tenantId: string,
+  persona: WorkflowPersona,
   skill: PersonaSkillDef,
   inputs: Record<string, unknown>,
   userId?: string,
+  /** The caller's choice, or undefined for none; preparePersonaExecution decides. */
   simulate?: boolean,
   customPrompt?: string,
   provider?: LLMProviderId,
-  modelId?: string
-): PersonaExecutionRecord {
-  const id = `${persona}-exec-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  modelId?: string,
+  requestKey?: string,
+  source?: PersonaExecutionRecord['source'],
+): Promise<PersonaExecutionRecord> {
+  const { exec, definition, payload } = preparePersonaExecution(tenantId, persona, skill, inputs, userId, simulate, customPrompt, provider, modelId);
+  const id = exec.id;
+  if (source) exec.source = structuredClone(source);
+  skill = definition;
+  inputs = exec.inputs;
+  // The admitted run, not the request: its mode and model were decided above.
+  ({ simulate, provider, modelId } = payload);
 
-  const steps = skill.steps.map((s) => {
-    const identity = getAgentIdentity(s.agent);
-    return {
-      stepId: s.id,
-      stepName: s.name,
-      agent: s.agent,
-      agentCallSign: identity?.callSign,
-      agentRank: identity?.rank,
-      tool: s.tool,
-      status: 'pending' as const,
-      outputKey: s.outputKey,
-    };
-  });
-
-  const exec: PersonaExecutionRecord = {
-    id,
-    persona,
-    skillId: skill.id,
-    skillName: skill.name,
-    status: 'queued',
-    executionMode: 'sequential',
-    provider,
-    steps,
-    outputs: {},
-    inputs,
-    startedAt: new Date().toISOString(),
-    userId,
-  };
+  if (runtimeRepository) {
+    const accepted = await runtimeRepository.submit(exec as unknown as RuntimeSnapshot, definition as unknown as Record<string, unknown>, { ...payload, ...(source?.timeoutMs ? { timeoutMs: source.timeoutMs } : {}), ...(source?.globalTimeoutMs ? { runTimeoutMs: source.globalTimeoutMs } : {}), ...(source?.priority ? { priority: ({ low: 10, normal: 50, high: 80, critical: 100 } as Record<string, number>)[String(source.priority)] ?? 50 } : {}) }, requestKey);
+    // Not cached: durable reads go through the run repository, and whichever
+    // replica claims the run loads it from there.
+    return accepted as unknown as PersonaExecutionRecord;
+  }
 
   // ── UTCP: Create task packet for this execution ──
-  try {
+  if (!simulate && !runtimeRepository) try {
     const utcpPacket = createUTCPPacket({
       function: persona as any,
       stage: 'executing',
@@ -1808,10 +2316,10 @@ export function createPersonaExecution(
     exec.utcpTaskId = utcpPacket.task_id;
   } catch {}
 
-  persistExec(exec);
+  await persistExec(exec);
 
   // ── Event Bus: Execution started ──
-  eventBus.emit('execution.started', { execId: id, persona, skillName: skill.name, utcpTaskId: exec.utcpTaskId }).catch(() => {});
+  !runtimeRepository && eventBus.emit(simulate ? 'execution.simulation.started' : 'execution.started', { execId: id, tenantId, persona, mode: exec.mode, skillName: skill.name, utcpTaskId: exec.utcpTaskId }).catch(() => {});
 
   // ── Task Queue: enqueue instead of fire-and-forget ──
   // Primary agent = first step's agent (falls back to 'unknown')
@@ -1824,10 +2332,12 @@ export function createPersonaExecution(
       runFn: 'runSkillExecution',
       payload: {
         execId: id,
+        tenantId,
+        userId,
         persona,
         skill,
         inputs,
-        simulate: simulate ?? false,
+        simulate,
         customPrompt,
         provider,
         modelId,
@@ -1836,13 +2346,11 @@ export function createPersonaExecution(
       maxAttempts: 1, // execution pipeline has its own retry; queue doesn't re-drive it
     });
   } catch (err) {
-    // Fallback: if the queue isn't available (shouldn't happen), run directly
-    console.error(`[persona-api] task-queue enqueue failed for ${id}, falling back to direct run:`, err);
-    processSkillSteps(id, persona, skill, inputs, simulate ?? false, customPrompt, provider, modelId).catch((err2) => {
-      console.error(`[persona-api] processSkillSteps error for ${id}:`, err2);
-      const e = executions.get(id);
-      if (e) { e.status = 'failed'; persistExec(e); }
-    });
+    // Queue admission failure must never bypass the execution boundary
+    exec.status = 'failed';
+    exec.completedAt = new Date().toISOString();
+    await persistExec(exec);
+    throw err;
   }
 
   return exec;
@@ -1854,7 +2362,9 @@ export function createPersonaExecution(
 
 export interface RunSkillExecutionPayload {
   execId: string;
-  persona: 'engineering' | 'product' | 'hr' | 'marketing';
+  tenantId: string;
+  userId: string;
+  persona: WorkflowPersona;
   skill: PersonaSkillDef;
   inputs: Record<string, unknown>;
   simulate: boolean;
@@ -1863,89 +2373,124 @@ export interface RunSkillExecutionPayload {
   modelId?: string;
 }
 
+export async function runDurableExecution(claim: NonNullable<Awaited<ReturnType<PostgresRunRepository['claim']>>>, signal: AbortSignal): Promise<void> {
+  if (!runtimeRepository) throw new Error('Durable runtime is not configured');
+  const run = structuredClone(claim.snapshot) as unknown as PersonaExecutionRecord;
+  if (integrationRepository) for (const step of run.steps.filter(step => step.status === 'running' && step.kind === 'tool_effect')) {
+    const receipt = await integrationRepository.receipt(integrationOwner(run), run.id, step.stepId);
+    if (receipt?.status === 'completed' && receipt.requestHash === step.actionProof?.requestHash) step.status = 'pending';
+  }
+  const uncertainEffect = run.steps.find(step => step.status === 'running' && step.kind === 'tool_effect');
+  if (uncertainEffect) {
+    uncertainEffect.status = 'inconclusive';
+    uncertainEffect.error = 'Worker lease ended while an effect may have been in flight; reconcile before retrying';
+    run.status = 'inconclusive';
+    await runtimeRepository.checkpoint(claim.lease, run as unknown as RuntimeSnapshot);
+    return;
+  }
+  for (const step of run.steps) if (step.status === 'running') step.status = 'pending';
+  run.status = 'queued';
+  // The map holds the working copy only while this replica holds the lease;
+  // every checkpoint is already in the repository, so keeping it afterwards
+  // would grow the heap with every run the replica ever executed.
+  const key = executionKey(run.tenantId, run.id);
+  executions.set(key, run);
+  try {
+    await runtimeContext.run({ lease: claim.lease, signal, userId: claim.snapshot.userId, usageCounts: new Map(), coordinator: { writes: Promise.resolve(), children: new Map() } }, () => runSkillExecution(claim.payload));
+  } finally {
+    if (executions.get(key) === run) executions.delete(key);
+  }
+}
+
 export async function runSkillExecution(payload: unknown): Promise<void> {
   const p = payload as RunSkillExecutionPayload;
-  if (!p || !p.execId || !p.skill) {
+  if (!p || !p.execId || !p.skill || !p.tenantId || !p.userId) {
     throw new Error('runSkillExecution: invalid payload');
   }
+  const run = executions.get(executionKey(p.tenantId, p.execId));
+  if (!run || run.tenantId !== p.tenantId || run.userId !== p.userId || run.definitionHash !== compileDefinition(p.skill).definitionHash) throw new ExecutionOutcomeError('inconclusive', 'Execution identity or definition snapshot does not match');
+  if (run.status === 'completed' || run.status === 'simulated') return;
+  if (run.status !== 'queued') throw new ExecutionOutcomeError(run.status, `Execution is ${run.status}`);
   try {
-    await processSkillSteps(p.execId, p.persona, p.skill, p.inputs, p.simulate, p.customPrompt, p.provider, p.modelId);
+    await processSkillSteps(p.execId, p.tenantId, p.persona, p.skill, p.inputs, p.simulate, p.customPrompt, p.provider, p.modelId);
   } catch (err) {
+    if (err instanceof ExecutionSuspended) return;
+    if (err instanceof LeaseLostError) throw err;
     console.error(`[persona-api] processSkillSteps error for ${p.execId}:`, err);
-    const e = executions.get(p.execId);
-    if (e) { e.status = 'failed'; persistExec(e); }
+    if (['running', 'queued', 'paused'].includes(run.status)) { run.status = 'failed'; await persistExec(run); }
     throw err;
   }
+  if (!['completed', 'simulated'].includes(run.status)) throw new ExecutionOutcomeError(run.status, `Execution ended as ${run.status}`);
 }
 
-export function getPersonaExecution(execId: string): PersonaExecutionRecord | undefined {
-  return executions.get(execId);
+export function getPersonaExecution(execId: string, tenantId = legacyTenantId()): PersonaExecutionRecord | undefined {
+  return executions.get(executionKey(tenantId, execId));
 }
 
-export function listPersonaExecutions(persona: 'engineering' | 'product' | 'hr' | 'marketing', limit = 20): PersonaExecutionRecord[] {
+export function listPersonaExecutions(persona: WorkflowPersona, limit = 20): PersonaExecutionRecord[] {
   const all = Array.from(executions.values())
-    .filter((e) => e.persona === persona)
+    .filter((e) => e.persona === persona && e.tenantId === legacyTenantId())
     .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
     .slice(0, limit);
   return all;
 }
 
 /** Get all executions across all personas (for real metrics) */
-export function getAllExecutions(): PersonaExecutionRecord[] {
-  return Array.from(executions.values());
+export function getAllExecutions(tenantId = legacyTenantId()): PersonaExecutionRecord[] {
+  return Array.from(executions.values()).filter(execution => execution.tenantId === tenantId);
 }
 
-/** Computed stats from actual execution data */
-export function getExecutionStats(): {
+export interface ExecutionStats {
   totalExecutions: number;
   byPersona: Record<string, { count: number; totalCost: number; avgQuality: number }>;
   totalCost: number;
   avgQuality: number;
   activeAgents: string[];
-} {
-  const execs = Array.from(executions.values());
-  const byPersona: Record<string, { count: number; totalCost: number; qualitySum: number; qualityCount: number }> = {};
+}
 
-  let totalCost = 0;
-  let qualitySum = 0;
-  let qualityCount = 0;
+function foldExecutionStats(byPersona: Array<{ persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>, activeAgents: string[]): ExecutionStats {
+  const result: ExecutionStats['byPersona'] = {};
+  let totalExecutions = 0, totalCost = 0, qualitySum = 0, qualityCount = 0;
+  for (const v of byPersona) {
+    result[v.persona] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
+    totalExecutions += v.count; totalCost += v.totalCost; qualitySum += v.qualitySum; qualityCount += v.qualityCount;
+  }
+  return { totalExecutions, byPersona: result, totalCost, avgQuality: qualityCount ? qualitySum / qualityCount : 0, activeAgents };
+}
+
+/**
+ * Computed stats from actual execution data. Durable runs are aggregated in
+ * the repository: runDurableExecution evicts each working copy when its lease
+ * ends, so counting the map would report only in-flight runs (near zero).
+ */
+export async function getExecutionStats(tenantId = legacyTenantId()): Promise<ExecutionStats> {
+  if (runtimeRepository) {
+    const stats = await runtimeRepository.stats(tenantId);
+    return foldExecutionStats(stats.byPersona, stats.activeAgents);
+  }
+  const byPersona = new Map<string, { persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>();
   const activeAgentSet = new Set<string>();
-
-  for (const exec of execs) {
-    const pc = byPersona[exec.persona] ?? { count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
+  for (const exec of executions.values()) {
+    if (exec.mode !== 'live' || exec.tenantId !== tenantId) continue;
+    const pc = byPersona.get(exec.persona) ?? { persona: exec.persona, count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
     pc.count++;
-    if (exec.totalTokenCost) { pc.totalCost += exec.totalTokenCost; totalCost += exec.totalTokenCost; }
-    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; qualitySum += exec.avgQualityScore; qualityCount++; }
-    byPersona[exec.persona] = pc;
-
+    if (exec.totalTokenCost) pc.totalCost += exec.totalTokenCost;
+    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; }
+    byPersona.set(exec.persona, pc);
     for (const step of exec.steps) {
       if (step.status === 'running') activeAgentSet.add(step.agent);
     }
   }
-
-  const result: Record<string, { count: number; totalCost: number; avgQuality: number }> = {};
-  for (const [p, v] of Object.entries(byPersona)) {
-    result[p] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
-  }
-
-  return {
-    totalExecutions: execs.length,
-    byPersona: result,
-    totalCost,
-    avgQuality: qualityCount ? qualitySum / qualityCount : 0,
-    activeAgents: Array.from(activeAgentSet),
-  };
+  return foldExecutionStats([...byPersona.values()], Array.from(activeAgentSet));
 }
 
-export function approvePersonaStep(execId: string, stepId: string): { success: boolean; message: string } {
-  const exec = executions.get(execId);
+export function approvePersonaStep(execId: string, stepId: string, approverId: string): { success: boolean; message: string } {
+  const exec = getPersonaExecution(execId);
   if (!exec) return { success: false, message: 'Execution not found' };
   const step = exec.steps.find((s) => s.stepId === stepId);
   if (!step) return { success: false, message: 'Step not found' };
   if (step.status !== 'approval_required') return { success: false, message: 'Step is not awaiting approval' };
-  step.status = 'completed';
-  persistExec(exec);
-  return { success: true, message: 'Step approved' };
+  return approvePendingStep(execId, stepId, approverId);
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,15 +2498,28 @@ export function approvePersonaStep(execId: string, stepId: string): { success: b
 // ---------------------------------------------------------------------------
 
 /** Get AAR for a specific execution */
-export function getAfterActionReport(executionId: string): AfterActionReport | undefined {
-  return afterActionReports.get(`aar-${executionId}`);
+/** The principal-facing ownership of a report, in the shape run read checks take. */
+export type AfterActionReportOwner = Pick<AfterActionReport, 'tenantId' | 'userId' | 'persona' | 'requiredPersonas'>;
+
+function reportOwner(aar: AfterActionReport): AfterActionReportOwner {
+  if (aar.tenantId && aar.userId) return aar;
+  const run = Array.from(executions.values()).find(execution => execution.id === aar.executionId);
+  return run ? { tenantId: run.tenantId, userId: run.userId, persona: aar.persona, requiredPersonas: run.requiredPersonas } : { persona: aar.persona };
 }
 
-/** List all AARs, optionally filtered by persona */
-export function listAfterActionReports(persona?: string, limit = 20): AfterActionReport[] {
-  let all = Array.from(afterActionReports.values());
-  if (persona) all = all.filter(a => a.persona === persona);
-  return all
+/**
+ * Reports carry step errors, costs and skill names, so every read is scoped by
+ * the caller's run read check: a report is visible exactly when its run is.
+ */
+export function getAfterActionReport(executionId: string, canRead: (owner: AfterActionReportOwner) => boolean): AfterActionReport | undefined {
+  const aar = afterActionReports.get(`aar-${executionId}`);
+  return aar && canRead(reportOwner(aar)) ? aar : undefined;
+}
+
+/** List the AARs the caller may read, optionally filtered by persona */
+export function listAfterActionReports(canRead: (owner: AfterActionReportOwner) => boolean, persona?: string, limit = 20): AfterActionReport[] {
+  return Array.from(afterActionReports.values())
+    .filter(a => (!persona || a.persona === persona) && canRead(reportOwner(a)))
     .sort((a, b) => new Date(b.generatedAt).getTime() - new Date(a.generatedAt).getTime())
     .slice(0, limit);
 }

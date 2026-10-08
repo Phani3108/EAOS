@@ -44,6 +44,7 @@ export interface TaskRow {
     updatedAt: string;
     cancelledAt?: string;
     completedAt?: string;
+    availableAt?: string;
 }
 
 export interface QueueStats {
@@ -76,6 +77,7 @@ export function enqueue(params: {
     priority?: number;
     maxAttempts?: number;
 }): TaskRow {
+    if (tasks.has(params.taskId)) throw new Error('Task identity already exists');
     const now = new Date().toISOString();
     const row: TaskRow = {
         taskId: params.taskId,
@@ -120,7 +122,7 @@ export function claim(params: {
     // Find the highest-priority queued task that respects concurrency caps
     let best: TaskRow | null = null;
     for (const task of tasks.values()) {
-        if (task.status !== 'queued') continue;
+        if (task.status !== 'queued' || (task.availableAt && Date.parse(task.availableAt) > Date.now())) continue;
         if (params.personaFilter && task.persona !== params.personaFilter) continue;
 
         const agentInFlight = inFlightByAgent.get(task.agentId) ?? 0;
@@ -149,7 +151,7 @@ export function claim(params: {
 
 export function markRunning(taskId: string): void {
     const task = tasks.get(taskId);
-    if (!task) return;
+    if (!task || task.status !== 'claimed') return;
     task.status = 'running';
     task.attempts++;
     task.updatedAt = new Date().toISOString();
@@ -158,21 +160,22 @@ export function markRunning(taskId: string): void {
 
 export function markCompleted(taskId: string): void {
     const task = tasks.get(taskId);
-    if (!task) return;
+    if (!task || task.status !== 'running') return;
     task.status = 'completed';
     task.completedAt = new Date().toISOString();
     task.updatedAt = task.completedAt;
     tasks.set(taskId, task);
 }
 
-export function markFailed(taskId: string, error: string, opts: { retry?: boolean } = {}): void {
+export function markFailed(taskId: string, error: string, opts: { retry?: boolean; delayMs?: number } = {}): void {
     const task = tasks.get(taskId);
-    if (!task) return;
+    if (!task || !['claimed', 'running'].includes(task.status)) return;
     task.lastError = error;
     task.updatedAt = new Date().toISOString();
 
     if (opts.retry && task.attempts < task.maxAttempts) {
         // Requeue for retry
+        task.availableAt = new Date(Date.now() + (opts.delayMs ?? 1000)).toISOString();
         task.status = 'queued';
         task.claimedBy = undefined;
         task.claimedAt = undefined;

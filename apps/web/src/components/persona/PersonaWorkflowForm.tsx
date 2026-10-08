@@ -8,6 +8,9 @@
 
 import { useState, useCallback, useEffect } from 'react';
 import { getPrompts, type PromptEntry } from '@/lib/api';
+import { getAuthConfig } from '@/lib/auth-client';
+import { uploadArtifact } from '@/lib/execution-client';
+import { ModelSelector, type ModelChoice } from '../ModelSelector';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -45,7 +48,7 @@ export interface PersonaWorkflowFormProps {
   accentClass?: string;            // Tailwind bg class for Run button, e.g. 'bg-slate-900'
   accentHoverClass?: string;       // hover variant
   persona?: 'engineering' | 'product' | 'marketing' | 'hr';
-  onExecute: (inputs: Record<string, string>, simulate: boolean, customPrompt?: string, modelId?: string, provider?: string) => void;
+  onExecute: (inputs: Record<string, unknown>, simulate: boolean, customPrompt?: string, modelId?: string, provider?: string) => void;
   onCancel: () => void;
   executing: boolean;
 }
@@ -54,19 +57,43 @@ export interface PersonaWorkflowFormProps {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function serializeValues(values: FormValues): Record<string, string> {
-  const out: Record<string, string> = {};
+/**
+ * Values shaped the way the gateway validates them (validateSkillInputs in
+ * services/gateway/src/validation.ts): multiselect/tags → string[], toggle →
+ * boolean, number → number, file → { artifactId } (uploaded first). Every value
+ * used to be flattened to a string, which the gateway rejects for those types —
+ * so any skill with one of those inputs could not run from a persona hub.
+ */
+async function serializeValues(values: FormValues, fields: SkillInputField[]): Promise<Record<string, unknown>> {
+  const byId = new Map(fields.map((f) => [f.id, f] as const));
+  const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(values)) {
-    if (v === null || v === undefined) continue;
-    if (typeof v === 'boolean') {
-      out[k] = v ? 'true' : 'false';
-    } else if (Array.isArray(v)) {
-      out[k] = v.join(', ');
-    } else if (v instanceof FileList) {
-      const names = Array.from(v).map((f) => f.name);
-      out[k] = names.join(', ');
-    } else {
-      out[k] = v;
+    if (v === null || v === undefined || v === '') continue;
+    const field = byId.get(k);
+    switch (field?.type) {
+      case 'multiselect':
+      case 'tags': {
+        const items = (Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : []).map((item) => item.trim()).filter(Boolean);
+        if (items.length) out[k] = items;
+        break;
+      }
+      case 'toggle':
+        out[k] = v === true || v === 'true';
+        break;
+      case 'number': {
+        const n = typeof v === 'string' ? Number(v) : NaN;
+        if (Number.isFinite(n)) out[k] = n;
+        break;
+      }
+      case 'file': {
+        if (!(v instanceof FileList) || v.length === 0) break;
+        const refs: { artifactId: string }[] = [];
+        for (const file of Array.from(v)) refs.push(await uploadArtifact(file));
+        out[k] = field.multiple ? refs : refs[0];
+        break;
+      }
+      default:
+        out[k] = Array.isArray(v) ? v.join(', ') : typeof v === 'boolean' ? String(v) : v instanceof FileList ? undefined : v;
     }
   }
   return out;
@@ -337,6 +364,7 @@ function RunModeSelector({ mode, onChange }: { mode: RunMode; onChange: (m: RunM
         <button
           key={m.id}
           type="button"
+          aria-pressed={mode === m.id}
           onClick={() => onChange(m.id)}
           className={`flex-1 flex flex-col items-center gap-0.5 px-3 py-2 rounded-lg border text-center transition-all ${
             mode === m.id
@@ -480,73 +508,6 @@ function FieldRenderer({
 }
 
 // ---------------------------------------------------------------------------
-// LLM Model selector
-// ---------------------------------------------------------------------------
-
-type LLMProvider = 'anthropic' | 'openai' | 'azure-openai' | 'gemini' | 'ollama';
-
-const LLM_MODELS: { id: string; label: string; provider: LLMProvider; icon: string }[] = [
-  // Anthropic
-  { id: 'claude-sonnet-4-6-20251001', label: 'Claude Sonnet 4.6', provider: 'anthropic', icon: '🟣' },
-  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'anthropic', icon: '🟣' },
-  { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'anthropic', icon: '🟣' },
-  { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'anthropic', icon: '🟣' },
-  // OpenAI
-  { id: 'gpt-4o', label: 'GPT-4o', provider: 'openai', icon: '🟢' },
-  { id: 'gpt-4o-mini', label: 'GPT-4o Mini', provider: 'openai', icon: '🟢' },
-  { id: 'gpt-4-turbo', label: 'GPT-4 Turbo', provider: 'openai', icon: '🟢' },
-  { id: 'o3-mini', label: 'O3 Mini', provider: 'openai', icon: '🟢' },
-  // Google Gemini
-  { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro', provider: 'gemini', icon: '🔵' },
-  { id: 'gemini-1.5-flash', label: 'Gemini 1.5 Flash', provider: 'gemini', icon: '🔵' },
-  { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash', provider: 'gemini', icon: '🔵' },
-  // Azure OpenAI
-  { id: 'azure-gpt-4o', label: 'Azure GPT-4o', provider: 'azure-openai', icon: '☁️' },
-  { id: 'azure-gpt-4-turbo', label: 'Azure GPT-4 Turbo', provider: 'azure-openai', icon: '☁️' },
-  // Ollama (Local)
-  { id: 'llama3.1', label: 'Llama 3.1', provider: 'ollama', icon: '🦙' },
-  { id: 'codellama', label: 'Code Llama', provider: 'ollama', icon: '🦙' },
-  { id: 'mistral', label: 'Mistral', provider: 'ollama', icon: '🦙' },
-  { id: 'deepseek-coder', label: 'DeepSeek Coder', provider: 'ollama', icon: '🦙' },
-];
-
-const PROVIDER_LABELS: Record<LLMProvider, string> = {
-  anthropic: 'Anthropic',
-  openai: 'OpenAI',
-  'azure-openai': 'Azure OpenAI',
-  gemini: 'Google Gemini',
-  ollama: 'Ollama (Local)',
-};
-
-function ModelSelector({ modelId, onChange }: { modelId: string; onChange: (id: string) => void }) {
-  const grouped = LLM_MODELS.reduce<Record<string, typeof LLM_MODELS>>((acc, m) => {
-    if (!acc[m.provider]) acc[m.provider] = [];
-    acc[m.provider]!.push(m);
-    return acc;
-  }, {});
-
-  return (
-    <div>
-      <p className="text-xs font-semibold text-slate-700 mb-1.5">AI Model & Provider</p>
-      <select
-        value={modelId}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-300 bg-white"
-      >
-        {Object.entries(grouped).map(([provider, models]) => (
-          <optgroup key={provider} label={PROVIDER_LABELS[provider as LLMProvider] ?? provider}>
-            {models.map((m) => (
-              <option key={m.id} value={m.id}>{m.icon} {m.label}</option>
-            ))}
-          </optgroup>
-        ))}
-      </select>
-      <p className="text-[11px] text-slate-400 mt-1">Select which AI model and provider powers this skill execution</p>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Prompt selector
 // ---------------------------------------------------------------------------
 
@@ -612,8 +573,11 @@ export function PersonaWorkflowForm({
 }: PersonaWorkflowFormProps) {
   const [values, setValues] = useState<FormValues>({});
   const [runMode, setRunMode] = useState<RunMode>('live');
+  const [runModeTouched, setRunModeTouched] = useState(false);
+  const [llmConfigured, setLlmConfigured] = useState<boolean | null>(null);
+  const [submitError, setSubmitError] = useState('');
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const [selectedModelId, setSelectedModelId] = useState(LLM_MODELS[0]!.id);
+  const [model, setModel] = useState<ModelChoice>({});
   const [selectedPromptId, setSelectedPromptId] = useState('');
   const [prompts, setPrompts] = useState<PromptEntry[]>([]);
   const [promptsLoading, setPromptsLoading] = useState(true);
@@ -640,6 +604,17 @@ export function PersonaWorkflowForm({
     return () => { cancelled = true; };
   }, [persona]);
 
+  // With no model configured a Live run is refused, so default to Sandbox
+  // (until the user picks a mode themselves).
+  useEffect(() => {
+    let cancelled = false;
+    getAuthConfig().then((config) => { if (!cancelled) setLlmConfigured(config.llmConfigured); }).catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+  useEffect(() => {
+    if (llmConfigured === false && !runModeTouched) setRunMode('sandbox');
+  }, [llmConfigured, runModeTouched]);
+
   const basicFields = fields.filter((f) => f.section === 'basic');
   const advancedFields = fields.filter((f) => f.section === 'advanced');
 
@@ -647,8 +622,9 @@ export function PersonaWorkflowForm({
     setValues((prev) => ({ ...prev, [id]: v }));
   }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setSubmitError('');
 
     // Validate required basic fields
     for (const field of basicFields) {
@@ -660,13 +636,17 @@ export function PersonaWorkflowForm({
       }
     }
 
-    const serialized = serializeValues(values);
+    let serialized: Record<string, unknown>;
+    try {
+      serialized = await serializeValues(values, fields);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'Could not upload the attached files');
+      return;
+    }
     const promptContent = selectedPromptId
       ? prompts.find((p) => p.id === selectedPromptId)?.content
       : undefined;
-    const selectedModel = LLM_MODELS.find((m) => m.id === selectedModelId);
-    const provider = selectedModel?.provider;
-    onExecute(serialized, runMode === 'sandbox', promptContent, selectedModelId, provider);
+    onExecute(serialized, runMode === 'sandbox', promptContent, model.modelId, model.provider);
   };
 
   return (
@@ -722,13 +702,18 @@ export function PersonaWorkflowForm({
       />
 
       {/* AI Model selector */}
-      <ModelSelector modelId={selectedModelId} onChange={setSelectedModelId} />
+      <ModelSelector value={model} onChange={setModel} />
 
       {/* Run mode */}
       <div>
         <p className="text-xs font-semibold text-slate-700 mb-2">Run Mode</p>
-        <RunModeSelector mode={runMode} onChange={setRunMode} />
+        <RunModeSelector mode={runMode} onChange={(m) => { setRunMode(m); setRunModeTouched(true); }} />
+        {llmConfigured === false && runMode === 'live' && (
+          <p className="text-xs text-amber-700 mt-2">No model provider is configured on the gateway, so a Live run will be refused. Use Sandbox, or add an API key.</p>
+        )}
       </div>
+
+      {submitError && <p role="alert" className="text-sm text-red-700">{submitError}</p>}
 
       {/* Action buttons */}
       <div className="flex gap-2 pt-1">

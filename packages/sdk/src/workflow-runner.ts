@@ -12,6 +12,7 @@ import type {
     TaskResult,
     RetryConfig,
 } from './types.js';
+import { validateGraph, resolveGraphInput } from './graph-plan.js';
 
 // ---------------------------------------------------------------------------
 // Workflow Runner
@@ -20,11 +21,29 @@ import type {
 /**
  * Executes a workflow definition as a DAG of tasks.
  */
+export interface WorkflowClient {
+    execute(workflow: WorkflowDefinition, trigger: unknown): Promise<WorkflowExecution>;
+    get(id: string): Promise<WorkflowExecution | undefined>;
+    decide(id: string, stepId: string, approved: boolean, confirmations?: Record<string, boolean>): Promise<void>;
+    cancel(id: string): Promise<boolean>;
+}
+
 export class WorkflowRunner {
+    constructor(private readonly client: WorkflowClient) {
+        if (!client || typeof client.execute !== 'function' || typeof client.get !== 'function' || typeof client.cancel !== 'function' || typeof client.decide !== 'function') throw new Error('WorkflowRunner requires an authenticated canonical workflow client');
+    }
+    execute(workflow: WorkflowDefinition, trigger: unknown): Promise<WorkflowExecution> { return this.client.execute(workflow, trigger); }
+    get(id: string): Promise<WorkflowExecution | undefined> { return this.client.get(id); }
+    decide(id: string, stepId: string, approved: boolean, confirmations?: Record<string, boolean>): Promise<void> { return this.client.decide(id, stepId, approved, confirmations); }
+    cancel(id: string): Promise<boolean> { return this.client.cancel(id); }
+}
+
+export class LegacyWorkflowRunner {
     constructor(
         private readonly dispatcher: TaskDispatcher,
         private readonly conditionEvaluator: ConditionEvaluator,
-        private readonly approvalManager: ApprovalManager
+        private readonly approvalManager: ApprovalManager,
+        private readonly client?: { execute(workflow: WorkflowDefinition, trigger: unknown): Promise<WorkflowExecution> },
     ) { }
 
     /**
@@ -34,8 +53,10 @@ export class WorkflowRunner {
         workflow: WorkflowDefinition,
         trigger: unknown
     ): Promise<WorkflowExecution> {
+        if (this.client) return this.client.execute(workflow, trigger);
         const executionId = crypto.randomUUID();
         const stepResults = new Map<string, TaskResult>();
+        const skipped = new Set<string>();
 
         const execution: WorkflowExecution = {
             id: executionId,
@@ -55,6 +76,8 @@ export class WorkflowRunner {
                 // Check if dependencies are met
                 const depsReady = this.areDependenciesMet(step, stepResults);
                 if (!depsReady) {
+                    if (!(step.dependsOn ?? []).some(id => skipped.has(id))) throw new Error(`Unresolved dependency for '${step.id}'`);
+                    skipped.add(step.id);
                     continue; // skip — dependency failed or was skipped
                 }
 
@@ -65,6 +88,7 @@ export class WorkflowRunner {
                         { trigger, steps: this.buildStepContext(stepResults) }
                     );
                     if (!conditionMet) {
+                        skipped.add(step.id);
                         continue; // skip this step
                     }
                 }
@@ -103,7 +127,7 @@ export class WorkflowRunner {
 
                 stepResults.set(step.id, result);
 
-                if (result.status === 'failure') {
+                if (result.status !== 'success') {
                     execution.status = 'failed';
                     execution.error = `Step '${step.id}' failed: ${result.error?.message}`;
                     break;
@@ -111,6 +135,7 @@ export class WorkflowRunner {
             }
 
             if (execution.status === 'running') {
+                if (stepResults.size + skipped.size !== workflow.steps.length) throw new Error('Workflow has unresolved required steps');
                 execution.status = 'completed';
             }
         } catch (err) {
@@ -130,6 +155,7 @@ export class WorkflowRunner {
      * Topological sort of workflow steps based on `dependsOn`.
      */
     private resolveExecutionOrder(steps: WorkflowStep[]): WorkflowStep[] {
+        validateGraph(steps, steps.flatMap(step => (step.dependsOn ?? []).map(from => ({ from, to: step.id }))));
         const stepMap = new Map(steps.map((s) => [s.id, s]));
         const visited = new Set<string>();
         const order: WorkflowStep[] = [];
@@ -185,6 +211,7 @@ export class WorkflowRunner {
     ): Promise<TaskResult> {
         const maxAttempts = retry?.maxAttempts ?? 1;
         const initialDelay = retry?.initialDelayMs ?? 1000;
+        if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 10 || !Number.isFinite(initialDelay) || initialDelay < 0 || initialDelay > 60_000) throw new Error('Invalid retry policy');
         const backoff = retry?.backoff ?? 'exponential';
 
         let lastResult: TaskResult | null = null;
@@ -199,13 +226,13 @@ export class WorkflowRunner {
                 timeoutMs: step.timeoutMs,
             });
 
-            if (lastResult.status === 'success') {
+            if (lastResult.status === 'success' || lastResult.error?.retryable !== true) {
                 return lastResult;
             }
 
             // Don't retry on the last attempt
-            if (attempt < maxAttempts - 1 && lastResult.error?.retryable !== false) {
-                const delay = this.calculateDelay(backoff, initialDelay, attempt);
+            if (attempt < maxAttempts - 1) {
+                const delay = Math.min(60_000, this.calculateDelay(backoff, initialDelay, attempt));
                 await new Promise((resolve) => setTimeout(resolve, delay));
             }
         }
@@ -244,22 +271,7 @@ export class WorkflowRunner {
         input: Record<string, unknown>,
         context: Record<string, unknown>
     ): Record<string, unknown> {
-        const result: Record<string, unknown> = {};
-
-        for (const [key, value] of Object.entries(input)) {
-            if (typeof value === 'string') {
-                result[key] = this.resolveTemplateString(value, context);
-            } else if (typeof value === 'object' && value !== null) {
-                result[key] = this.resolveTemplates(
-                    value as Record<string, unknown>,
-                    context
-                );
-            } else {
-                result[key] = value;
-            }
-        }
-
-        return result;
+        return resolveGraphInput(input, context) as Record<string, unknown>;
     }
 
     /**
@@ -282,15 +294,7 @@ export class WorkflowRunner {
      * Resolve a dot-path expression against a context object.
      */
     private resolvePath(path: string, context: Record<string, unknown>): unknown {
-        const parts = path.split('.');
-        let current: unknown = context;
-
-        for (const part of parts) {
-            if (current == null || typeof current !== 'object') return undefined;
-            current = (current as Record<string, unknown>)[part];
-        }
-
-        return current;
+        return resolveGraphInput({ $ref: path }, context);
     }
 
     /**

@@ -12,6 +12,7 @@
 import { createHmac, randomBytes } from 'node:crypto';
 import { eventBus, type GatewayEvent } from './event-bus.js';
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,14 +149,14 @@ function isPrivateHost(host: string): boolean {
   return false;
 }
 
-export function initWebhookStore(store: Store): void {
+export async function initWebhookStore(store: Store): Promise<void> {
   persistentStore = store;
   try {
-    for (const row of store.all(ENDPOINTS_TABLE)) {
+    for (const row of await readAll(store, ENDPOINTS_TABLE)) {
       const ep = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as WebhookEndpoint;
       if (ep.id) endpoints.set(ep.id, ep);
     }
-    for (const row of store.all(SUBS_TABLE)) {
+    for (const row of await readAll(store, SUBS_TABLE)) {
       const sub = (typeof row.data === 'string' ? JSON.parse(row.data) : row) as WebhookSubscription;
       if (sub.id) subscriptions.set(sub.id, sub);
     }
@@ -188,6 +189,36 @@ export function createEndpoint(name: string, source: string, eventPrefix?: strin
   endpoints.set(id, ep);
   persist(ENDPOINTS_TABLE, id, ep);
   return ep;
+}
+
+export function redactEndpoint(endpoint: WebhookEndpoint) {
+  return {
+    id: endpoint.id,
+    name: endpoint.name,
+    source: endpoint.source,
+    eventPrefix: endpoint.eventPrefix,
+    enabled: endpoint.enabled,
+    receivedCount: endpoint.receivedCount,
+    lastReceivedAt: endpoint.lastReceivedAt,
+    createdAt: endpoint.createdAt,
+  };
+}
+
+export function redactSubscription(subscription: WebhookSubscription) {
+  let targetOrigin: string | undefined;
+  try { targetOrigin = new URL(subscription.targetUrl).origin; } catch {}
+  return {
+    id: subscription.id,
+    name: subscription.name,
+    eventPattern: subscription.eventPattern,
+    targetOrigin,
+    headerNames: Object.keys(subscription.headers ?? {}),
+    enabled: subscription.enabled,
+    deliveredCount: subscription.deliveredCount,
+    failedCount: subscription.failedCount,
+    lastDeliveredAt: subscription.lastDeliveredAt,
+    createdAt: subscription.createdAt,
+  };
 }
 
 export function getEndpoint(id: string): WebhookEndpoint | undefined {

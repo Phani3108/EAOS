@@ -138,6 +138,11 @@ export function setNotificationConfig(cfg: Partial<NotificationConfig>): void {
   Object.assign(config, cfg);
 }
 
-export function getNotificationConfig(): NotificationConfig {
-  return { ...config };
+export function getNotificationConfig() {
+  return {
+    enabled: config.enabled,
+    teams: { configured: Boolean(config.teams?.webhookUrl) },
+    email: { smtpConfigured: Boolean(config.email?.smtpConfigured) },
+    whatsapp: { configured: Boolean(config.whatsapp?.apiKey) },
+  };
 }

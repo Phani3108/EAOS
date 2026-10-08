@@ -20,6 +20,7 @@ import { callLLM as callLLMProvider, type LLMProviderId } from './llm-provider.j
 import { eventBus } from './event-bus.js';
 import { buildPrompt, type PromptContext } from './prompt-builder.js';
 import { WorkflowStore } from '@agentos/db/workflow-store';
+import type { Store } from '@agentos/db';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Types
@@ -189,10 +190,10 @@ const pipelineExecutions = new Map<string, PipelineExecution>();
 let _workflowStore: WorkflowStore | null = null;
 
 /** Call from server.ts after the gateway store is initialised. */
-export function initWorkflowStore(dataDir?: string): void {
-  _workflowStore = new WorkflowStore(dataDir);
+export async function initWorkflowStore(store: Store): Promise<void> {
+  _workflowStore = new WorkflowStore(store);
   // Rehydrate any previously saved executions that are not yet terminal
-  for (const snapshot of _workflowStore.list(200)) {
+  for (const snapshot of await _workflowStore.list(200)) {
     if (snapshot.status === 'completed' || snapshot.status === 'failed' || snapshot.status === 'cancelled') continue;
     const exec = _workflowStore.rehydrate(snapshot) as unknown as PipelineExecution;
     // Mark interrupted executions as failed so they don't appear stuck
@@ -321,6 +322,8 @@ export class PipelineEngine {
         // Execute the DAG
         try {
             await this.executeDAG(execution, activeNodes, options);
+            if (execution.status as PipelineStatus === 'cancelled') return execution;
+            if (!execution.nodeStates.size || [...execution.nodeStates.values()].some(node => node.status !== 'completed')) throw new Error('Pipeline did not complete every required node');
 
             // Generate after-action report
             execution.afterActionReport = await this.generateAAR(execution);
@@ -333,7 +336,7 @@ export class PipelineEngine {
                 durationMs: Date.now() - new Date(execution.startedAt).getTime(),
             });
         } catch (err) {
-            execution.status = 'failed';
+            if (execution.status as PipelineStatus !== 'cancelled') execution.status = 'failed';
             execution.completedAt = new Date().toISOString();
             await eventBus.emit('pipeline.failed', {
                 pipelineId,
@@ -626,7 +629,7 @@ Return JSON:
             execution.totalTokensUsed += result.inputTokens + result.outputTokens;
             execution.totalCostUsd += result.cost;
 
-            if (validation?.passed && (validation.score ?? 0) >= 0.7) {
+            if (validation?.passed === true && typeof validation.score === 'number' && Number.isFinite(validation.score) && validation.score >= 0.7 && validation.score <= 1 && Array.isArray(validation.missing_sections) && validation.missing_sections.length === 0 && Array.isArray(validation.issues)) {
                 await eventBus.emit('gate.passed', { pipelineId: execution.id, gateId: gate.id, score: validation.score });
                 return 'passed';
             }
@@ -644,14 +647,14 @@ Return JSON:
             }
 
             if (gate.on_fail === 'skip') {
-                return 'passed'; // Skip = treat as pass
+                return 'failed'; // A skipped validation cannot certify the node
             }
 
             return 'failed';
         } catch {
-            // If quality gate LLM call itself fails, pass with warning
+            // An unavailable evaluator cannot certify a quality gate
             await eventBus.emit('gate.error', { pipelineId: execution.id, gateId: gate.id, error: 'Gate validation LLM call failed' });
-            return 'passed';
+            return 'failed';
         }
     }
 

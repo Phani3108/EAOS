@@ -18,6 +18,10 @@ import { PromptLibrary } from './PromptLibraryDeep';
 import AgentsPanel from './AgentsPanel';
 import { PipelineView } from './PipelineView';
 import DemoPreviewBanner from './shared/DemoPreviewBanner';
+import { notify } from '../lib/notify';
+import { submitExecution } from '../lib/execution-client';
+import { isTerminalExecutionStatus } from '@agentos/skills/schema';
+import type { ExecutionRequest } from '@agentos/gateway/execution-api-contract';
 import type { ExecutionStepEvent } from '../store/marketing-store';
 
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
@@ -89,7 +93,7 @@ function ProgramCommandCenter() {
   }, []);
 
   useEffect(() => {
-    if (!activeExecution || activeExecution.status !== 'running') { if (pollRef.current) clearInterval(pollRef.current); return; }
+    if (!activeExecution || isTerminalExecutionStatus(activeExecution.status)) { if (pollRef.current) clearInterval(pollRef.current); return; }
     pollRef.current = setInterval(async () => {
       try {
         const r = await fetch(`${GATEWAY_URL}/api/program/executions/${activeExecution.id}`);
@@ -100,21 +104,25 @@ function ProgramCommandCenter() {
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [activeExecution?.id, activeExecution?.status, updateExecution]);
 
-  const handleExecute = async (inputs: Record<string, unknown>) => {
+  const handleExecute = async (inputs: Record<string, unknown>, simulate: boolean, customPrompt?: string, modelId?: string, provider?: string) => {
     if (!selectedSkill) return;
     setExecuting(true);
     try {
-      const r = await fetch(`${GATEWAY_URL}/api/program/executions`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skillId: selectedSkill.id, inputs }),
+      // Canonical path (was /api/program/executions, which skipped the shared validation and run mode).
+      const execution = await submitExecution({
+        persona: 'program', skillId: selectedSkill.id, inputs, simulate, customPrompt,
+        provider: provider as ExecutionRequest['provider'], modelId,
       });
-      const data = await r.json();
-      if (data.execution) addExecution({ id: data.execution.id, persona: 'program', skillId: selectedSkill.id, skillName: selectedSkill.name, status: 'running', steps: data.execution.steps || [], outputs: {}, startedAt: new Date().toISOString() });
-    } catch {}
-    setExecuting(false);
+      addExecution({ id: execution.id, persona: 'program', skillId: selectedSkill.id, skillName: selectedSkill.name, status: execution.status, steps: execution.steps || [], outputs: {}, startedAt: execution.startedAt });
+    } catch (err) {
+      notify('error', 'Run not started', err instanceof Error ? err.message : 'Something went wrong');
+    } finally {
+      setExecuting(false);
+    }
   };
 
-  const phase = activeExecution ? (activeExecution.status === 'completed' || activeExecution.status === 'failed' ? 'output' : 'running') : selectedSkill ? 'configure' : 'pick';
+  const phase = activeExecution ? (isTerminalExecutionStatus(activeExecution.status) ? 'output' : 'running') : selectedSkill ? 'configure' : 'pick';
+  const succeeded = activeExecution ? ['completed', 'simulated'].includes(activeExecution.status) : false;
 
   return (
     <div className="p-6 space-y-5 max-w-5xl mx-auto">
@@ -144,7 +152,7 @@ function ProgramCommandCenter() {
       {phase === 'configure' && selectedSkill && (
         <div>
           <button onClick={() => setSelectedSkill(null)} className="text-xs text-slate-500 hover:text-slate-700 mb-3">&larr; Back to skills</button>
-          <PersonaWorkflowForm fields={selectedSkill.inputs} tools={Object.values(toolStatus)} persona="engineering" accentClass="bg-indigo-600" accentHoverClass="hover:bg-indigo-700" onExecute={(inputs) => handleExecute(inputs)} onCancel={() => setSelectedSkill(null)} executing={executing} />
+          <PersonaWorkflowForm fields={selectedSkill.inputs} tools={Object.values(toolStatus)} persona="engineering" accentClass="bg-indigo-600" accentHoverClass="hover:bg-indigo-700" onExecute={handleExecute} onCancel={() => setSelectedSkill(null)} executing={executing} />
         </div>
       )}
 
@@ -154,9 +162,9 @@ function ProgramCommandCenter() {
 
       {phase === 'output' && activeExecution && (
         <div>
-          <div className={`rounded-xl p-4 mb-4 ${activeExecution.status === 'completed' ? 'bg-indigo-50 border border-indigo-200' : 'bg-red-50 border border-red-200'}`}>
-            <h3 className={`text-sm font-bold ${activeExecution.status === 'completed' ? 'text-indigo-800' : 'text-red-800'}`}>
-              {activeExecution.status === 'completed' ? 'Execution Complete' : 'Execution Failed'}
+          <div className={`rounded-xl p-4 mb-4 ${succeeded ? 'bg-indigo-50 border border-indigo-200' : 'bg-red-50 border border-red-200'}`}>
+            <h3 className={`text-sm font-bold ${succeeded ? 'text-indigo-800' : 'text-red-800'}`}>
+              {activeExecution.status === 'simulated' ? 'Completed · Simulated' : succeeded ? 'Completed' : `Run ${activeExecution.status}`}
             </h3>
           </div>
           <button onClick={() => { updateExecution(activeExecution.id, {}); setSelectedSkill(null); }} className="btn btn-secondary btn-sm">Run Another Skill</button>

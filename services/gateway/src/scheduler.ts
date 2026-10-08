@@ -11,6 +11,7 @@ import { getEngineeringSkill } from './engineering-skills-data.js';
 import { getProductSkill } from './product-skills-data.js';
 import { getHRSkill } from './hr-skills-data.js';
 import { getWorkflowRef } from './marketing-workflows-data.js';
+import { deploymentTenant } from './deployment-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -21,6 +22,16 @@ export type JobStatus = 'active' | 'paused' | 'failed' | 'completed' | 'pending'
 
 export interface ScheduledJob {
     id: string;
+    /**
+     * Owning tenant, captured from the creating principal.
+     *
+     * Optional only for backward compatibility with jobs persisted before this
+     * field existed; those stay quarantined (executeJob refuses them) until an
+     * explicit ownership migration is reviewed. A scheduled run produces a
+     * real execution, so without this the run — and everything attributed from
+     * it — would be tenant-less.
+     */
+    tenantId?: string;
     name: string;
     skillId: string;
     skillName: string;
@@ -167,7 +178,7 @@ export class Scheduler {
     private tickInterval?: ReturnType<typeof setInterval>;
 
     constructor() {
-        this.seed();
+        if (process.env.SEED_DEMO === 'true') this.seed();
         this.startTick();
     }
 
@@ -227,6 +238,8 @@ export class Scheduler {
         ];
 
         for (const job of demo) {
+            // Seeded by this deployment, so owned by its tenant rather than quarantined as legacy.
+            job.tenantId = deploymentTenant();
             this.jobs.set(job.id, job);
             this.logs.set(job.id, []);
             if (job.eventTrigger) {
@@ -305,12 +318,18 @@ export class Scheduler {
                 // to `timeout` seconds for it to reach a terminal state to record
                 // accurate success/failure in the job log.
                 const persona = this.resolvePersonaForJob(job);
-                const exec = createPersonaExecution(
+                if (!job.tenantId || job.tenantId !== deploymentTenant()) throw new Error('Legacy job tenant ownership requires review');
+                const exec = await createPersonaExecution(
+                    // Pre-existing jobs without verified tenant ownership remain
+                    // quarantined until an explicit migration has been reviewed.
+                    job.tenantId,
                     persona,
                     skill,
                     job.inputs ?? {},
                     job.createdBy,
-                    /* simulate */ false,
+                    // No choice recorded on the job: the runtime decides (run-mode.ts), so a
+                    // keyless gateway simulates instead of queuing live runs that can only fail.
+                    /* simulate */ undefined,
                 );
 
                 const timeoutMs = (job.timeout ?? 120) * 1000;
@@ -373,8 +392,9 @@ export class Scheduler {
      * Resolve the scheduled job's skillId against all persona skill catalogs.
      * Accepts bare ids ("blog-from-brief"), slugs, or legacy dotted ids.
      * Returns undefined if not found — caller treats that as a no-op job.
+     * Public so the job routes authorize exactly the definition a run would execute.
      */
-    private resolveSkillForJob(job: ScheduledJob): ReturnType<typeof getEngineeringSkill> {
+    resolveSkillForJob(job: Pick<ScheduledJob, 'skillId' | 'personaId'>): ReturnType<typeof getEngineeringSkill> {
         const id = job.skillId;
         // Try persona-specific first to short-circuit.
         switch (job.personaId) {

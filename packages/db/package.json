@@ -23,21 +23,47 @@
             "types": "./dist/unified-types.d.ts",
             "import": "./dist/unified-types.js"
         },
+        "./run-repository": {
+            "types": "./dist/run-repository.d.ts",
+            "import": "./dist/run-repository.js"
+        },
+        "./schedule-repository": {
+            "types": "./dist/schedule-repository.d.ts",
+            "import": "./dist/schedule-repository.js"
+        },
+        "./platform-repository": {
+            "types": "./dist/platform-repository.d.ts",
+            "import": "./dist/platform-repository.js"
+        },
+        "./integration-repository": {
+            "types": "./dist/integration-repository.d.ts",
+            "import": "./dist/integration-repository.js"
+        },
+        "./workspace-repository": {
+            "types": "./dist/workspace-repository.d.ts",
+            "import": "./dist/workspace-repository.js"
+        },
         "./workflow-store": {
             "types": "./dist/workflow-store.d.ts",
             "import": "./dist/workflow-store.js"
+        },
+        "./create-store": {
+            "types": "./dist/create-store.d.ts",
+            "import": "./dist/create-store.js"
         }
     },
     "scripts": {
         "build": "tsc",
         "typecheck": "tsc --noEmit",
-        "migrate": "psql -d eaos -f migrations/001_initial.sql && psql -d eaos -f migrations/002_prompt_library.sql && psql -d eaos -f migrations/003_unified_execution.sql && psql -d eaos -f migrations/004_missing_tables.sql && psql -d eaos -f migrations/005_multi_tenancy.sql && psql -d eaos -f migrations/006_audit_persistence.sql"
+        "migrate": "node dist/migrate.js"
     },
     "devDependencies": {
-        "typescript": "^5.4.0",
-        "@types/pg": "^8.11.0"
+        "@types/pg": "^8.11.0",
+        "typescript": "^5.4.0"
     },
     "dependencies": {
+        "@agentos/sdk": "workspace:*",
+        "@agentos/skills": "workspace:*",
         "pg": "^8.13.0"
     }
 }

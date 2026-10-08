@@ -12,6 +12,8 @@ import { useEAOSStore } from '../../store/eaos-store';
 import { InlineError } from '../ui';
 import type { WorkflowDef, InputField, InputFieldType } from '../../lib/marketing-workflows';
 import { getPrompts, type PromptEntry } from '@/lib/api';
+import { uploadArtifact } from '../../lib/execution-client';
+import { ModelSelector, type ModelChoice } from '../ModelSelector';
 
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
 
@@ -23,7 +25,7 @@ export interface PreCheckResult {
 
 interface WorkflowExecutionFormProps {
   workflow: WorkflowDef;
-  onExecute: (inputs: Record<string, unknown>, fileIds?: string[], simulate?: boolean, customPrompt?: string, modelId?: string) => void;
+  onExecute: (inputs: Record<string, unknown>, fileIds?: string[], simulate?: boolean, customPrompt?: string, modelId?: string, provider?: string) => void;
   onCancel?: () => void;
   preCheck?: PreCheckResult | null;
   onPreCheck?: () => void;
@@ -47,23 +49,11 @@ function FileUploadField({
       const ids: string[] = [];
       for (const file of files) {
         try {
-          const buf = await file.arrayBuffer();
-          const base64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          const res = await fetch(`${GATEWAY_URL}/api/marketing/upload`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fileName: file.name,
-              contentBase64: base64,
-              mimeType: file.type || 'application/octet-stream',
-            }),
-          });
-          if (res.ok) {
-            const { fileId } = await res.json();
-            ids.push(fileId);
-          }
-        } catch {
-          // ignore
+          const { artifactId } = await uploadArtifact(file);
+          ids.push(artifactId);
+        } catch (error) {
+          // Surface rejection without inventing an uploaded reference
+          notify('error', 'Upload failed', error instanceof Error ? error.message : 'Artifact upload failed');
         }
       }
       setUploadedIds(ids);
@@ -79,8 +69,8 @@ function FileUploadField({
       <div className="border border-dashed border-slate-300 rounded-lg p-4 bg-slate-50/50">
         <input
           type="file"
-          accept={field.accept ?? '.pdf,.ppt,.pptx,.doc,.docx,.csv,image/*'}
-          multiple
+          accept=".txt,.md,.csv,.json,.log,.ts,.js,.py,.go,.rs,.java,.sql"
+          multiple={field.multiple}
           onChange={handleFileChange}
           className="block w-full text-sm text-slate-600 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-sm file:font-semibold file:bg-slate-200 file:text-slate-700 hover:file:bg-slate-300"
         />
@@ -216,7 +206,7 @@ function renderField(
         <FileUploadField
           key={field.id}
           field={field}
-          onFileIdsChange={(ids) => onChange(ids)}
+          onFileIdsChange={(ids) => onChange(field.multiple ? ids.map(artifactId => ({ artifactId })) : ids[0] ? { artifactId: ids[0] } : undefined)}
         />
       );
     default:
@@ -234,18 +224,11 @@ function renderField(
   }
 }
 
-const MKT_LLM_MODELS = [
-  { id: 'claude-sonnet-4-6-20251001', label: 'Claude Sonnet 4.6', provider: 'Anthropic', icon: '🟣' },
-  { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'Anthropic', icon: '🟣' },
-  { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'Anthropic', icon: '🟣' },
-  { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'Anthropic', icon: '🟣' },
-];
-
 export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck, onPreCheck }: WorkflowExecutionFormProps) {
   const setActiveSection = useEAOSStore((s) => s.setActiveSection);
   const [inputs, setInputs] = useState<Record<string, unknown>>({});
   const [simulateMode, setSimulateMode] = useState(false);
-  const [selectedModelId, setSelectedModelId] = useState(MKT_LLM_MODELS[0]!.id);
+  const [model, setModel] = useState<ModelChoice>({});
   const [selectedPromptId, setSelectedPromptId] = useState('');
   const [prompts, setPrompts] = useState<PromptEntry[]>([]);
   const [promptsLoading, setPromptsLoading] = useState(true);
@@ -295,13 +278,10 @@ export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck,
       notify('warning', 'Tools not connected', 'Connect required tools or enable Simulation mode to run without real execution.');
       return;
     }
-    const allFileIds = workflow.inputs
-      .filter((f) => f.type === 'file')
-      .flatMap((f) => (inputs[f.id] as string[]) ?? []);
     const promptContent = selectedPromptId
       ? prompts.find((p) => p.id === selectedPromptId)?.content
       : undefined;
-    onExecute(inputs, allFileIds.length > 0 ? allFileIds : undefined, simulateMode, promptContent, selectedModelId);
+    onExecute(inputs, undefined, simulateMode, promptContent, model.modelId, model.provider);
   };
 
   return (
@@ -394,19 +374,7 @@ export function WorkflowExecutionForm({ workflow, onExecute, onCancel, preCheck,
       </div>
 
       {/* AI Model selector */}
-      <div>
-        <p className="text-xs font-semibold text-slate-700 mb-1.5">AI Model</p>
-        <select
-          value={selectedModelId}
-          onChange={(e) => setSelectedModelId(e.target.value)}
-          className="w-full px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-slate-300 bg-white"
-        >
-          {MKT_LLM_MODELS.map((m) => (
-            <option key={m.id} value={m.id}>{m.icon} {m.label} ({m.provider})</option>
-          ))}
-        </select>
-        <p className="text-[11px] text-slate-400 mt-1">Select which AI model powers this workflow execution</p>
-      </div>
+      <ModelSelector value={model} onChange={setModel} label="AI Model" />
 
       <div className="flex items-center gap-2">
         <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer">

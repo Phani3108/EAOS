@@ -11,7 +11,7 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
-import { callLLM, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
+import { callLLM, LLMNotConfiguredError, type LLMRequest, type LLMResponse, type LLMProviderId, getDefaultProvider } from './llm-provider.js';
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -20,6 +20,7 @@ import { callLLM, type LLMRequest, type LLMResponse, type LLMProviderId, getDefa
 export type TaskComplexity = 'simple' | 'moderate' | 'complex' | 'critical';
 
 export interface ModelRouterConfig {
+  signal?: AbortSignal;
   /** Maximum cost per execution in USD */
   maxCostPerExec: number;
   /** Maximum cost per hour in USD */
@@ -185,28 +186,27 @@ export async function routedLLMCall(
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const routing = routeModel(userPrompt, config, skillComplexity);
 
-  // Whether this call will actually hit a real provider. In simulation mode
-  // (no LLM key) callLLM returns deterministic sandbox output at zero cost and
-  // never makes a network request, so the budget cap and circuit breaker are
-  // inert — dev/demo behaviour is unchanged.
-  const realCall = hasAnyLLMKey();
+  // Every call through this function is a real provider call. Simulation is an
+  // explicit decision made by the caller BEFORE it gets here (see
+  // `shouldSimulate` in server.ts and `generateSandboxOutput` in persona-api.ts)
+  // — it is never an implicit fallback, because a silent fallback is what let a
+  // provider outage register as a successful, billable run.
 
-  if (realCall) {
-    // (2) Hard hourly budget cap — block real spend once the cap is reached.
-    // The softer 80% downgrade already happened inside routeModel().
-    resetHourlyCostIfNeeded();
-    if (hourlySpend >= cfg.maxCostPerHour) {
-      throw new BudgetExceededError(hourlySpend, cfg.maxCostPerHour);
-    }
+  // (2) Hard hourly budget cap — block real spend once the cap is reached.
+  // The softer 80% downgrade already happened inside routeModel().
+  resetHourlyCostIfNeeded();
+  if (hourlySpend >= cfg.maxCostPerHour) {
+    throw new BudgetExceededError(hourlySpend, cfg.maxCostPerHour);
+  }
 
-    // (1) Circuit breaker — fail fast if this provider's circuit is open.
-    // Keyed by provider, consistent with getAllCircuitStates().
-    if (isCircuitOpen(routing.provider)) {
-      throw new CircuitOpenError(routing.provider);
-    }
+  // (1) Circuit breaker — fail fast if this provider's circuit is open.
+  // Keyed by provider, consistent with getAllCircuitStates().
+  if (isCircuitOpen(routing.provider)) {
+    throw new CircuitOpenError(routing.provider);
   }
 
   const callArgs: LLMRequest = {
+    signal: config.signal,
     provider: routing.provider,
     model: routing.model,
     systemPrompt,
@@ -216,19 +216,17 @@ export async function routedLLMCall(
   };
 
   let response: LLMResponse;
-  if (realCall) {
-    // Wrap the real provider call so the circuit breaker observes outcomes.
-    try {
-      response = await callLLM(callArgs);
-    } catch (err) {
-      recordCircuitFailure(routing.provider);
-      throw err;
-    }
-    recordCircuitSuccess(routing.provider);
-  } else {
-    // Simulation mode: no breaker, no real failures, no real spend.
+  try {
     response = await callLLM(callArgs);
+  } catch (err) {
+    // A missing credential is an operator error, not a provider fault. Tripping
+    // the breaker on it would hold the circuit open against a healthy provider.
+    if (!(err instanceof LLMNotConfiguredError)) {
+      recordCircuitFailure(routing.provider);
+    }
+    throw err;
   }
+  recordCircuitSuccess(routing.provider);
 
   // Track cost
   hourlySpend += response.cost;
@@ -306,11 +304,32 @@ export function getCostHistory(limit = 100): typeof costLog {
 
 const rateLimitWindows = new Map<string, { count: number; resetAt: number }>();
 
+/**
+ * A window is only replaced when its key comes back, so keys that never return —
+ * one per client address or browser session, and clients choose some of those —
+ * used to stay in this map for the life of the process. Expired windows are swept
+ * once the map is large enough to matter, at most once a second so a flood of new
+ * keys cannot turn every request into a full scan.
+ */
+const RATE_LIMIT_SWEEP_SIZE = 10_000;
+let lastRateLimitSweep = 0;
+function sweepExpiredRateLimitWindows(now: number): void {
+  if (rateLimitWindows.size < RATE_LIMIT_SWEEP_SIZE || now - lastRateLimitSweep < 1000) return;
+  lastRateLimitSweep = now;
+  for (const [key, window] of rateLimitWindows) if (now > window.resetAt) rateLimitWindows.delete(key);
+}
+
+/** Live window count, for tests and diagnostics. */
+export function rateLimitWindowCount(): number {
+  return rateLimitWindows.size;
+}
+
 export function checkRateLimit(key: string, maxPerMinute: number): { allowed: boolean; remaining: number; resetInMs: number } {
   const now = Date.now();
   const window = rateLimitWindows.get(key);
 
   if (!window || now > window.resetAt) {
+    sweepExpiredRateLimitWindows(now);
     rateLimitWindows.set(key, { count: 1, resetAt: now + 60_000 });
     // Also attempt Redis sliding window (async, non-blocking)
     _redisRateLimit(key, maxPerMinute).catch(() => {});

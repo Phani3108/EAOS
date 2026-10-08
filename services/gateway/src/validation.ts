@@ -8,6 +8,7 @@
  */
 
 import { z } from 'zod';
+import { WORKFLOW_PERSONAS, canonicalPersona, type UnifiedInputField } from '@agentos/skills/schema';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -33,7 +34,7 @@ export function validate<T>(schema: z.ZodType<T>, body: unknown): T {
 // Common reusables
 // ---------------------------------------------------------------------------
 
-const PersonaEnum = z.enum(['engineering', 'product', 'hr', 'marketing', 'talent-acquisition', 'program-management']);
+const PersonaEnum = z.preprocess(value => typeof value === 'string' ? canonicalPersona(value) ?? value : value, z.enum(WORKFLOW_PERSONAS));
 const ProviderEnum = z.enum(['anthropic', 'openai', 'azure-openai', 'gemini', 'ollama']);
 
 // ---------------------------------------------------------------------------
@@ -202,3 +203,37 @@ export const ChatMessageSchema = z.object({
   role: z.enum(['user', 'assistant']).optional().default('user'),
 });
 export type ChatMessageBody = z.infer<typeof ChatMessageSchema>;
+
+export function validateSkillInputs(fields: readonly UnifiedInputField[], body: unknown): Record<string, unknown> {
+  const input = validate(z.record(z.string().max(100), z.json()).refine(value => Object.keys(value).length <= 100 && JSON.stringify(value).length <= 128_000, 'Input payload is too large'), body);
+  if (Object.hasOwn(input, '_artifacts') || Object.hasOwn(input, '_knowledge')) throw new ValidationError([{ code: 'custom', path: ['_artifacts'], message: 'Artifact evidence is resolved by the server' }]);
+  const result: Record<string, unknown> = { ...input };
+  for (const field of fields) {
+    const choices = field.options?.map(option => typeof option === 'string' ? option : option.value);
+    const text = z.string().max(field.type === 'textarea' ? 64_000 : 4000);
+    let schema: z.ZodType;
+    switch (field.type) {
+      case 'text': case 'textarea': schema = field.required ? text.refine(value => value.trim().length > 0, 'Required value is empty') : text; break;
+      case 'url': schema = z.url({ protocol: /^https?$/ }).max(4000); break;
+      case 'number': schema = z.number().finite(); break;
+      case 'toggle': schema = z.boolean(); break;
+      case 'date': schema = z.iso.date(); break;
+      case 'select': schema = z.string().refine(value => Boolean(choices?.includes(value)), 'Unknown option'); break;
+      case 'multiselect': case 'tags': schema = z.array(z.string().max(500).refine(value => !choices || choices.includes(value), 'Unknown option')).max(100).min(field.required ? 1 : 0); break;
+      case 'file': {
+        const file = z.object({ artifactId: z.string().regex(/^[a-zA-Z0-9_-]{1,128}$/) }).strict();
+        schema = field.multiple ? z.array(file).max(20).min(field.required ? 1 : 0) : file;
+        break;
+      }
+      default: throw new ValidationError([{ code: 'custom', path: [field.id], message: 'Unsupported input type' }]);
+    }
+    const required = field.required && (!field.dependsOn || Boolean(input[field.dependsOn]));
+    let value: unknown = input[field.id];
+    if (!required && (value === '' || value === null)) value = undefined;
+    const parsed = (required ? schema : schema.optional()).safeParse(value);
+    if (!parsed.success) throw new ValidationError(parsed.error.issues.map(issue => ({ ...issue, path: [field.id, ...issue.path] })));
+    if (parsed.data === undefined) delete result[field.id];
+    else result[field.id] = parsed.data;
+  }
+  return result;
+}

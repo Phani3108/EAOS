@@ -9,6 +9,7 @@ interface Props {
 }
 
 const STATUS_CONFIG: Record<ConnectionStatus, { label: string; dot: string; badge: string }> = {
+  'configured':      { label: 'Not Verified', dot: 'bg-amber-400', badge: 'text-amber-700 bg-amber-50 border-amber-200' },
   'connected':       { label: 'Connected',        dot: 'bg-emerald-500', badge: 'text-emerald-700 bg-emerald-50 border-emerald-200' },
   'not-connected':   { label: 'Not Connected',    dot: 'bg-slate-300',   badge: 'text-slate-500 bg-slate-50 border-slate-200' },
   'expired':         { label: 'Expired',          dot: 'bg-amber-400',   badge: 'text-amber-700 bg-amber-50 border-amber-200' },

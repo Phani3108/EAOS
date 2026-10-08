@@ -32,10 +32,32 @@ const CATEGORIES: Array<ConnectorCategory | 'all'> = [
 ];
 
 export function ConnectionsHub() {
-  const { connections, activeCategory, setActiveCategory, getConnectedCount } = useConnectionsStore();
+  const { connections, activeCategory, setActiveCategory } = useConnectionsStore();
   const activeSection = useEAOSStore(s => s.activeSection);
   const setActiveSection = useEAOSStore(s => s.setActiveSection);
   const [search, setSearch] = useState('');
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/_/gateway/api/connections', { cache: 'no-store' }).then(async response => {
+      if (!response.ok) throw new Error('Connection state could not be loaded');
+      return response.json();
+    }).then(data => {
+      if (!active) return;
+      const next = Object.fromEntries(CONNECTOR_CATALOG.map(connector => {
+        const record = data.connections?.[connector.id];
+        const status = record?.status === 'verified' ? 'connected' as const : record?.status === 'configured' ? 'configured' as const : 'not-connected' as const;
+        return [connector.id, { connectorId: connector.id, status }];
+      }));
+      useConnectionsStore.setState({ connections: next });
+    }).catch(error => {
+      if (!active) return;
+      setConnectionError(error.message);
+      useConnectionsStore.setState({ connections: Object.fromEntries(CONNECTOR_CATALOG.map(connector => [connector.id, { connectorId: connector.id, status: 'error' as const }])) });
+    });
+    return () => { active = false; };
+  }, []);
 
   // Sync sidebar nav item → category filter
   useEffect(() => {
@@ -43,7 +65,7 @@ export function ConnectionsHub() {
     if (cat) setActiveCategory(cat);
   }, [activeSection, setActiveCategory]);
 
-  const connectedCount = getConnectedCount();
+  const connectedCount = Object.values(connections).filter(connection => connection.status === 'connected').length;
   const totalCount = CONNECTOR_CATALOG.length;
   const coveragePct = Math.round((connectedCount / totalCount) * 100);
 
@@ -70,7 +92,8 @@ export function ConnectionsHub() {
         <div className="flex items-center justify-between mb-4">
           <div>
             <h1 className="page-title">Connections</h1>
-            <p className="page-subtitle">Connect your tools to unlock live execution. Skills run in sandbox mode until tools are connected.</p>
+            <p className="page-subtitle">Save tenant-owned secret references. Live execution requires a verified adapter; simulation must be selected explicitly.</p>
+            {connectionError && <p role="alert" className="text-sm text-red-600">{connectionError}</p>}
           </div>
           <div className="flex items-center gap-4">
             <div className="text-right">

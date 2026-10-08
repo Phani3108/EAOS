@@ -14,10 +14,17 @@ const STATUS_DOT: Record<string, string> = {
   running: 'bg-blue-500 animate-pulse',
   completed: 'bg-emerald-500',
   failed: 'bg-red-500',
+  rejected: 'bg-red-500', cancelled: 'bg-slate-400', skipped: 'bg-slate-300', unsupported: 'bg-amber-500', inconclusive: 'bg-amber-500', simulated: 'bg-purple-500',
   approval_required: 'bg-amber-400',
 };
 
 const STATUS_LABEL: Record<string, { label: string; classes: string }> = {
+  rejected: { label: 'Rejected', classes: 'bg-red-50 text-red-700 border-red-200' },
+  cancelled: { label: 'Cancelled', classes: 'bg-slate-100 text-slate-600 border-slate-200' },
+  skipped: { label: 'Skipped', classes: 'bg-slate-100 text-slate-600 border-slate-200' },
+  unsupported: { label: 'Unsupported', classes: 'bg-amber-50 text-amber-700 border-amber-200' },
+  inconclusive: { label: 'Inconclusive', classes: 'bg-amber-50 text-amber-700 border-amber-200' },
+  simulated: { label: 'Simulated', classes: 'bg-purple-50 text-purple-700 border-purple-200' },
   pending: { label: 'Pending', classes: 'bg-slate-100 text-slate-500 border-slate-200' },
   running: { label: 'Running…', classes: 'bg-blue-100 text-blue-700 border-blue-200' },
   completed: { label: '✓ Done', classes: 'bg-emerald-100 text-emerald-700 border-emerald-200' },
@@ -93,7 +100,7 @@ function StepRow({
           )}
 
           {/* Output preview */}
-          {(step.status === 'completed' || step.status === 'approval_required') && hasOutput && (
+          {(step.status === 'completed' || step.status === 'simulated' || step.status === 'approval_required') && hasOutput && (
             <div className="mt-1.5">
               <button
                 onClick={() => setExpanded(!expanded)}
@@ -144,7 +151,7 @@ function StepRow({
 }
 
 export function ExecutionTimeline({ steps, workflowName, status, outputs = {}, onApprove }: ExecutionTimelineProps) {
-  const completed = steps.filter((s) => s.status === 'completed' || s.status === 'approval_required').length;
+  const completed = steps.filter((s) => s.status === 'completed' || s.status === 'simulated').length;
   const total = steps.length;
   const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
   const [showAllOutputs, setShowAllOutputs] = useState(false);
@@ -202,7 +209,7 @@ export function ExecutionTimeline({ steps, workflowName, status, outputs = {}, o
       </div>
 
       {/* All outputs panel — shown when completed */}
-      {status === 'completed' && outputKeys.length > 0 && (
+      {(status === 'completed' || status === 'simulated') && outputKeys.length > 0 && (
         <div className="px-5 py-4 border-t border-slate-100 bg-slate-50/50">
           <button
             onClick={() => setShowAllOutputs(!showAllOutputs)}
