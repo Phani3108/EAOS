@@ -52,12 +52,18 @@ export async function createBrowserSession(principal: AuthUser, ttl = ACCESS_TTL
   const current = await principalResolver(principal);
   if (!current) throw new Error('Membership is suspended');
   principal = current;
+  // A session minted from an expiring API key ends when the key does, and carries
+  // that bound (authorityExpiresAt stays on the stored user) into whatever it mints
+  // in turn. A one-hour key used to buy a renewable 14-day session.
+  const now = Date.now();
+  const expiresAt = Math.min(now + SESSION_TTL * 1000, principal.authorityExpiresAt ?? Infinity);
+  if (expiresAt <= now) throw Object.assign(new Error('The presenting credential has expired'), { statusCode: 401 });
   const id = randomUUID();
   const { tokenExpiresAt: _expiry, ...identity } = principal;
   const user = { ...identity, sessionId: id };
   const refreshToken = `${id}.${randomBytes(32).toString('hex')}`;
-  const result = credentials(user, refreshToken, ttl);
-  await change(id, () => ({ row: { id, user, hash: digest(refreshToken), used: [], expiresAt: Date.now() + SESSION_TTL * 1000, revoked: false }, value: undefined }));
+  const result = credentials(user, refreshToken, Math.max(1, Math.min(ttl, Math.floor((expiresAt - now) / 1000))));
+  await change(id, () => ({ row: { id, user, hash: digest(refreshToken), used: [], expiresAt, revoked: false }, value: undefined }));
   return result;
 }
 

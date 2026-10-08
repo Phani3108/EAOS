@@ -30,6 +30,26 @@ describe('durable browser session lifecycle', () => {
     await sessions.revokeBrowserSession(issued.user.sessionId!);
     expect(await sessions.getSessionUser(issued.user.sessionId!)).toBeUndefined();
   });
+  it('ends a session minted from an expiring key when the key does', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const keyExpiry = Date.now() + 60 * 60_000;
+      const issued = await sessions.createBrowserSession({ ...user, authorityExpiresAt: keyExpiry }, 86400);
+      // The bound travels with the session, so whatever it mints is bounded too.
+      expect(issued.expiresIn).toBe(3600);
+      expect((await sessions.getSessionUser(issued.user.sessionId!))?.authorityExpiresAt).toBe(keyExpiry);
+      expect((await sessions.getRefreshUser(issued.refreshToken))?.authorityExpiresAt).toBe(keyExpiry);
+      vi.setSystemTime(keyExpiry + 1);
+      expect(await sessions.getSessionUser(issued.user.sessionId!)).toBeUndefined();
+      expect(await sessions.refreshBrowserSession(issued.refreshToken)).toBeUndefined();
+      await expect(sessions.createBrowserSession({ ...user, authorityExpiresAt: keyExpiry })).rejects.toMatchObject({ statusCode: 401 });
+    } finally { vi.useRealTimers(); }
+  });
+  it('keeps the full session lifetime for identities nothing bounds', async () => {
+    const issued = await sessions.createBrowserSession(user);
+    expect(issued.expiresIn).toBe(900);
+    expect((await sessions.getSessionUser(issued.user.sessionId!))?.tokenExpiresAt).toBeGreaterThan(Date.now() + 13 * 86400_000);
+  });
   it('makes OIDC handoff codes one-time and browser-bound', async () => {
     const code = sessions.issueLoginCode(user, 'browser-binding');
     expect(sessions.consumeLoginCode(code, 'wrong-browser')).toBeUndefined();

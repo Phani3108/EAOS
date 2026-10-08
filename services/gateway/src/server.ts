@@ -25,10 +25,11 @@ import {
   listApiKeysForUser,
   API_KEY_TABLE,
 } from './api-key-store.js';
-import { resolveApiKeyScopes, revokeApiKey, rotateApiKey } from './api-key-lifecycle.js';
+import { boundedKeyExpiry, resolveApiKeyScopes, resolvePostgresApiKey, revokeApiKey, rotateApiKey } from './api-key-lifecycle.js';
 import { runSetup, SETUP_TABLE } from './setup.js';
-import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, hashApiKeyCandidates, isDemoPrincipal, localDemoUser, DEMO_PRINCIPAL_PREFIX } from './auth.js';
-import { DemoTenantMissingError, provisionDemoUser } from './demo-principals.js';
+import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, isDemoPrincipal, isDemoVisitor, demoPrincipalPermitted, localDemoUser, DEMO_PRINCIPAL_PREFIX, LOCAL_DEMO_PRINCIPAL_ID, DEMO_DISABLED_ERROR } from './auth.js';
+import { DemoTenantMissingError, localDemoProvisioner, provisionDemoUser } from './demo-principals.js';
+import { localDemoVerdict, parseTrustedProxies } from './request-origin.js';
 import { initAuthSessions, createBrowserSession, refreshBrowserSession, getSessionUser, getRefreshUser, revokeBrowserSession, issueLoginCode, consumeLoginCode, readCookie, cookie, setSessionCookies, setSessionRevocationHandler, persistOidcUser, setPrincipalResolver } from './auth-sessions.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
@@ -236,8 +237,6 @@ setApiKeyResolver(async (rawKey: string) => {
   // POST /api/setup was unusable the moment it was handed out.
   if (!pgPool) return lookupApiKey(rawKey);
   try {
-    const candidates = hashApiKeyCandidates(rawKey);
-    let keyHash = candidates[0]!;
     // Resolved through a SECURITY DEFINER function (migration 007), not a direct
     // SELECT.
     //
@@ -250,25 +249,9 @@ setApiKeyResolver(async (rawKey: string) => {
     //
     // The function takes a hash, never a raw key, so a database dump still
     // contains no usable credential and the lookup cannot be used to enumerate.
-    let row: Record<string, any> | undefined;
-    for (const candidate of candidates) {
-      const result = await pgPool.query(`SELECT * FROM authenticate_api_key($1)`, [candidate]);
-      if (result.rows[0]) { row = result.rows[0]; keyHash = candidate; break; }
-    }
-    if (!row) return undefined;
-
-    // Best-effort last-used stamp; never block auth on it.
-    void pgPool.query(`SELECT touch_api_key($1)`, [keyHash]).catch(() => {});
-
-    return {
-      id: row.user_id,
-      email: row.email ?? '',
-      name: row.name ?? '',
-      role: (row.role ?? 'user') as 'user' | 'operator' | 'admin',
-      teams: [],
-      personaScopes: Array.isArray(row.scopes) ? row.scopes : ['*'],
-      tenantId: row.tenant_id ?? 'default',
-    };
+    // resolvePostgresApiKey then reads the key's expiry under the tenant it named,
+    // and moves a key found under a pre-API_KEY_HASH_SECRET hash onto the current one.
+    return await resolvePostgresApiKey(pgPool, rawKey);
   } catch (err) {
     // A lookup failure must deny, never fall through to a weaker check.
     console.error('[auth] API key lookup failed:', (err as Error).message);
@@ -288,12 +271,20 @@ const verifyDeploymentStorage = async () => {
     if (pgPool) await pgPool.query('SELECT c.secret_version,c.binding_hash,c.config FROM workspace_connections c JOIN input_artifacts a ON FALSE JOIN runtime_tool_receipts t ON FALSE JOIN integration_audit i ON FALSE');
     if (pgPool) await pgPool.query('SELECT p.revision,d.version,m.state,e.stream_sequence,n.execution_run_id FROM platform_registry_packages p JOIN platform_datasets d ON FALSE JOIN platform_memberships m ON FALSE JOIN runtime_events e ON FALSE JOIN platform_http_metrics h ON FALSE JOIN platform_event_offsets o ON FALSE JOIN runtime_deliveries n ON FALSE JOIN runtime_connector_observations co ON FALSE');
     await bindDeploymentTenant(store, pgPool);
-    // The local demo principal acts without a session, so it is provisioned with storage.
-    if (pgPool && env.EAOS_DEMO_MODE === 'local') await provisionDemoUser(pgPool, localDemoUser());
+};
+// The 503 body stays generic (it reaches unauthenticated callers); the cause goes to
+// the log. Both used to be generic, so a misconfigured deployment said nothing at all
+// about why every route answered 503. Logged once per distinct cause, not every 5s.
+let storageCause: string | undefined;
+const reportStorageCause = (error: unknown) => {
+    const cause = error instanceof Error ? error.message : String(error);
+    if (cause !== storageCause) console.error(`[server] DEPLOYMENT STORAGE NOT VERIFIED — ${cause}. Every route but the probes answers 503; retrying every 5s.`);
+    storageCause = cause;
 };
 try { await verifyDeploymentStorage(); } catch (error) {
     if (!pgPool) throw error;
     deploymentBindingError = 'Deployment storage ownership or application role is not yet verified';
+    reportStorageCause(error);
 }
 if (pgPool) {
     let checking = false;
@@ -303,9 +294,21 @@ if (pgPool) {
         // Rehydrate BEFORE lifting the 503: boot skipped it while storage was
         // unverified, so clearing the error first would serve empty state as if
         // it were the tenant's real (empty) data.
-        void verifyDeploymentStorage().then(rehydrateStores).then(() => { deploymentBindingError = undefined; }).catch(() => {}).finally(() => { checking = false; });
+        void verifyDeploymentStorage().then(rehydrateStores).then(() => {
+            deploymentBindingError = undefined;
+            storageCause = undefined;
+            console.log('[server] deployment storage verified; serving requests');
+        }).catch(reportStorageCause).finally(() => { checking = false; });
     }, 5000).unref();
 }
+// The local demo principal acts without a session, so it must exist as a user before
+// its first run. Provisioned on its own — not inside the storage check above, where a
+// missing tenant became a silent permanent 503 that also blocked POST /api/setup, the
+// route that creates the tenant. See localDemoProvisioner.
+const ensureLocalDemoUser = localDemoProvisioner(env.EAOS_DEMO_MODE === 'local' ? pgPool : undefined, localDemoUser());
+if (!deploymentBindingError) await ensureLocalDemoUser();
+// Explicit list of proxies whose X-Forwarded-For names the client (request-origin.ts).
+const trustedProxies = parseTrustedProxies(env.EAOS_TRUSTED_PROXIES);
 const runRepository = pgPool ? new PostgresRunRepository(pgPool) : undefined;
 configureRuntimeRepository(runRepository);
 const workspaceRepository = pgPool ? new PostgresWorkspaceRepository(pgPool) : undefined;
@@ -850,11 +853,22 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const user = await getRefreshUser(readCookie(req, 'eaos_refresh'));
             auth = { authenticated: Boolean(user), user, error: user ? undefined : 'Session expired or revoked' };
         } else {
-            auth = await authenticateRequest(headers);
+            // In local demo mode a request with no credential is the administrator,
+            // so the gateway first establishes it is the developer's own (loopback
+            // client, local Host, no foreign Origin) — see localDemoVerdict.
+            auth = await authenticateRequest(headers, { localDemo: env.EAOS_DEMO_MODE === 'local' ? localDemoVerdict(req, trustedProxies) : undefined });
         }
+        // A demo identity counts only while the mode that minted it is on.
+        // authenticateRequest enforces that for keys and tokens; the cookie session
+        // path above does not go through it, and visitor sessions last 14 days.
+        if (auth.user && !demoPrincipalPermitted(auth.user)) auth = { authenticated: false, error: DEMO_DISABLED_ERROR };
         if (!auth.authenticated) {
             sendJSON(res, 401, { error: auth.error ?? 'Unauthorized' });
             return;
+        }
+        if (auth.user?.id === LOCAL_DEMO_PRINCIPAL_ID) {
+            const problem = await ensureLocalDemoUser();
+            if (problem) { sendJSON(res, 503, { error: problem }); return; }
         }
     }
 
@@ -884,12 +898,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     }
     const chatOwner = { userId, tenantId: authUser?.tenantId ?? '' };
 
-    // Rate limiting — apply before any route processing
+    // Rate limiting — apply before any route processing. Unauthenticated calls key on
+    // the client as rateLimitSubject attributes it: behind the web tier's proxy the
+    // socket peer is the web server for every visitor, which made each public auth
+    // path one bucket for the whole deployment. When nothing in front of the web
+    // tier names clients, that is still true for a visitor's first calls, so those
+    // carry budgets sized for it (rate-limiter.ts unauthenticatedBudget).
     if (!['/api/live', '/api/ready', '/api/health'].includes(path)) {
-        const { applyRateLimit } = await import('./rate-limiter.js');
-        const key = authUser ? `${authUser.tenantId}:${userId}` : `${req.socket.remoteAddress ?? 'unknown'}:${path}`;
-        const rl = applyRateLimit(res, key, authUser?.role ?? 'unauthenticated');
-        if (rl.blocked) {
+        const { applyRateLimit, applyUnauthenticatedRateLimit } = await import('./rate-limiter.js');
+        const rl = authUser
+            ? applyRateLimit(res, `${authUser.tenantId}:${userId}`, authUser.role)
+            : applyUnauthenticatedRateLimit(res, req, method, path, trustedProxies);
+        if (rl?.blocked) {
             sendJSON(res, 429, { error: 'Rate limit exceeded', resetInMs: rl.resetInMs });
             return;
         }
@@ -935,10 +955,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (/^\/api\/tools\/[^/]+\/(auth|(oauth\/)?callback)$/.test(path) && guardRole('admin')) return;
     if (path === '/api/marketing/notifications/config' && guardRole('operator')) return;
     if (method !== 'GET' && (path.startsWith('/api/marketplace/skills') || path === '/api/mcp/execute') && guardRole('operator')) return;
-    // Demo visitors may decide steps of their OWN runs (always simulated): the
-    // executionRoute check below 404s any run they cannot read, and a role=user
-    // principal can only read runs it owns.
-    if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && !isDemoPrincipal(authUser) && guardRole('operator')) return;
+    // Public demo visitors may decide steps of their OWN runs (always simulated):
+    // the executionRoute check below 404s any run they cannot read, and a role=user
+    // principal can only read runs it owns. Visitors cannot authenticate outside
+    // public mode at all; the mode check keeps this exemption from depending on that.
+    if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && !(env.EAOS_DEMO_MODE === 'public' && isDemoVisitor(authUser)) && guardRole('operator')) return;
     /**
      * Run mode follows one rule (run-mode.ts): demo visitors are always
      * simulated, otherwise a client may choose, and with no choice no configured
@@ -1389,7 +1410,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // POST /api/auth/token — issue JWT from API key or credentials
         if (path === '/api/auth/token' && method === 'POST') {
             if (!authUser || authUser.id === 'anonymous') { sendJSON(res, 401, { error: 'Authentication required to issue token' }); return; }
+            // A demo visitor already holds the only session it needs; more credentials
+            // for an anonymous internet visitor are only more to outlive the demo.
+            if (isDemoVisitor(authUser)) { sendJSON(res, 403, { error: 'Demo sessions cannot issue further credentials' }); return; }
             const body = await readBody(req);
+            // createBrowserSession ends the session no later than the presenting key
+            // (authorityExpiresAt), and reports the access lifetime it actually granted.
             if (body.browser === true) {
                 if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
                 const issued = await createBrowserSession(authUser);
@@ -1399,7 +1425,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 const expiresIn = typeof body.expiresIn === 'number' ? body.expiresIn : 900;
                 if (!Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > 86400) { sendJSON(res, 400, { error: 'Invalid token lifetime' }); return; }
                 const issued = await createBrowserSession(authUser, expiresIn);
-                sendJSON(res, 200, { token: issued.token, expiresIn, user: issued.user });
+                sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
             }
             return;
         }
@@ -1445,6 +1471,13 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/auth/token/refresh' && method === 'POST') {
             if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
             const issued = await refreshBrowserSession(readCookie(req, 'eaos_refresh'));
+            // A demo session whose mode has been switched off is over, not renewable.
+            if (issued && !demoPrincipalPermitted(issued.user)) {
+                await revokeBrowserSession(issued.user.sessionId!);
+                setSessionCookies(res);
+                sendJSON(res, 401, { error: DEMO_DISABLED_ERROR });
+                return;
+            }
             setSessionCookies(res, issued);
             if (!issued) { sendJSON(res, 401, { error: 'Session expired or revoked' }); return; }
             sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
@@ -1530,11 +1563,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // POST /api/users/apikeys — create new API key (returns raw key once, stores hash in DB)
         if (path === '/api/users/apikeys' && method === 'POST') {
             if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
+            // An anonymous demo visitor gets one session, not a durable key to keep.
+            if (isDemoVisitor(authUser)) { sendJSON(res, 403, { error: 'Demo sessions cannot create API keys' }); return; }
             try {
                 const { generateApiKey } = await import('./auth.js');
                 const body = await readBody(req);
                 const label = typeof body.label === 'string' ? body.label : 'api-key';
-                const expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
+                // Never later than the credential presenting this request: an expiring
+                // key (or a session minted from one) cannot mint a key that outlives it.
+                const expiresAt = boundedKeyExpiry(typeof body.expiresAt === 'string' ? body.expiresAt : null, authUser);
                 const { rawKey, keyHash, keyPrefix } = generateApiKey();
                 const keyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
@@ -5802,7 +5839,10 @@ void initOTel('gateway');
 // Attach WebSocket handler for live execution streaming
 attachWebSocket(server, {
     authenticate: async req => {
-        const result = await authenticateRequest({ authorization: req.headers.authorization, 'x-api-key': typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : undefined });
+        const result = await authenticateRequest(
+            { authorization: req.headers.authorization, 'x-api-key': typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : undefined },
+            { localDemo: env.EAOS_DEMO_MODE === 'local' ? localDemoVerdict(req, trustedProxies) : undefined },
+        );
         return result.authenticated && result.user && (runRepository || result.user.tenantId === deploymentTenantId) ? result.user : undefined;
     },
     authorize: async (user, channel) => {
@@ -5816,11 +5856,14 @@ attachWebSocket(server, {
     },
 });
 
-server.listen(PORT, () => {
+// HOST unset listens on every interface, which a container needs; `pnpm dev` sets
+// 127.0.0.1 so local demo mode is not reachable from the network at all.
+const onListening = () => {
     console.log(`\n  ╔══════════════════════════════════════╗`);
     console.log(`  ║   EOS Gateway — Enterprise OS API    ║`);
     console.log(`  ║   http://localhost:${PORT}              ║`);
     console.log(`  ╚══════════════════════════════════════╝\n`);
+    console.log(`  Listening on ${env.HOST ?? 'every interface'}, port ${PORT}`);
     console.log(`  Endpoints:`);
     console.log(`    POST /api/query                    — Natural language query`);
     console.log(`    GET  /api/query/:id                — Get session result`);
@@ -5855,7 +5898,9 @@ server.listen(PORT, () => {
     console.log(`  GitHub: ${process.env.GITHUB_TOKEN ? '✅ GITHUB_TOKEN configured' : '⚠️  GITHUB_TOKEN not set'}`);
     console.log(`  Persistence: ${storeResult.mode === 'postgres' ? '✅ PostgreSQL (DATABASE_URL)' : storeResult.mode === 'file' ? `✅ File-backed (${storeResult.path})` : '⚠️  EPHEMERAL — in-memory only, all state lost on restart'}`);
     console.log(`  OpenTelemetry: ${process.env.OTEL_EXPORTER_OTLP_ENDPOINT ? '✅ Exporting to ' + process.env.OTEL_EXPORTER_OTLP_ENDPOINT : '📝 Set OTEL_EXPORTER_OTLP_ENDPOINT to enable'}\n`);
-});
+};
+if (env.HOST) server.listen(PORT, env.HOST, onListening);
+else server.listen(PORT, onListening);
 
 // Graceful shutdown — flush persistent store
 let shutdownStarted = false;

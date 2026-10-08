@@ -98,3 +98,97 @@ describe('API key lifecycle', () => {
     expect(await lifecycle.revokeApiKey('missing', owner, pool)).toBe(false);
   });
 });
+
+describe('credentials minted from an expiring key', () => {
+  const inAnHour = Date.now() + 3600_000;
+  const shortLived = { ...owner, authorityExpiresAt: inAnHour };
+
+  it('caps what a bounded principal asks for, and leaves everyone else alone', () => {
+    expect(lifecycle.boundedKeyExpiry(null, shortLived)).toBe(new Date(inAnHour).toISOString());
+    expect(lifecycle.boundedKeyExpiry('2099-01-01T00:00:00Z', shortLived)).toBe(new Date(inAnHour).toISOString());
+    const sooner = new Date(Date.now() + 60_000).toISOString();
+    expect(lifecycle.boundedKeyExpiry(sooner, shortLived)).toBe(sooner);
+    expect(lifecycle.boundedKeyExpiry(null, owner)).toBeNull();
+    expect(lifecycle.boundedKeyExpiry('2099-01-01T00:00:00Z', owner)).toBe('2099-01-01T00:00:00Z');
+  });
+
+  it('cannot rotate a longer-lived sibling key into a fresh one that outlives it', async () => {
+    seed();
+    const replacement = await lifecycle.rotateApiKey('old-key', shortLived);
+    expect(replacement?.expiresAt).toBe(new Date(inAnHour).toISOString());
+    expect(keys.lookupApiKey(replacement!.rawKey)?.authorityExpiresAt).toBe(inAnHour);
+  });
+
+  it('caps a PostgreSQL rotation the same way', async () => {
+    const { pool, query } = fakePool();
+    const replacement = await lifecycle.rotateApiKey('old-key', shortLived, pool);
+    expect(replacement?.expiresAt).toBe(new Date(inAnHour).toISOString());
+    expect(query.mock.calls.find(([sql]) => sql.startsWith('INSERT'))?.[1]).toContain(new Date(inAnHour).toISOString());
+  });
+});
+
+describe('PostgreSQL key resolution', () => {
+  const principal = { user_id: owner.id, email: owner.email, name: owner.name, role: 'user', scopes: ['engineering'], tenant_id: owner.tenantId };
+
+  /** authenticate_api_key answers for `storedHash`; api_keys holds it with `expiresAt`. */
+  function lookupPool(storedHash: string, expiresAt: string | null, options: { revoked?: boolean; failUpdate?: boolean } = {}) {
+    let hash = storedHash;
+    const direct = vi.fn(async (sql: string, params?: unknown[]) => ({ rows: sql.includes('authenticate_api_key') && params?.[0] === hash ? [principal] : [] }));
+    const scoped = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.startsWith('SELECT expires_at')) return { rows: !options.revoked && params?.[0] === hash ? [{ expires_at: expiresAt }] : [] };
+      if (sql.startsWith('UPDATE api_keys SET key_hash')) {
+        if (options.failUpdate) throw new Error('permission denied for table api_keys');
+        if (params?.[1] === hash) hash = params[0] as string;
+      }
+      return { rows: [] };
+    });
+    return { pool: { query: direct, connect: vi.fn(async () => ({ query: scoped, release: vi.fn() })) }, direct, scoped, stored: () => hash };
+  }
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+
+  it('carries the key expiry, read under the tenant context', async () => {
+    const generated = auth.generateApiKey();
+    const { pool, scoped } = lookupPool(generated.keyHash, '2099-01-01T00:00:00Z');
+    const user = await lifecycle.resolvePostgresApiKey(pool, generated.rawKey);
+    expect(user).toMatchObject({ id: owner.id, tenantId: owner.tenantId, authorityExpiresAt: Date.parse('2099-01-01T00:00:00Z') });
+    expect(scoped.mock.calls.some(([sql, params]) => sql.includes('set_config') && params?.[0] === owner.tenantId)).toBe(true);
+    expect(scoped.mock.calls.some(([sql]) => sql.startsWith('UPDATE'))).toBe(false);
+  });
+
+  it('denies a key revoked between the lookup and the expiry read', async () => {
+    const generated = auth.generateApiKey();
+    expect(await lifecycle.resolvePostgresApiKey(lookupPool(generated.keyHash, null, { revoked: true }).pool, generated.rawKey)).toBeUndefined();
+  });
+
+  it('resolves a key hashed before API_KEY_HASH_SECRET was set, then moves it onto the current hash', async () => {
+    const legacy = auth.generateApiKey();
+    vi.resetModules();
+    vi.stubEnv('API_KEY_HASH_SECRET', 'fixture-independent-key-hash-secret');
+    lifecycle = await import('./api-key-lifecycle.js');
+    auth = await import('./auth.js');
+    const { pool, direct, stored } = lookupPool(legacy.keyHash, null);
+    expect(await lifecycle.resolvePostgresApiKey(pool, legacy.rawKey)).toMatchObject({ id: owner.id, authorityExpiresAt: undefined });
+    await settle();
+    expect(stored()).toBe(auth.hashApiKey(legacy.rawKey));
+    expect(direct.mock.calls.find(([sql]) => sql.includes('touch_api_key'))?.[1]).toEqual([stored()]);
+    // Next use finds it under the current hash first.
+    expect(await lifecycle.resolvePostgresApiKey(pool, legacy.rawKey)).toMatchObject({ id: owner.id });
+    vi.unstubAllEnvs();
+  });
+
+  it('keeps a legacy key working when the move is not permitted', async () => {
+    const legacy = auth.generateApiKey();
+    vi.resetModules();
+    vi.stubEnv('API_KEY_HASH_SECRET', 'fixture-independent-key-hash-secret');
+    lifecycle = await import('./api-key-lifecycle.js');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { pool, stored } = lookupPool(legacy.keyHash, null, { failUpdate: true });
+    expect(await lifecycle.resolvePostgresApiKey(pool, legacy.rawKey)).toMatchObject({ id: owner.id });
+    expect(await lifecycle.resolvePostgresApiKey(pool, legacy.rawKey)).toMatchObject({ id: owner.id });
+    await settle();
+    expect(stored()).toBe(legacy.keyHash);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+    vi.unstubAllEnvs();
+  });
+});

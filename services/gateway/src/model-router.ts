@@ -304,11 +304,32 @@ export function getCostHistory(limit = 100): typeof costLog {
 
 const rateLimitWindows = new Map<string, { count: number; resetAt: number }>();
 
+/**
+ * A window is only replaced when its key comes back, so keys that never return —
+ * one per client address or browser session, and clients choose some of those —
+ * used to stay in this map for the life of the process. Expired windows are swept
+ * once the map is large enough to matter, at most once a second so a flood of new
+ * keys cannot turn every request into a full scan.
+ */
+const RATE_LIMIT_SWEEP_SIZE = 10_000;
+let lastRateLimitSweep = 0;
+function sweepExpiredRateLimitWindows(now: number): void {
+  if (rateLimitWindows.size < RATE_LIMIT_SWEEP_SIZE || now - lastRateLimitSweep < 1000) return;
+  lastRateLimitSweep = now;
+  for (const [key, window] of rateLimitWindows) if (now > window.resetAt) rateLimitWindows.delete(key);
+}
+
+/** Live window count, for tests and diagnostics. */
+export function rateLimitWindowCount(): number {
+  return rateLimitWindows.size;
+}
+
 export function checkRateLimit(key: string, maxPerMinute: number): { allowed: boolean; remaining: number; resetInMs: number } {
   const now = Date.now();
   const window = rateLimitWindows.get(key);
 
   if (!window || now > window.resetAt) {
+    sweepExpiredRateLimitWindows(now);
     rateLimitWindows.set(key, { count: 1, resetAt: now + 60_000 });
     // Also attempt Redis sliding window (async, non-blocking)
     _redisRateLimit(key, maxPerMinute).catch(() => {});

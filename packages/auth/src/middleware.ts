@@ -26,6 +26,14 @@ export interface AuthUser {
     tenantId: string;
     sessionId?: string;
     tokenExpiresAt?: number;
+    /**
+     * Hard end of this principal's authority when it derives from an expiring API
+     * key — presented directly, or through a session minted from one. Credentials
+     * this principal mints (keys, sessions, tokens) never outlive it; otherwise a
+     * one-hour key could buy a non-expiring one. Absent when nothing bounds the
+     * identity (SSO, bootstrap and demo sessions, non-expiring keys).
+     */
+    authorityExpiresAt?: number;
 }
 
 /** Result of generating a new API key — raw key is shown once, only hash is stored. */
@@ -107,17 +115,57 @@ const ALLOW_DEV_API_KEYS = process.env.ALLOW_DEV_API_KEYS === 'true';
  */
 const DEMO_MODE = process.env.EAOS_DEMO_MODE ?? 'off';
 export const DEMO_PRINCIPAL_PREFIX = 'demo:';
+export const LOCAL_DEMO_PRINCIPAL_ID = `${DEMO_PRINCIPAL_PREFIX}local`;
+export const DEMO_DISABLED_ERROR = 'Demo access is not enabled on this deployment';
 
 export function isDemoPrincipal(user: Pick<AuthUser, 'id'> | undefined): boolean {
     return Boolean(user?.id.startsWith(DEMO_PRINCIPAL_PREFIX));
 }
 
+/** A public demo visitor (`demo:<uuid>`): every demo principal except the local developer. */
+export function isDemoVisitor(user: Pick<AuthUser, 'id'> | undefined): boolean {
+    return isDemoPrincipal(user) && user!.id !== LOCAL_DEMO_PRINCIPAL_ID;
+}
+
+/**
+ * Whether a demo identity may act under the demo mode this process runs with:
+ * `demo:local` only in local mode, visitors only in public mode. Non-demo
+ * principals always may.
+ *
+ * Demo identities are recognised by their id alone, and what they hold outlives
+ * the mode that minted them: browser sessions last 14 days, API keys until
+ * revoked, and the users row is permanent. Without this check, switching a
+ * public demo off left every visitor with a working credential — now running
+ * live, because forced simulation is a demo-mode rule — and a key minted by the
+ * local administrator stayed an admin credential on that database.
+ */
+export function demoPrincipalPermitted(user: Pick<AuthUser, 'id'> | undefined): boolean {
+    if (!isDemoPrincipal(user)) return true;
+    return user!.id === LOCAL_DEMO_PRINCIPAL_ID ? !IS_PRODUCTION && DEMO_MODE === 'local' : DEMO_MODE === 'public';
+}
+
 /** The single principal behind `EAOS_DEMO_MODE=local`: the developer on their own machine. */
 export function localDemoUser(): AuthUser {
     return {
-        id: `${DEMO_PRINCIPAL_PREFIX}local`, email: 'demo@localhost', name: 'Local demo', role: 'admin',
+        id: LOCAL_DEMO_PRINCIPAL_ID, email: 'demo@localhost', name: 'Local demo', role: 'admin',
         teams: [], personaScopes: ['*'], tenantId: process.env.EAOS_TENANT_ID || 'default',
     };
+}
+
+/**
+ * The caller's finding on whether a credential-less request is the developer's
+ * own (see the gateway's `localDemoVerdict`). Headers alone cannot show that —
+ * the client address is a property of the socket — so the auth package does not
+ * guess, and treats a missing verdict as a refusal.
+ */
+export interface LocalDemoVerdict {
+    allowed: boolean;
+    /** Why it was refused; generic wording, never an echo of request values. */
+    reason?: string;
+}
+
+export interface AuthenticateOptions {
+    localDemo?: LocalDemoVerdict;
 }
 
 // NOTE: the fail-fast check for a missing JWT_SECRET used to live here as a
@@ -127,7 +175,13 @@ export function localDemoUser(): AuthUser {
 // `loadEnvOrExit()` from @agentos/config, which prints a set/missing table and
 // exits 78 (EX_CONFIG). Do not reintroduce a module-scope throw here.
 
-export async function authenticateRequest(headers: Record<string, string | undefined>): Promise<AuthResult> {
+export async function authenticateRequest(headers: Record<string, string | undefined>, options: AuthenticateOptions = {}): Promise<AuthResult> {
+    const result = await authenticateCredential(headers, options);
+    if (result.user && !demoPrincipalPermitted(result.user)) return { authenticated: false, error: DEMO_DISABLED_ERROR };
+    return result;
+}
+
+async function authenticateCredential(headers: Record<string, string | undefined>, options: AuthenticateOptions): Promise<AuthResult> {
     // 1. Try X-API-Key header first
     const apiKey = headers['x-api-key'];
     if (apiKey) {
@@ -173,8 +227,16 @@ export async function authenticateRequest(headers: Record<string, string | undef
     //    rejected under production by @agentos/config; the IS_PRODUCTION check is
     //    defence-in-depth. `public` demo visitors instead hold a browser session
     //    minted by POST /api/auth/demo, so they never reach this fallback.
+    //
+    //    Having no credential is the credential here, so it is honoured only when
+    //    the caller has established the request is the developer's own. It used to
+    //    be honoured for any caller: another machine on the network, or any web page
+    //    the developer had open (a text/plain POST needs no CORS preflight), was the
+    //    administrator.
     if (!IS_PRODUCTION && DEMO_MODE === 'local') {
-        return { authenticated: true, user: localDemoUser() };
+        if (options.localDemo?.allowed) return { authenticated: true, user: localDemoUser() };
+        const reason = options.localDemo?.reason;
+        return { authenticated: false, error: `Local demo mode only serves this machine${reason ? `: ${reason}` : ''}. Send a credential from anywhere else.` };
     }
 
     return { authenticated: false, error: 'Missing authentication' };
@@ -260,9 +322,21 @@ export function hashApiKey(rawKey: string, secret?: string): string {
     return createHmac('sha256', signingSecret).update(rawKey).digest('hex');
 }
 
+/**
+ * Every hash a stored key may have been written under, the current one first.
+ *
+ * New keys are hashed with the first API_KEY_HASH_SECRET entry, or the first
+ * JWT_SECRET entry when that is unset. Keys written before API_KEY_HASH_SECRET
+ * was set were hashed with a JWT secret, so those stay candidates too: the
+ * README advises adding API_KEY_HASH_SECRET around a JWT rotation, and doing so
+ * used to orphan every existing key — the single-use bootstrap admin key
+ * included. A key found under any candidate but the first is moved onto the
+ * current hash by the key store on use (see the gateway's api-key-store and
+ * api-key-lifecycle), so it then survives the old secret being retired.
+ */
 export function hashApiKeyCandidates(rawKey: string): string[] {
-    const raw = process.env.API_KEY_HASH_SECRET || JWT_SECRET;
-    return [...new Set([...raw.split(',').map(value => value.trim()).filter(Boolean), raw].filter(Boolean).map(secret => hashApiKey(rawKey, secret)))];
+    const sources = [process.env.API_KEY_HASH_SECRET ?? '', JWT_SECRET].filter(Boolean);
+    return [...new Set(sources.flatMap(raw => [...raw.split(',').map(value => value.trim()).filter(Boolean), raw]).map(secret => hashApiKey(rawKey, secret)))];
 }
 
 async function resolveApiKey(key: string): Promise<AuthUser | undefined> {

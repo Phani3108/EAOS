@@ -124,9 +124,25 @@ export function lookupApiKey(rawKey: string): AuthUser | undefined {
 
   const match = candidates.map(keyHash => ({ keyHash, row: store!.get(API_KEY_TABLE, keyHash) as unknown as StoredApiKey | undefined })).find(candidate => candidate.row);
   if (!match?.row) return undefined;
-  const { keyHash, row } = match;
+  let { keyHash } = match;
+  const { row } = match;
 
-  if (row.expiresAt && !(new Date(row.expiresAt).getTime() > Date.now())) return undefined;
+  const expiresAt = row.expiresAt ? new Date(row.expiresAt).getTime() : undefined;
+  if (expiresAt !== undefined && !(expiresAt > Date.now())) return undefined;
+
+  // Found under an older hash (written before API_KEY_HASH_SECRET was set, or
+  // under a JWT secret since rotated): move the row onto the current hash, keeping
+  // its public id, so the key survives that secret being retired.
+  const current = candidates[0]!;
+  if (keyHash !== current) {
+    try {
+      store.insert(API_KEY_TABLE, current, { ...row, id: current, keyId: publicKeyId(row) } as unknown as Record<string, unknown>);
+      store.delete(API_KEY_TABLE, keyHash);
+      keyHash = current;
+    } catch {
+      /* the key still resolves under its old hash; the move is retried next use */
+    }
+  }
 
   // Best-effort last-used stamp. Never block or fail auth on it.
   try {
@@ -143,6 +159,7 @@ export function lookupApiKey(rawKey: string): AuthUser | undefined {
     teams: [],
     personaScopes: (row.scopes?.length ? row.scopes : ['*']) as AuthUser['personaScopes'],
     tenantId: row.tenantId ?? 'default',
+    authorityExpiresAt: expiresAt,
   };
 }
 

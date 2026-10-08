@@ -69,6 +69,20 @@ export async function verifyPlatformGovernance(pool: RuntimePool, runs: Postgres
   await repository.shareDataset(owner, dataset.id, shared.version, []);
   await assert.rejects(repository.getActiveVersion(owner, staged.packageId));
   await assert.rejects(repository.getDataset(reviewer, dataset.id));
+  // Demo principals are users (the durable runtime references them) but never
+  // members: a public demo provisions one per visit, and the local administrator
+  // exists only while local mode is on — so it must not count as the last admin.
+  const demoAdmin = `demo:contract-${tenantId}`;
+  const demoClient = await pool.connect();
+  try {
+    await demoClient.query('BEGIN');
+    await demoClient.query("SELECT set_config('app.tenant_id', $1, true)", [tenantId]);
+    await demoClient.query("INSERT INTO users (id,email,name,role,tenant_id) VALUES ($1,$2,'Demo fixture','admin',$3)", [demoAdmin, `${demoAdmin}@demo.invalid`, tenantId]);
+    await demoClient.query('COMMIT');
+  } finally { demoClient.release(); }
+  const members = await repository.members(owner) as Array<{ id: string }>;
+  assert.ok(members.some(member => member.id === owner.userId));
+  assert.ok(members.every(member => !member.id.startsWith('demo:')));
   await repository.updateMember(owner, owner.userId, 0, { role: 'admin', state: 'active', personaScopes: ['*'] });
   await assert.rejects(repository.updateMember(owner, owner.userId, 1, { role: 'user', state: 'active', personaScopes: ['*'] }));
   const pending: RuntimeSnapshot = { id: randomUUID(), tenantId, userId: reviewerId, persona: 'engineering', definitionHash: definition.definitionHash, status: 'queued', mode: 'simulation', inputs: {}, outputs: {}, steps: [{ stepId: 'step', kind: 'transform', outputKey: 'result', status: 'pending', provenance: 'none' }] };

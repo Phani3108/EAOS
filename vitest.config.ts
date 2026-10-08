@@ -46,6 +46,8 @@ export default defineConfig({
     include: [
       'services/*/src/**/*.test.ts',
       'packages/*/src/**/*.test.ts',
+      // Framework-free web helpers only; components need a DOM environment.
+      'apps/web/src/lib/**/*.test.ts',
     ],
     exclude: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/.turbo/**'],
     environment: 'node',

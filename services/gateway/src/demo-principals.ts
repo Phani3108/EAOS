@@ -31,3 +31,43 @@ export async function provisionDemoUser(pool: Pool | undefined, user: AuthUser):
     );
   });
 }
+
+/**
+ * Provisioning for the local demo principal, which acts without a session.
+ *
+ * It used to run inside the deployment-storage check, where a missing tenant — any
+ * EAOS_TENANT_ID but the `default` one migration 007 seeds, until setup runs — was
+ * swallowed into the generic "storage not verified" 503. That 503 covered every
+ * route, POST /api/setup included: the one step that creates the tenant, and the
+ * step the swallowed message named. Nothing was logged, and the retry loop could
+ * never succeed.
+ *
+ * Now it is its own step. Each failure is logged with its cause (once per distinct
+ * cause), retried on the next local-demo request, and reported to that request
+ * only, so setup stays reachable. Resolves to undefined when the principal is
+ * ready, or to a message safe to return to the caller.
+ */
+export function localDemoProvisioner(pool: Pool | undefined, user: AuthUser, log: Pick<Console, 'log' | 'error'> = console): () => Promise<string | undefined> {
+  let ready = !pool;
+  let pending: Promise<string | undefined> | undefined;
+  let lastCause: string | undefined;
+  return () => {
+    if (ready) return Promise.resolve(undefined);
+    pending ??= provisionDemoUser(pool, user).then(
+      () => {
+        ready = true;
+        if (lastCause) log.log(`[demo] local demo user provisioned in tenant "${user.tenantId}"`);
+        return undefined;
+      },
+      (err: unknown) => {
+        const cause = err instanceof Error ? err.message : String(err);
+        if (cause !== lastCause) {
+          log.error(`[demo] LOCAL DEMO UNAVAILABLE — ${cause}. Credential-less requests get 503 until this succeeds; it is retried on each one.`);
+          lastCause = cause;
+        }
+        return err instanceof DemoTenantMissingError ? err.message : 'The local demo user could not be provisioned; the gateway log has the cause';
+      },
+    ).finally(() => { pending = undefined; });
+    return pending;
+  };
+}

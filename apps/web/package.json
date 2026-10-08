@@ -4,7 +4,7 @@
     "private": true,
     "description": "EAOS Mission Control — Frontend",
     "scripts": {
-        "dev": "next dev --port 3010",
+        "dev": "next dev --port 3010 --hostname 127.0.0.1",
         "build": "next build",
         "start": "next start --port 3010",
         "lint": "next lint"
