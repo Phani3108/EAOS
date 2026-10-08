@@ -392,8 +392,9 @@ export class Scheduler {
      * Resolve the scheduled job's skillId against all persona skill catalogs.
      * Accepts bare ids ("blog-from-brief"), slugs, or legacy dotted ids.
      * Returns undefined if not found — caller treats that as a no-op job.
+     * Public so the job routes authorize exactly the definition a run would execute.
      */
-    private resolveSkillForJob(job: ScheduledJob): ReturnType<typeof getEngineeringSkill> {
+    resolveSkillForJob(job: Pick<ScheduledJob, 'skillId' | 'personaId'>): ReturnType<typeof getEngineeringSkill> {
         const id = job.skillId;
         // Try persona-specific first to short-circuit.
         switch (job.personaId) {
