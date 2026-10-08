@@ -97,6 +97,13 @@ async function main() {
       return { status: response.status, data: await response.json(), headers: response.headers };
     }
     assert.equal((await request('/api/live')).status, 200);
+    // Every caller here is 127.0.0.1 and nothing is trusted to name a client — the
+    // shape of a deployment whose web tier proxies every browser. A visitor's first
+    // calls must still get through past the strict 10/minute budget.
+    for (let visitor = 0; visitor < 15; visitor++) {
+      assert.equal((await request('/api/auth/config')).status, 200, 'the sign-in configuration is never rate limited');
+      assert.equal((await request('/api/auth/demo', {})).status, 404, 'demo start draws on the sign-in budget (404: demo mode is off)');
+    }
     assert.equal((await request('/api/skills')).status, 401);
     const login = await request('/api/auth/token', { browser: true }, { 'X-API-Key': rotated.rawKey });
     assert.equal(login.status, 200);

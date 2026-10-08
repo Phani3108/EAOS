@@ -118,7 +118,7 @@ const PUBLIC_PATHS: readonly PublicPath[] = [
     reason:
       'Mints an isolated demo-visitor session when EAOS_DEMO_MODE=public (404 otherwise). The principal ' +
       'is a fresh role=user identity whose runs are forced to simulation, so it can neither spend LLM ' +
-      'budget nor read another visitor\'s work. Rate limited per address like every unauthenticated call.',
+      'budget nor read another visitor\'s work. Rate limited per client on the sign-in budget (rate-limiter.ts).',
   },
   {
     method: 'POST',

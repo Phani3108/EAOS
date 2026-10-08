@@ -53,6 +53,14 @@ services:
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3010}
       - GATEWAY_URL=${GATEWAY_URL:-http://localhost:3010/_/gateway}
       - API_KEY_HASH_SECRET=${API_KEY_HASH_SECRET:-}
+      # off | public. `local` refuses to boot in production by design.
+      - EAOS_DEMO_MODE=${EAOS_DEMO_MODE:-off}
+      # Every browser reaches the gateway through the web service's /_/gateway
+      # proxy, which adds no X-Forwarded-For. Leave this empty unless a TLS edge in
+      # front of `web` sets X-Forwarded-For; then list the web service's address or
+      # network (e.g. its compose subnet). Trusting `web` without such an edge lets
+      # a client name any address, so it is not trusted by default.
+      - EAOS_TRUSTED_PROXIES=${EAOS_TRUSTED_PROXIES:-}
       - VAULT_ADDR=${VAULT_ADDR:-}
       - VAULT_TOKEN=${VAULT_TOKEN:-}
       - VAULT_KV_MOUNT=${VAULT_KV_MOUNT:-secret}

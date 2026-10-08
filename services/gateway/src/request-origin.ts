@@ -118,7 +118,9 @@ const digest = (value: string) => createHash('sha256').update(value).digest('hex
  * values are client-held, so a client can mint itself fresh buckets — which costs
  * nobody else anything, unlike one shared bucket that any client can drain.
  * Paths that carry neither (config, demo, authorize, setup) share the proxy's
- * bucket until the edge in front of the web tier forwards client addresses.
+ * bucket until the edge in front of the web tier forwards client addresses —
+ * which is why those paths have budgets sized for a shared bucket
+ * (rate-limiter.ts unauthenticatedBudget).
  */
 export function rateLimitSubject(req: RequestLike, trusted: AddressMatcher): string {
   const client = clientAddress(req.socket.remoteAddress, header(req, 'x-forwarded-for'), trusted);

@@ -29,7 +29,7 @@ import { boundedKeyExpiry, resolveApiKeyScopes, resolvePostgresApiKey, revokeApi
 import { runSetup, SETUP_TABLE } from './setup.js';
 import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, isDemoPrincipal, isDemoVisitor, demoPrincipalPermitted, localDemoUser, DEMO_PRINCIPAL_PREFIX, LOCAL_DEMO_PRINCIPAL_ID, DEMO_DISABLED_ERROR } from './auth.js';
 import { DemoTenantMissingError, localDemoProvisioner, provisionDemoUser } from './demo-principals.js';
-import { localDemoVerdict, parseTrustedProxies, rateLimitSubject } from './request-origin.js';
+import { localDemoVerdict, parseTrustedProxies } from './request-origin.js';
 import { initAuthSessions, createBrowserSession, refreshBrowserSession, getSessionUser, getRefreshUser, revokeBrowserSession, issueLoginCode, consumeLoginCode, readCookie, cookie, setSessionCookies, setSessionRevocationHandler, persistOidcUser, setPrincipalResolver } from './auth-sessions.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
@@ -900,12 +900,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // Rate limiting — apply before any route processing. Unauthenticated calls key on
     // the client as rateLimitSubject attributes it: behind the web tier's proxy the
     // socket peer is the web server for every visitor, which made each public auth
-    // path one bucket for the whole deployment.
+    // path one bucket for the whole deployment. When nothing in front of the web
+    // tier names clients, that is still true for a visitor's first calls, so those
+    // carry budgets sized for it (rate-limiter.ts unauthenticatedBudget).
     if (!['/api/live', '/api/ready', '/api/health'].includes(path)) {
-        const { applyRateLimit } = await import('./rate-limiter.js');
-        const key = authUser ? `${authUser.tenantId}:${userId}` : `${rateLimitSubject(req, trustedProxies)}:${path}`;
-        const rl = applyRateLimit(res, key, authUser?.role ?? 'unauthenticated');
-        if (rl.blocked) {
+        const { applyRateLimit, applyUnauthenticatedRateLimit } = await import('./rate-limiter.js');
+        const rl = authUser
+            ? applyRateLimit(res, `${authUser.tenantId}:${userId}`, authUser.role)
+            : applyUnauthenticatedRateLimit(res, req, method, path, trustedProxies);
+        if (rl?.blocked) {
             sendJSON(res, 429, { error: 'Rate limit exceeded', resetInMs: rl.resetInMs });
             return;
         }
