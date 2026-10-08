@@ -29,8 +29,11 @@
  * silently produced zero spans for months because `@opentelemetry/api` was
  * absent from package.json and its dynamic import fell into a catch. The checks
  * needed here are presence, enum, integer range and boolean; none of that earns
- * a schema library.
+ * a schema library. Node built-ins (`node:net` for address syntax) cannot be
+ * missing, so they are fair game.
  */
+
+import { isIP } from 'node:net';
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -54,6 +57,19 @@ interface VarSpec {
 const SPEC = {
   NODE_ENV: { kind: 'enum', values: ['development', 'test', 'production'], default: 'development' },
   PORT: { kind: 'int', default: 3000, min: 1, max: 65535 },
+  /**
+   * Interface the gateway listens on. Unset listens on every interface, which a
+   * container needs. `pnpm dev` sets 127.0.0.1 so local demo mode is never
+   * reachable from the network.
+   */
+  HOST: { kind: 'string' },
+  /**
+   * Comma-separated proxy addresses (IPs or CIDR blocks) whose X-Forwarded-For
+   * names the client. Unset trusts nobody: unauthenticated rate limits key on
+   * the socket peer, which behind the web tier's /_/gateway proxy is the web
+   * server for every visitor. `pnpm dev` trusts loopback.
+   */
+  EAOS_TRUSTED_PROXIES: { kind: 'string' },
 
   // ── Security ──────────────────────────────────────────────────────────────
   /** HS256 signing secret. Comma-separated to rotate: sign with the first, verify against any. */
@@ -117,6 +133,8 @@ export type EnvKey = keyof typeof SPEC;
 export interface Env {
   NODE_ENV: 'development' | 'test' | 'production';
   PORT: number;
+  HOST?: string;
+  EAOS_TRUSTED_PROXIES?: string;
   JWT_SECRET?: string;
   AUTH_SECRET?: string;
   API_KEY_HASH_SECRET?: string;
@@ -226,6 +244,25 @@ function parseOne(
 }
 
 // ---------------------------------------------------------------------------
+// Address helpers
+// ---------------------------------------------------------------------------
+
+/** An IP address, or an IP/prefix block, as EAOS_TRUSTED_PROXIES entries must be. */
+function isAddressOrBlock(entry: string): boolean {
+  const [address = '', prefix, ...rest] = entry.split('/');
+  const family = isIP(address);
+  if (!family || rest.length) return false;
+  if (prefix === undefined) return true;
+  const bits = Number(prefix);
+  return /^\d+$/.test(prefix) && bits <= (family === 6 ? 128 : 32);
+}
+
+/** Whether a listen host keeps the gateway on this machine. */
+function isLoopbackListenHost(host: string | undefined): boolean {
+  return host === 'localhost' || host === '::1' || (isIP(host ?? '') === 4 && host!.startsWith('127.'));
+}
+
+// ---------------------------------------------------------------------------
 // Cross-field rules
 // ---------------------------------------------------------------------------
 
@@ -302,8 +339,31 @@ function crossFieldProblems(env: Env): EnvProblem[] {
       severity: isProd ? 'error' : 'warning',
       message: isProd
         ? 'Local demo mode signs every unauthenticated request in as an administrator and cannot run in production. Use EAOS_DEMO_MODE=public for a hosted demo.'
-        : 'Local demo mode is ON — unauthenticated requests act as the local demo administrator. Never expose this port.',
+        : 'Local demo mode is ON — credential-less requests from this machine (loopback client, local Host, no foreign Origin) act as the local demo administrator. Never expose this port.',
     });
+    // The request-level checks keep other machines out, but a port that is not
+    // reachable at all is the stronger guarantee — and the only one that covers a
+    // web dev server on the same machine relaying the network to this one.
+    if (!isProd && !isLoopbackListenHost(env.HOST)) {
+      problems.push({
+        key: 'HOST',
+        severity: 'warning',
+        message: `Local demo mode is ON and the gateway listens on ${env.HOST ?? 'every interface'}. Set HOST=127.0.0.1 (pnpm dev does) so no other machine can reach it.`,
+      });
+    }
+  }
+
+  if (env.EAOS_TRUSTED_PROXIES) {
+    // A malformed entry is an error rather than skipped: trust is the input to a
+    // rate-limit and local-access decision, and a typo should not silently change it.
+    const invalid = env.EAOS_TRUSTED_PROXIES.split(',').map(entry => entry.trim()).filter(entry => entry && !isAddressOrBlock(entry));
+    if (invalid.length) {
+      problems.push({
+        key: 'EAOS_TRUSTED_PROXIES',
+        severity: 'error',
+        message: `must be comma-separated IP addresses or CIDR blocks — got ${invalid.map(entry => `"${entry}"`).join(', ')}`,
+      });
+    }
   }
   if (env.EAOS_DEMO_MODE === 'public' && !signingSecret) {
     problems.push({

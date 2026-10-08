@@ -17,12 +17,8 @@ const CLIENT_ID     = process.env.OIDC_CLIENT_ID ?? '';
 const CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET ?? '';
 const REDIRECT_URI  = process.env.OIDC_REDIRECT_URI ?? '';
 
-/**
- * Only NODE_ENV=production tightens id_token verification (RS256 signature
- * check against the provider JWKS). In dev/demo the signature-less path is kept
- * so the anonymous/demo flow boots with no env vars exactly as before.
- */
-const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+// id_token signatures are verified against the provider JWKS in every
+// environment (see verifyIdToken); there is no signature-less development path.
 
 // ---------------------------------------------------------------------------
 // Discovery
@@ -106,15 +102,15 @@ export async function completeAuthorization(code: string, state: string, binding
   if (!pending || Date.now() - pending.createdAt >= 600_000 || !binding ||
       pending.binding !== createHash('sha256').update(binding).digest('hex')) throw new Error('Invalid or expired authorization state');
   const tokens = await exchangeCode(code, pending.verifier);
-  return verifyIdToken(tokens.id_token, pending.nonce);
+  // The keys are fetched for this token and handed to verification, not read back
+  // from shared state afterwards: another login's refresh can no longer swap them
+  // out — or, as it once did, empty them — between the two.
+  const keys = await loadJWKS(idTokenKeyId(tokens.id_token));
+  return verifyIdToken(tokens.id_token, pending.nonce, keys);
 }
 
 export async function exchangeCode(code: string, verifier: string): Promise<TokenResponse> {
   const cfg = await discoverOIDC();
-
-  // Pre-warm the JWKS cache (production only) so the subsequent synchronous
-  // verifyIdToken() can perform an RS256 signature check. No-op in dev/demo.
-  await prewarmJWKS();
 
   const body = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -143,7 +139,7 @@ export async function exchangeCode(code: string, verifier: string): Promise<Toke
 }
 
 // ---------------------------------------------------------------------------
-// ID token verification (signature-less in dev; JWKS in production)
+// ID token verification (RS256 against the provider JWKS)
 // ---------------------------------------------------------------------------
 
 interface OIDCClaims {
@@ -181,58 +177,84 @@ interface JWTHeader {
   typ?: string;
 }
 
-/** In-module JWKS cache (production: a longer-lived store / Redis could be used). */
-let _jwks: JWK[] | null = null;
+/**
+ * In-module JWKS cache: one complete key set and when it was fetched.
+ *
+ * It is replaced only by a successful fetch and never cleared. Every exchange
+ * used to null it before refetching, so a login whose token response arrived
+ * while another login's refetch was in flight found no keys and failed (its state
+ * already consumed), and one failed refetch left no keys for anyone.
+ */
+let _jwks: { keys: JWK[]; fetchedAt: number } | null = null;
+let _jwksFetch: Promise<JWK[]> | null = null;
+/** Keys older than this are refetched before use: rotation reaches us without a restart. */
+const JWKS_MAX_AGE_MS = 10 * 60_000;
+/** A token naming an unknown kid refetches at most this often, so it cannot drive a fetch per login. */
+const JWKS_REFETCH_COOLDOWN_MS = 30_000;
 
 /**
- * Fetch (and cache in-module) the provider JWKS from the discovery jwks_uri.
- * Guarded with try/catch — on any failure the cache is left empty and the
- * caller fails closed (production refuses tokens it cannot verify).
+ * Fetch the provider JWKS from the discovery jwks_uri and swap it in. Concurrent
+ * callers share one request. Throws on failure, leaving the previous set in place.
  */
 async function fetchJWKS(): Promise<JWK[]> {
-  if (_jwks) return _jwks;
-  try {
-    const cfg = await discoverOIDC();
-    if (!cfg.jwks_uri) throw new Error('discovery doc has no jwks_uri');
-    const res = await fetch(cfg.jwks_uri);
-    if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
-    const body = await res.json() as { keys?: JWK[] };
-    if (!Array.isArray(body.keys)) throw new Error('JWKS response missing keys[]');
-    _jwks = body.keys;
-    return _jwks;
-  } catch (err) {
-    // Leave the cache empty so the next call retries; verification fails closed.
-    throw new Error(`Unable to load OIDC JWKS: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  _jwksFetch ??= (async () => {
+    try {
+      const cfg = await discoverOIDC();
+      if (!cfg.jwks_uri) throw new Error('discovery doc has no jwks_uri');
+      const res = await fetch(cfg.jwks_uri);
+      if (!res.ok) throw new Error(`JWKS fetch failed: ${res.status}`);
+      const body = await res.json() as { keys?: JWK[] };
+      if (!Array.isArray(body.keys)) throw new Error('JWKS response missing keys[]');
+      _jwks = { keys: body.keys, fetchedAt: Date.now() };
+      return body.keys;
+    } catch (err) {
+      throw new Error(`Unable to load OIDC JWKS: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  })().finally(() => { _jwksFetch = null; });
+  return _jwksFetch;
 }
 
 /**
- * Pre-warm the in-module JWKS cache. Called from exchangeCode (async, always
- * runs before verifyIdToken) so that verifyIdToken can stay synchronous — its
- * signature/return type are preserved — while still performing a real RS256
- * signature check against freshly-fetched provider keys in production.
- *
- * In dev/demo (NODE_ENV !== 'production') this is a no-op so the flow needs no
- * IdP keys configured, exactly as before.
+ * Keys able to verify a token signed with `kid`: the cached set while it is fresh
+ * and knows that kid, otherwise a refetch (key rotation). Fails closed — throws —
+ * when stale keys cannot be refreshed; a kid that is still unknown after a
+ * refetch fails later, in verification.
  */
+export async function loadJWKS(kid?: string): Promise<JWK[]> {
+  const cached = _jwks;
+  const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+  if (cached && age < JWKS_MAX_AGE_MS && (!kid || cached.keys.some(key => key.kid === kid) || age < JWKS_REFETCH_COOLDOWN_MS)) return cached.keys;
+  return fetchJWKS();
+}
+
+/** Warm the key cache ahead of a login. Failures are left for loadJWKS to report. */
 export async function prewarmJWKS(): Promise<void> {
-  _jwks = null;
   try {
-    await fetchJWKS();
+    await loadJWKS();
   } catch {
-    // Swallow here; verifyIdToken fails closed if keys are still unavailable.
+    // Verification fails closed if keys are still unavailable.
+  }
+}
+
+/** The kid an id_token's header names, if its header can be read at all. */
+function idTokenKeyId(idToken: string): string | undefined {
+  try {
+    const header = JSON.parse(Buffer.from(idToken.split('.')[0] ?? '', 'base64url').toString()) as JWTHeader;
+    return typeof header.kid === 'string' ? header.kid : undefined;
+  } catch {
+    return undefined;
   }
 }
 
 /**
- * Synchronously verify the RS256 signature of an id_token against the already
- * cached provider JWKS. Selects the JWK by the token header 'kid', builds an
- * RSA public key with node:crypto createPublicKey({ key: jwk, format: 'jwk' })
- * (Node 18+ — no new dependency), and verifies 'RSA-SHA256' over the
- * 'header.payload' bytes with the base64url signature. Throws (fails CLOSED)
- * if the signature cannot be verified or the keys are unavailable.
+ * Synchronously verify the RS256 signature of an id_token against `keys`.
+ * Selects the JWK by the token header 'kid', builds an RSA public key with
+ * node:crypto createPublicKey({ key: jwk, format: 'jwk' }) (Node 18+ — no new
+ * dependency), and verifies 'RSA-SHA256' over the 'header.payload' bytes with the
+ * base64url signature. Throws (fails CLOSED) if the signature cannot be verified
+ * or no keys are available.
  */
-function verifyIdTokenSignatureSync(parts: string[]): void {
+function verifyIdTokenSignatureSync(parts: string[], keys: JWK[] | undefined): void {
   const [headerB64, payloadB64, signatureB64] = parts;
 
   let header: JWTHeader;
@@ -246,7 +268,6 @@ function verifyIdTokenSignatureSync(parts: string[]): void {
     throw new Error(`Unsupported id_token alg: ${header.alg ?? 'none'} (expected RS256)`);
   }
 
-  const keys = _jwks;
   if (!keys) throw new Error('OIDC JWKS unavailable — cannot verify id_token signature');
 
   const jwk = header.kid
@@ -268,21 +289,17 @@ function verifyIdTokenSignatureSync(parts: string[]): void {
   if (!ok) throw new Error('id_token signature verification failed');
 }
 
-export function verifyIdToken(idToken: string, state: string): OIDCClaims {
+/**
+ * Verify an id_token's RS256 signature and claims. `keys` defaults to the cached
+ * set; completeAuthorization passes the set it loaded for this token's kid.
+ */
+export function verifyIdToken(idToken: string, state: string, keys: JWK[] | undefined = _jwks?.keys): OIDCClaims {
   const parts = idToken.split('.');
   if (parts.length !== 3) throw new Error('Invalid id_token format');
 
-  // ---------------------------------------------------------------------------
-  // Signature verification.
-  //   PRODUCTION (NODE_ENV === 'production'): RS256 signature is verified
-  //     against the provider JWKS (pre-warmed by exchangeCode). Fails CLOSED
-  //     (throws) if it cannot be verified. verifyIdToken stays synchronous.
-  //   DEV/DEMO (NODE_ENV !== 'production'): KEEP the original signature-less
-  //     path — claims are trusted without checking the signature so the
-  //     anonymous demo flow keeps working with no IdP keys configured.
-  // ---------------------------------------------------------------------------
-  verifyIdTokenSignatureSync(parts);
-  // else: dev/demo — signature-less, exactly as before.
+  // Signature verification against the provider JWKS, in every environment. Fails
+  // CLOSED (throws) if it cannot be verified. Synchronous: the caller loads keys.
+  verifyIdTokenSignatureSync(parts, keys);
 
   const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString()) as OIDCClaims;
 

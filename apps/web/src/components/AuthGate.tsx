@@ -5,6 +5,7 @@ import {
   authRequest, clearUserState, getAuthConfig, GatewayRequestError, GatewayUnavailableError,
   signInWithKey, startDemoSession, type AuthConfig, type SessionUser,
 } from '../lib/auth-client';
+import { rememberSsoReturn } from '../lib/initial-section';
 
 let initialSession: Promise<{ user: SessionUser }> | undefined;
 const SessionContext = createContext<{ user: SessionUser; busy: boolean; logout: () => Promise<void>; showKey: (key: string) => void } | null>(null);
@@ -145,7 +146,7 @@ export default function AuthGate({ children }: { children: React.ReactNode }) {
         {setup && <label className="block text-sm">Administrator email<input className="input w-full mt-1" type="email" required value={email} onChange={event => setEmail(event.target.value)} /></label>}
         <label className="block text-sm">{setup ? 'Operator setup token' : 'API key'}<input className="input w-full mt-1" type="password" autoComplete="off" required value={credential} onChange={event => setCredential(event.target.value)} /></label>
         <button className="btn btn-primary w-full" disabled={busy}>{busy ? 'Working…' : setup ? 'Create administrator' : 'Sign in'}</button>
-        {config?.sso !== false && <a className="block text-sm underline" href="/_/gateway/api/auth/oidc/authorize">Sign in with organization SSO</a>}
+        {config?.sso !== false && <a className="block text-sm underline" href="/_/gateway/api/auth/oidc/authorize" onClick={() => rememberSsoReturn(window.location.pathname.replace(/^\/+/, ''))}>Sign in with organization SSO</a>}
         <button type="button" className="text-sm underline" onClick={() => { setSetup(!setup); setError(''); setCredential(''); }}>{setup ? 'Use an existing API key' : 'First-time administrator setup'}</button>
       </form>
     </div>

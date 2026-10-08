@@ -185,4 +185,26 @@ describe('demo mode is explicit and validated', () => {
   it('requires a signing secret for public demo sessions', () => {
     expect(errorKeys({ EAOS_DEMO_MODE: 'public' })).toContain('EAOS_DEMO_MODE');
   });
+  it('warns when local demo mode listens beyond loopback', () => {
+    const hostWarning = (env: NodeJS.ProcessEnv) => validateEnv(env).problems.some(p => p.key === 'HOST' && p.severity === 'warning');
+    expect(hostWarning({ EAOS_DEMO_MODE: 'local' })).toBe(true);
+    expect(hostWarning({ EAOS_DEMO_MODE: 'local', HOST: '0.0.0.0' })).toBe(true);
+    expect(hostWarning({ EAOS_DEMO_MODE: 'local', HOST: '127.0.0.1' })).toBe(false);
+    expect(hostWarning({ EAOS_DEMO_MODE: 'local', HOST: '::1' })).toBe(false);
+    expect(hostWarning({ EAOS_DEMO_MODE: 'off' })).toBe(false);
+  });
+});
+
+describe('listen host and trusted proxies', () => {
+  it('leaves both unset by default: every interface, nobody trusted', () => {
+    const { env } = validateEnv({});
+    expect(env.HOST).toBeUndefined();
+    expect(env.EAOS_TRUSTED_PROXIES).toBeUndefined();
+  });
+  it('accepts IP addresses and CIDR blocks of either family', () => {
+    expect(errorKeys({ EAOS_TRUSTED_PROXIES: '127.0.0.1, ::1, 10.0.0.0/8, fd00::/8' })).not.toContain('EAOS_TRUSTED_PROXIES');
+  });
+  it.each(['web', '10.0.0.0/33', '::1/129', '10.0.0.1/8/8', '10.0.0.0/-1', '*'])('rejects %s instead of guessing what it trusts', entry => {
+    expect(errorKeys({ EAOS_TRUSTED_PROXIES: `127.0.0.1,${entry}` })).toContain('EAOS_TRUSTED_PROXIES');
+  });
 });

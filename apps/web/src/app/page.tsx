@@ -54,6 +54,7 @@ import { PromptLibrary } from '../components/PromptLibrary';
 import AboutPage from '../components/AboutPage';
 import AuthGate from '../components/AuthGate';
 import { hasCompletedOnboarding } from '../lib/storage';
+import { resolveInitialSection, takeSsoReturn } from '../lib/initial-section';
 
 function MainContent({ section }: { section: string }) {
   // Dynamic connector detail pages: connector-detail-{connectorId}
@@ -147,7 +148,6 @@ export default function Home() {
 
   // On mount: read URL path and navigate to the matching section, default to landing
   useEffect(() => {
-    const path = window.location.pathname.replace(/^\/+/, '');
     const knownSections = [
       'home','dashboard','landing',
       'csuite-command','csuite-vision',
@@ -163,11 +163,13 @@ export default function Home() {
       'prompts','about',
     ];
     // Allow connector-detail-{id} dynamic sections to round-trip through URL
-    const isKnown = knownSections.includes(path) || path.startsWith('connector-detail-');
-    const resolved = isKnown ? path : 'landing';
-    // Returning users (completed onboarding) skip the Landing splash → straight to Home
-    const finalSection = resolved === 'landing' && hasCompletedOnboarding() ? 'home' : resolved;
-    setActiveSection(finalSection);
+    const isKnown = (section: string) => knownSections.includes(section) || section.startsWith('connector-detail-');
+    // An SSO sign-in (?login_code) always opens the app shell, where AuthGate exchanges the code.
+    const signingIn = new URLSearchParams(window.location.search).has('login_code');
+    setActiveSection(resolveInitialSection({
+      pathname: window.location.pathname, search: window.location.search, onboarded: hasCompletedOnboarding(), isKnown,
+      ssoReturn: signingIn ? takeSsoReturn() : null,
+    }));
     assertProvenance();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 

@@ -292,9 +292,15 @@ export class PlatformRepository {
     if (!query.trim() || query.length > 500) throw new Error('Bounded search query required');
     return this.transaction(principal, async client => (await client.query("SELECT r.id,r.family,r.version,r.data,g.source_run_id AS \"sourceRunId\",g.reviewer_id AS \"reviewerId\",g.expires_at AS \"expiresAt\" FROM workspace_records r JOIN platform_record_reviews g ON g.tenant_id=r.tenant_id AND g.family=r.family AND g.record_id=r.id AND g.record_version=r.version WHERE r.tenant_id=$1 AND r.archived_at IS NULL AND g.status='approved' AND g.expires_at>NOW() AND (g.user_id=$2 OR $2=ANY(g.readers)) AND to_tsvector('simple',r.data::text) @@ plainto_tsquery('simple',$3) ORDER BY r.updated_at DESC LIMIT 20", [principal.tenantId, principal.userId, query])).rows);
   }
+  /**
+   * Members exclude demo principals (`demo:` ids, see @agentos/auth). Every public
+   * demo visit provisions a permanent users row, and 'demo:' sorts before 'oidc:'
+   * and 'user_', so after 200 visits this list held only visitors: the bootstrap
+   * admin and every SSO user vanished from the console that suspends them.
+   */
   async members(principal: PlatformPrincipal) {
     this.require(principal, 'admin');
-    return this.transaction(principal, async client => (await client.query("SELECT u.id,u.name,u.email,COALESCE(m.role,u.role) AS role,COALESCE(m.state,'active') AS state,COALESCE(m.version,0) AS version,m.persona_scopes AS \"personaScopes\" FROM users u LEFT JOIN platform_memberships m ON m.tenant_id=u.tenant_id AND m.user_id=u.id WHERE u.tenant_id=$1 ORDER BY u.id LIMIT 200", [principal.tenantId])).rows);
+    return this.transaction(principal, async client => (await client.query("SELECT u.id,u.name,u.email,COALESCE(m.role,u.role) AS role,COALESCE(m.state,'active') AS state,COALESCE(m.version,0) AS version,m.persona_scopes AS \"personaScopes\" FROM users u LEFT JOIN platform_memberships m ON m.tenant_id=u.tenant_id AND m.user_id=u.id WHERE u.tenant_id=$1 AND u.id NOT LIKE 'demo:%' ORDER BY u.id LIMIT 200", [principal.tenantId])).rows);
   }
   async updateMember(principal: PlatformPrincipal, userId: string, expectedVersion: number, input: { role: PlatformPrincipal['role']; state: 'active' | 'suspended'; personaScopes: string[] }) {
     this.require(principal, 'admin');
@@ -306,7 +312,9 @@ export class PlatformRepository {
       const current = (await client.query('SELECT * FROM platform_memberships WHERE tenant_id=$1 AND user_id=$2 FOR UPDATE', [principal.tenantId, userId])).rows[0];
       if (!user || Number(current?.version ?? 0) !== expectedVersion) throw new RuntimeConflictError('Member changed or is outside the tenant');
       if ((current?.role ?? user.role) === 'admin' && (input.role !== 'admin' || input.state !== 'active')) {
-        const count = Number((await client.query("SELECT count(*) AS count FROM users u LEFT JOIN platform_memberships m ON m.tenant_id=u.tenant_id AND m.user_id=u.id WHERE u.tenant_id=$1 AND COALESCE(m.role,u.role)='admin' AND COALESCE(m.state,'active')='active'", [principal.tenantId])).rows[0]!.count);
+        // The local demo administrator (`demo:local`) does not count: it can act only
+        // while local demo mode is on, so it cannot be the tenant's last administrator.
+        const count = Number((await client.query("SELECT count(*) AS count FROM users u LEFT JOIN platform_memberships m ON m.tenant_id=u.tenant_id AND m.user_id=u.id WHERE u.tenant_id=$1 AND u.id NOT LIKE 'demo:%' AND COALESCE(m.role,u.role)='admin' AND COALESCE(m.state,'active')='active'", [principal.tenantId])).rows[0]!.count);
         if (count <= 1) throw new RuntimeConflictError('Cannot remove the last active tenant administrator');
       }
       await client.query('INSERT INTO platform_memberships (tenant_id,user_id,role,state,persona_scopes) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (tenant_id,user_id) DO UPDATE SET role=EXCLUDED.role,state=EXCLUDED.state,persona_scopes=EXCLUDED.persona_scopes,version=platform_memberships.version+1,updated_at=NOW()', [principal.tenantId, userId, input.role, input.state, input.personaScopes]);

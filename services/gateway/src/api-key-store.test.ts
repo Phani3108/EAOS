@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InMemoryStore } from '../../../packages/db/src/connection.js';
 import type { AuthUser } from './auth.js';
 
@@ -15,6 +15,7 @@ beforeEach(async () => {
   store = new InMemoryStore();
   keys.initApiKeyStore(store);
 });
+afterEach(() => { vi.unstubAllEnvs(); });
 
 function createKey(expiresAt: string | null = null) {
   const generated = auth.generateApiKey();
@@ -53,6 +54,34 @@ describe('API key storage lifecycle', () => {
   it.each(['invalid-date', '2000-01-01T00:00:00Z'])('rejects invalid or expired keys: %s', expiresAt => {
     const generated = createKey(expiresAt);
     expect(keys.lookupApiKey(generated.rawKey)).toBeUndefined();
+  });
+
+  it('carries the key expiry into the principal, so what the key mints is bounded by it', () => {
+    expect(keys.lookupApiKey(createKey('2099-01-01T00:00:00Z').rawKey)?.authorityExpiresAt).toBe(Date.parse('2099-01-01T00:00:00Z'));
+    store = new InMemoryStore();
+    keys.initApiKeyStore(store);
+    expect(keys.lookupApiKey(createKey().rawKey)?.authorityExpiresAt).toBeUndefined();
+  });
+
+  it('keeps keys working when API_KEY_HASH_SECRET is introduced, and moves them onto it', async () => {
+    const legacy = createKey();
+    vi.resetModules();
+    vi.stubEnv('API_KEY_HASH_SECRET', 'fixture-independent-key-hash-secret');
+    keys = await import('./api-key-store.js');
+    auth = await import('./auth.js');
+    keys.initApiKeyStore(store);
+    // Previously 401 'Invalid API key' for every existing key, bootstrap key included.
+    expect(keys.lookupApiKey(legacy.rawKey)?.id).toBe(owner.id);
+    const current = auth.hashApiKey(legacy.rawKey);
+    expect(store.get(keys.API_KEY_TABLE, legacy.keyHash)).toBeUndefined();
+    expect(store.get(keys.API_KEY_TABLE, current)).toMatchObject({ keyId: 'key-public-id', userId: owner.id });
+    expect(keys.listApiKeysForUser(owner).map(key => key.id)).toEqual(['key-public-id']);
+    // Once moved, retiring the JWT secret it was first hashed with no longer matters.
+    vi.resetModules();
+    vi.stubEnv('JWT_SECRET', 'fixture-rotated-signing-secret');
+    keys = await import('./api-key-store.js');
+    keys.initApiKeyStore(store);
+    expect(keys.lookupApiKey(legacy.rawKey)?.id).toBe(owner.id);
   });
 
   it('provides a safe management ID for legacy records without publishing the hash', () => {
