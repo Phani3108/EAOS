@@ -78,6 +78,7 @@ import { PostgresWorkspaceRepository } from '@agentos/db/workspace-repository';
 import { PostgresIntegrationRepository } from '@agentos/db/integration-repository';
 import { ConnectorService, vaultResolver, compileConnectorManifest } from './connector-service.js';
 import { isIntegrationRoute, integrationRequest } from './integration-api.js';
+import { attachmentDisposition } from './artifact-ingestion.js';
 import { PlatformRepository } from '@agentos/db/platform-repository';
 import { isPlatformRoute, platformRequest } from './platform-api.js';
 import { RequestMeasurements, resolvePlatformPrincipal } from './platform-observability.js';
@@ -268,7 +269,7 @@ const verifyDeploymentStorage = async () => {
         const role = (await pgPool.query('SELECT r.rolsuper,r.rolbypassrls,(r.oid=d.datdba) AS owner FROM pg_roles r JOIN pg_database d ON d.datname=current_database() WHERE r.rolname=current_user')).rows[0];
         if (!role || role.rolsuper || role.rolbypassrls || role.owner) throw new Error('Use a non-owner application database role without BYPASSRLS; migration credentials must stay separate');
     }
-    if (pgPool) await pgPool.query('SELECT c.secret_version,c.binding_hash,c.config FROM workspace_connections c JOIN input_artifacts a ON FALSE JOIN runtime_tool_receipts t ON FALSE JOIN integration_audit i ON FALSE');
+    if (pgPool) await pgPool.query('SELECT c.secret_version,c.binding_hash,c.config,a.expires_at FROM workspace_connections c JOIN input_artifacts a ON FALSE JOIN runtime_tool_receipts t ON FALSE JOIN integration_audit i ON FALSE');
     if (pgPool) await pgPool.query('SELECT p.revision,d.version,m.state,e.stream_sequence,n.execution_run_id FROM platform_registry_packages p JOIN platform_datasets d ON FALSE JOIN platform_memberships m ON FALSE JOIN runtime_events e ON FALSE JOIN platform_http_metrics h ON FALSE JOIN platform_event_offsets o ON FALSE JOIN runtime_deliveries n ON FALSE JOIN runtime_connector_observations co ON FALSE');
     await bindDeploymentTenant(store, pgPool);
 };
@@ -1051,7 +1052,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (authUser && isIntegrationRoute(path, method)) {
             const result = await integrationRequest(workspaceRepository, integrationRepository, connectors, authUser, url, method, () => readBody(req));
             if (result.download) {
-                res.writeHead(result.status, { 'Content-Type': result.download.mimeType, 'Content-Length': result.download.bytes.length, 'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(result.download.filename)}`, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
+                res.writeHead(result.status, { 'Content-Type': result.download.mimeType, 'Content-Length': result.download.bytes.length, 'Content-Disposition': attachmentDisposition(result.download.filename), 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
                 res.end(result.download.bytes);
             } else sendJSON(res, result.status, result.data);
             return;

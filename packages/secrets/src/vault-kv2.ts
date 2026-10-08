@@ -1,4 +1,5 @@
 import type { SecretReference, SecretValue, SecretAuditEntry, SecretVault } from './vault.js';
+import { isOwnedSecretPath, isSecretOwnerSegment } from './namespace.js';
 
 export interface VaultRequest { url: string; method: 'GET' | 'POST'; headers: Record<string, string>; body?: unknown; signal?: AbortSignal }
 export class VaultKV2 implements Pick<SecretVault, 'get' | 'rotate'> {
@@ -7,11 +8,11 @@ export class VaultKV2 implements Pick<SecretVault, 'get' | 'rotate'> {
   constructor(private readonly options: { tenantId: string; userId: string; address: string; mount?: string; token: () => Promise<string>; request: (request: VaultRequest) => Promise<unknown>; onAudit?: (entry: SecretAuditEntry) => Promise<void> }) {
     const url = new URL(options.address);
     if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error('Vault requires a configured HTTPS origin');
-    if (![options.tenantId, options.userId, options.mount ?? 'secret'].every(segment => /^[a-zA-Z0-9_-]{1,200}$/.test(segment))) throw new Error('Invalid Vault scope');
+    if (!isSecretOwnerSegment(options.tenantId) || !isSecretOwnerSegment(options.userId) || !/^[a-zA-Z0-9_-]{1,200}$/.test(options.mount ?? 'secret')) throw new Error('Invalid Vault scope');
     this.base = `${url.origin}/v1/${encodeURIComponent(options.mount ?? 'secret')}/data/`;
   }
   private location(ref: SecretReference): string {
-    if (ref.provider !== 'vault' || !ref.path.startsWith(`${this.options.tenantId}/${this.options.userId}/`) || !ref.path.split('/').every(segment => /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]{0,199}$/.test(segment) && !segment.includes('..')) || ref.key && !/^[a-zA-Z0-9_-]{1,200}$/.test(ref.key) || ref.version && !/^[1-9][0-9]{0,8}$/.test(ref.version)) throw new Error('Secret reference is outside the authorized scope');
+    if (ref.provider !== 'vault' || !isOwnedSecretPath(ref.path, this.options) || ref.key && !/^[a-zA-Z0-9_-]{1,200}$/.test(ref.key) || ref.version && !/^[1-9][0-9]{0,8}$/.test(ref.version)) throw new Error('Secret reference is outside the authorized scope');
     return this.base + ref.path.split('/').map(encodeURIComponent).join('/');
   }
   private async record(ref: SecretReference, success: boolean, action: 'read' | 'rotate') {

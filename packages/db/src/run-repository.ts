@@ -129,7 +129,7 @@ export class PostgresRunRepository {
       const artifacts = [...new Set([...collectArtifactIds(snapshot.inputs), ...collectArtifactIds(definition)])];
       if (artifacts.length > 20) throw new RuntimeConflictError('Too many input artifacts');
       for (const id of artifacts) {
-        const artifact = (await client.query('SELECT digest FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND archived_at IS NULL FOR SHARE', [snapshot.tenantId, snapshot.userId, id])).rows[0];
+        const artifact = (await client.query('SELECT digest FROM input_artifacts WHERE tenant_id=$1 AND user_id=$2 AND id=$3 AND archived_at IS NULL AND (expires_at IS NULL OR expires_at>NOW()) FOR SHARE', [snapshot.tenantId, snapshot.userId, id])).rows[0];
         if (!artifact) throw new RuntimeConflictError('Input artifact is unavailable to this owner');
         await client.query('INSERT INTO runtime_input_artifacts (tenant_id,run_id,artifact_id,digest) VALUES ($1,$2,$3,$4)', [snapshot.tenantId, snapshot.id, id, artifact.digest]);
       }

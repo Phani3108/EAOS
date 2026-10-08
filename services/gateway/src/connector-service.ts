@@ -5,13 +5,15 @@ import { integrationDigest, type ActionProof, type PostgresIntegrationRepository
 import type { PostgresWorkspaceRepository, WorkspaceOwner, ConnectionRecord } from '@agentos/db/workspace-repository';
 import type { RuntimeLease } from '@agentos/db/run-repository';
 import { createJsonTransport, type JsonTransport } from './outbound-http.js';
-import { actionSchemas, outputSchemas, repositoryName, connectorContract, SUPPORTED_CONNECTOR_ACTIONS } from './connector-contracts.js';
+import { actionSchemas, outputSchemas, repositoryName, connectorContract, slackDisplayText, SUPPORTED_CONNECTOR_ACTIONS } from './connector-contracts.js';
 export { connectorContract, compileConnectorManifest, SUPPORTED_CONNECTOR_ACTIONS } from './connector-contracts.js';
 
 export class ConnectorError extends Error {
   constructor(readonly outcome: 'unsupported' | 'failed' | 'inconclusive', message: string) { super(message); }
 }
 const nativeTransportFactory = (origin: string) => createJsonTransport([origin]);
+/** GitHub resolves owner/repo case-insensitively and answers with the canonical casing. Names are ASCII, so only ASCII case is folded. */
+const sameRepository = (actual: unknown, expected: string) => typeof actual === 'string' && actual.replace(/[A-Z]/g, char => char.toLowerCase()) === expected.replace(/[A-Z]/g, char => char.toLowerCase());
 export function validateConnectionConfig(connector: string, input: unknown): Record<string, unknown> {
   const actions = z.array(z.string().refine(action => SUPPORTED_CONNECTOR_ACTIONS.includes(`${connector}:${action}`), 'Unsupported connector action')).min(1).max(10);
   if (connector === 'github') return z.object({ repositories: z.array(repositoryName).min(1).max(20), actions: actions.default(['read:pull_request']) }).strict().parse(input);
@@ -83,7 +85,7 @@ export class ConnectorService {
         const result = await transport({ url: origin + target, method: 'GET', headers: credential.headers, signal });
         if (result.status !== 200) throw new Error('Resource scope was not verified');
         const data = result.data as Record<string, any>;
-        if (connectorId === 'github' && (typeof data.full_name !== 'string' || data.full_name.toLowerCase() !== resource.toLowerCase()) || connectorId === 'jira' && data.key !== resource || connectorId === 'slack' && (data.ok !== true || data.channel?.id !== resource || data.channel.is_archived !== false || data.channel.is_member !== true)) throw new Error('Resource identity/access differs from the configured scope');
+        if (connectorId === 'github' && !sameRepository(data.full_name, resource) || connectorId === 'jira' && data.key !== resource || connectorId === 'slack' && (data.ok !== true || data.channel?.id !== resource || data.channel.is_archived !== false || data.channel.is_member !== true)) throw new Error('Resource identity/access differs from the configured scope');
       }
       secretVersion = credential.version; bindingHash = credential.bindingHash; status = 'verified';
     } catch (error) { if (error instanceof ConnectorError && error.outcome === 'unsupported') status = 'unsupported'; }
@@ -149,7 +151,7 @@ export class ConnectorService {
           const pr = await send(`/repos/${repo}/pulls/${params.number}`);
           const sha = z.string().regex(/^[a-f0-9]{40}$/);
           const headSha = sha.parse(pr.head?.sha), baseSha = sha.parse(pr.base?.sha);
-          if (pr.number !== params.number || String(pr.base?.repo?.full_name).toLowerCase() !== String(params.repository).toLowerCase()) throw new Error('PR identity mismatch');
+          if (pr.number !== params.number || !sameRepository(pr.base?.repo?.full_name, String(params.repository))) throw new Error('PR identity mismatch');
           const changedFiles = z.number().int().nonnegative().parse(pr.changed_files);
           if (changedFiles > 100) throw new ConnectorError('unsupported', 'PR exceeds the complete text-diff bound');
           const comparison = await send(`/repos/${repo}/compare/${baseSha}...${headSha}?per_page=100`);
@@ -166,7 +168,12 @@ export class ConnectorService {
           const created = await send(`/repos/${repo}/issues/${params.number}/comments`, 'POST', { body });
           const id = z.number().int().positive().parse(created.id);
           const verified = await send(`/repos/${repo}/issues/comments/${id}`);
-          if (verified.id !== id || verified.body !== body || verified.issue_url !== `${origin}/repos/${repo}/issues/${params.number}`) throw new Error('Comment postcondition failed');
+          // The comment must sit on the requested issue. GitHub reports it under the repository's
+          // canonical casing, so only the owner/repo part may differ from the request, and only in case.
+          const issuePrefix = `${origin}/repos/`, issueSuffix = `/issues/${params.number}`;
+          const issueUrl = typeof verified.issue_url === 'string' ? verified.issue_url : '';
+          const onIssue = issueUrl.startsWith(issuePrefix) && issueUrl.endsWith(issueSuffix) && sameRepository(issueUrl.slice(issuePrefix.length, -issueSuffix.length), repo);
+          if (verified.id !== id || verified.body !== body || !onIssue) throw new Error('Comment postcondition failed');
           result = { id, repository: params.repository, number: params.number, body: params.body, verified: true };
         }
       } else if (connection.connectorId === 'jira') {
@@ -183,13 +190,18 @@ export class ConnectorService {
       } else {
         let ts = String(params.ts ?? '');
         if (action === 'create') {
-          const created = await send('/api/chat.postMessage', 'POST', { channel: params.channel, text: params.text, client_msg_id: `${proof.requestHash.slice(0,8)}-${proof.requestHash.slice(8,12)}-4${proof.requestHash.slice(13,16)}-8${proof.requestHash.slice(17,20)}-${proof.requestHash.slice(20,32)}` });
+          // parse=none: by default Slack rewrites bare URLs into <url> link markup in the stored
+          // text. The approved text is posted as-is, so the readback can be checked against it.
+          const created = await send('/api/chat.postMessage', 'POST', { channel: params.channel, text: params.text, parse: 'none', client_msg_id: `${proof.requestHash.slice(0,8)}-${proof.requestHash.slice(8,12)}-4${proof.requestHash.slice(13,16)}-8${proof.requestHash.slice(17,20)}-${proof.requestHash.slice(20,32)}` });
           ts = z.string().regex(/^\d{10,}\.\d+$/).parse(created.ts);
           if (created.channel !== params.channel) throw new Error('Channel mismatch');
         }
         const history = await send(`/api/conversations.history?channel=${encodeURIComponent(String(params.channel))}&oldest=${encodeURIComponent(ts)}&latest=${encodeURIComponent(ts)}&inclusive=true&limit=1`);
         const message = Array.isArray(history.messages) && history.messages.length === 1 && history.messages[0]?.ts === ts ? history.messages[0] : undefined;
-        if (!message || action === 'create' && message.text !== params.text) throw new Error('Message postcondition failed');
+        // Slack stores & < > as entities, so the readback is compared in display form: escaping
+        // passes, any other change of content does not. Truncation never reaches here — the
+        // input schema refuses any text Slack would cut short.
+        if (!message || action === 'create' && (typeof message.text !== 'string' || slackDisplayText(message.text) !== slackDisplayText(String(params.text)))) throw new Error('Message postcondition failed');
         result = { channel: params.channel, ts, text: z.string().parse(message.text), verified: true };
       }
       const actionId = `${connection.connectorId}:${action}:${resource}` as keyof typeof outputSchemas;
