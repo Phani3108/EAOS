@@ -130,6 +130,17 @@ async function main() {
     assert.equal((await workspace.usage(usageOwner)).spentMicros, 250);
     assert.equal((await workspace.usage(usageOwner)).reservedMicros, 0);
     await assert.rejects(workspace.settleUsage(usageOwner, reservation.value, 251));
+    // A refused provider attempt's reservation goes back to the budget rather than holding it forever.
+    const refused = await workspace.reserveUsage(usageOwner, usageRun.id, 'step', 3, 700);
+    await assert.rejects(workspace.reserveUsage(usageOwner, usageRun.id, 'step', 4, 700));
+    await assert.rejects(workspace.releaseUsage({ tenantId: b, userId: `user-${b}` }, refused));
+    await workspace.releaseUsage(usageOwner, refused);
+    await workspace.releaseUsage(usageOwner, refused);
+    assert.equal((await workspace.usage(usageOwner)).reservedMicros, 0);
+    await assert.rejects(workspace.settleUsage(usageOwner, refused, 0));
+    await assert.rejects(workspace.releaseUsage(usageOwner, reservation.value));
+    await workspace.settleUsage(usageOwner, await workspace.reserveUsage(usageOwner, usageRun.id, 'step', 5, 700), 0);
+    assert.deepEqual(await workspace.usage(usageOwner), { reservedMicros: 0, spentMicros: 250, limitMicros: 1000 });
     await repository.cancel(a, usageRun.id, usageRun.userId);
 
     const cancelled = snapshot(b);
@@ -286,7 +297,9 @@ async function main() {
     const chatSubmission = await request(a, `/api/chat/sessions/${chat.data.session.sessionId}/messages`, { content: 'Fixture message' });
     assert.equal(chatSubmission.status, 200);
     assert.ok(chatSubmission.data.executionId);
-    await waitStatus(a, chatSubmission.data.executionId, 'failed');
+    // No LLM provider is configured on this gateway, and chat offers no run-mode
+    // choice, so the message is a labelled simulation rather than a live run that fails.
+    await waitStatus(a, chatSubmission.data.executionId, 'simulated');
     assert.equal((await request(a, `/api/chat/sessions/${chat.data.session.sessionId}`)).data.messages.length, 2);
     assert.ok((await request(a, '/api/executions')).data.executions.every((run: any) => run.tenantId === a));
     await stopGateway();

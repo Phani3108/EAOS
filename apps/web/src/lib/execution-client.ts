@@ -12,6 +12,26 @@ export async function uploadArtifact(file: File): Promise<{ artifactId: string }
   return { artifactId: response.artifactId };
 }
 
+/** A model a live run may name, as `GET /api/llm/models` reports it. */
+export interface PricedModel {
+  id: string;
+  provider: NonNullable<ExecutionRequest['provider']>;
+  inputUsdPerMTok: number;
+  outputUsdPerMTok: number;
+  providerDefault: boolean;
+  /** The provider has credentials on the gateway. */
+  available: boolean;
+}
+
+/**
+ * The gateway reserves budget at a model's price before every live call, and
+ * refuses a run naming a model it cannot price — so pickers offer only these.
+ */
+export async function fetchPricedModels(): Promise<PricedModel[]> {
+  const response = await authRequest('/api/llm/models');
+  return Array.isArray(response.models) ? response.models : [];
+}
+
 export async function submitExecution(request: ExecutionRequest): Promise<ExecutionSnapshot> {
   const response = await authRequest('/api/execute', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request) });
   return response.execution;

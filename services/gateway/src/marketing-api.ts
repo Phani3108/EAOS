@@ -126,7 +126,7 @@ export function preCheckExecution(workflowId: string, simulate?: boolean): Execu
 // Execution Creation
 // ---------------------------------------------------------------------------
 
-export async function createMarketingExecution(tenantId: string, workflowId: string, inputs: Record<string, unknown>, userId: string, simulate = false, customPrompt?: string, provider?: LLMProviderId, modelId?: string): Promise<MarketingExecution> {
+export async function createMarketingExecution(tenantId: string, workflowId: string, inputs: Record<string, unknown>, userId: string, simulate?: boolean, customPrompt?: string, provider?: LLMProviderId, modelId?: string): Promise<MarketingExecution> {
   const definition = getCompiledDefinition(workflowId, 'marketing');
   if (!definition) throw new Error(`Workflow not found: ${workflowId}`);
   const run = await createPersonaExecution(tenantId, 'marketing', definition, inputs, userId, simulate, customPrompt, provider, modelId);

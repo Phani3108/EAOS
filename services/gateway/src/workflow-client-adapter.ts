@@ -9,7 +9,10 @@ import { validate } from './validation.js';
 const identifier = z.string().regex(/^[a-zA-Z][a-zA-Z0-9_-]{0,79}$/);
 const retry = z.object({ maxAttempts: z.number().int().min(1).max(6), backoff: z.enum(['fixed','linear','exponential']), initialDelayMs: z.number().min(0).max(60_000) });
 export function compileClientRequest(principal: AuthUser, body: unknown) {
-    const input = validate(z.object({ format: z.enum(['sdk','workflow-engine']), workflow: z.unknown(), variables: z.unknown().optional(), simulate: z.boolean().default(false) }).strict(), body);
+    // A missing `simulate` is no choice, not a request for a live run: the runtime
+    // decides the mode (run-mode.ts), so a keyless gateway simulates rather than
+    // admitting a run that can only fail.
+    const input = validate(z.object({ format: z.enum(['sdk','workflow-engine']), workflow: z.unknown(), variables: z.unknown().optional(), simulate: z.boolean().optional() }).strict(), body);
     let persona: WorkflowPersona;
     let name: string;
     let steps: UnifiedStepDef[] = [];
