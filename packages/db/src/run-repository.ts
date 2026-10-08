@@ -235,6 +235,24 @@ export class PostgresRunRepository {
     }
   }
 
+  // Closes out a run whose job the sweep has just failed without a live worker
+  // (deadline passed, or every lease attempt crashed). Nobody else will write a
+  // terminal state for it, so this one must be complete: an effect that was in
+  // flight may already have happened and is inconclusive rather than failed, and
+  // the trace, the attempt rows and the outbox all have to see the run end.
+  private async abandon(client: RuntimeClient, tenantId: string, runId: string, reason: string, attemptStatus: 'failed' | 'expired', eventType?: string): Promise<void> {
+    const snapshot = (await client.query('SELECT snapshot FROM runtime_runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE', [tenantId, runId])).rows[0]?.snapshot as RuntimeSnapshot | undefined;
+    if (!snapshot || isTerminalExecutionStatus(snapshot.status)) return;
+    snapshot.status = snapshot.steps.some(step => step.status === 'running' && step.kind === 'tool_effect') ? 'inconclusive' : 'failed';
+    snapshot.completedAt = new Date().toISOString();
+    for (const step of snapshot.steps) if (step.status === 'running') { step.status = snapshot.status; step.error = reason; }
+    await client.query('UPDATE runtime_runs SET status=$3,snapshot=$4,updated_at=NOW() WHERE tenant_id=$1 AND id=$2', [tenantId, runId, snapshot.status, JSON.stringify(snapshot)]);
+    await client.query("UPDATE runtime_attempts SET status=$3,error=$4,finished_at=NOW() WHERE tenant_id=$1 AND run_id=$2 AND status='running'", [tenantId, runId, attemptStatus, reason]);
+    await client.query("UPDATE runtime_step_attempts SET status='failed',error=$3,finished_at=NOW() WHERE tenant_id=$1 AND run_id=$2 AND finished_at IS NULL", [tenantId, runId, reason]);
+    await this.writeSteps(client, snapshot);
+    await this.event(client, snapshot, eventType ?? `execution.${snapshot.status}`);
+  }
+
   async park(lease: RuntimeLease, snapshot: RuntimeSnapshot): Promise<void> {
     if (snapshot.steps.some(step => step.status === 'running')) throw new RuntimeConflictError('Active parallel nodes must settle before suspension');
     const waiting = structuredClone(snapshot);
@@ -278,20 +296,10 @@ export class PostgresRunRepository {
       await this.expireApprovals(client, tenantId);
       await this.wakeBlocked(client, tenantId);
       const timedOut = await client.query("UPDATE runtime_jobs SET status='failed',last_error='Execution deadline exceeded',fencing_token=fencing_token+1,lease_owner=NULL,lease_until=NULL WHERE tenant_id=$1 AND status='running' AND deadline_at<=NOW() RETURNING run_id", [tenantId]);
-      for (const row of timedOut.rows) {
-        const snapshot = (await client.query('SELECT snapshot FROM runtime_runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE', [tenantId, row.run_id])).rows[0]?.snapshot as RuntimeSnapshot | undefined;
-        if (!snapshot || isTerminalExecutionStatus(snapshot.status)) continue;
-        snapshot.status = snapshot.steps.some(step => step.status === 'running' && step.kind === 'tool_effect') ? 'inconclusive' : 'failed';
-        snapshot.completedAt = new Date().toISOString();
-        for (const step of snapshot.steps) if (step.status === 'running') { step.status = snapshot.status; step.error = 'Execution deadline exceeded'; }
-        await client.query('UPDATE runtime_runs SET status=$3,snapshot=$4,updated_at=NOW() WHERE tenant_id=$1 AND id=$2', [tenantId, row.run_id, snapshot.status, JSON.stringify(snapshot)]);
-        await client.query("UPDATE runtime_attempts SET status='failed',error='Execution deadline exceeded',finished_at=NOW() WHERE tenant_id=$1 AND run_id=$2 AND status='running'", [tenantId, row.run_id]);
-        await client.query("UPDATE runtime_step_attempts SET status='failed',error='Execution deadline exceeded',finished_at=NOW() WHERE tenant_id=$1 AND run_id=$2 AND finished_at IS NULL", [tenantId, row.run_id]);
-        await this.writeSteps(client, snapshot);
-        await this.event(client, snapshot, 'execution.deadline');
-      }
-      const expired = await client.query("UPDATE runtime_jobs SET status='failed',last_error='Lease retries exhausted',lease_owner=NULL,lease_until=NULL WHERE tenant_id=$1 AND status='running' AND lease_until<NOW() AND retry_count>=max_attempts RETURNING run_id", [tenantId]);
-      for (const row of expired.rows) await client.query("UPDATE runtime_runs SET status='failed',snapshot=jsonb_set(snapshot,'{status}','\"failed\"'),updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status IN ('queued','running')", [tenantId, row.run_id]);
+      for (const row of timedOut.rows) await this.abandon(client, tenantId, row.run_id, 'Execution deadline exceeded', 'failed', 'execution.deadline');
+      const expired = await client.query("UPDATE runtime_jobs SET status='failed',last_error='Lease retries exhausted',fencing_token=fencing_token+1,lease_owner=NULL,lease_until=NULL WHERE tenant_id=$1 AND status='running' AND lease_until<NOW() AND retry_count>=max_attempts RETURNING run_id", [tenantId]);
+      // The last worker died holding the lease, so its attempt expired rather than failed.
+      for (const row of expired.rows) await this.abandon(client, tenantId, row.run_id, 'Lease retries exhausted', 'expired');
       const selected = await client.query("SELECT j.* FROM runtime_jobs j JOIN runtime_runs r ON r.tenant_id=j.tenant_id AND r.id=j.run_id WHERE j.tenant_id=$1 AND runtime_ancestors_active(j.tenant_id,j.run_id) AND r.status IN ('queued','running') AND j.retry_count<j.max_attempts AND ((j.status='queued' AND j.available_at<=NOW()) OR (j.status='running' AND j.lease_until<NOW())) ORDER BY j.priority DESC,j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1", [tenantId]);
       const job = selected.rows[0];
       if (!job) return undefined;
@@ -451,19 +459,44 @@ export class PostgresRunRepository {
 
   async retryFailed(tenantId: string, runId: string, userId?: string): Promise<boolean> {
     return this.transaction(tenantId, async client => {
-      await client.query('SELECT run_id FROM runtime_jobs WHERE tenant_id=$1 AND run_id=$2 FOR UPDATE', [tenantId, runId]);
-      const row = (await client.query('SELECT snapshot FROM runtime_runs WHERE tenant_id=$1 AND id=$2 AND ($3::text IS NULL OR user_id=$3) FOR UPDATE', [tenantId, runId, userId ?? null])).rows[0];
+      // The tree lock spawnChild and cancelTree take: the subtree is requeued
+      // atomically, so no sweep can cancel a child between it and its parent.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [`run-tree:${tenantId}`]);
+      const row = (await client.query('SELECT snapshot FROM runtime_runs WHERE tenant_id=$1 AND id=$2 AND ($3::text IS NULL OR user_id=$3)', [tenantId, runId, userId ?? null])).rows[0];
       if (!row || row.snapshot.status !== 'failed') return false;
-      const snapshot = row.snapshot as RuntimeSnapshot;
-      if (snapshot.steps.some(step => step.status === 'inconclusive' || step.status === 'rejected')) throw new RuntimeConflictError('Uncertain effects and rejected approvals cannot be replayed');
-      snapshot.status = 'queued'; delete snapshot.completedAt;
-      for (const step of snapshot.steps) if (step.status === 'failed' || step.status === 'skipped' && step.skipReason !== 'condition') { step.status = 'pending'; delete step.error; delete step.completedAt; }
-      await client.query("UPDATE runtime_jobs SET status='queued',available_at=NOW(),retry_count=0,fencing_token=fencing_token+1,lease_owner=NULL,lease_until=NULL,deadline_at=NULL WHERE tenant_id=$1 AND run_id=$2", [tenantId, runId]);
-      await client.query("UPDATE runtime_runs SET status='queued',snapshot=$3,updated_at=NOW() WHERE tenant_id=$1 AND id=$2", [tenantId, runId, JSON.stringify(snapshot)]);
-      await this.writeSteps(client, snapshot);
-      await this.event(client, snapshot, 'execution.retry.requested');
+      if (row.snapshot.parentRunId) {
+        // claim() cancels queued children of a finished parent, so a child-only retry would be accepted and then silently undone.
+        const parent = (await client.query('SELECT status FROM runtime_runs WHERE tenant_id=$1 AND id=$2', [tenantId, row.snapshot.parentRunId])).rows[0];
+        if (!parent || isTerminalExecutionStatus(parent.status)) throw new RuntimeConflictError('Retry the parent run to replay this child');
+      }
+      await this.requeueFailed(client, tenantId, runId, 0);
       return true;
     });
+  }
+
+  // A failed step keeps its childRunId, and runtime_children admits one child per
+  // parent step, so re-running the parent would only re-read the same failed child.
+  // The failed subtree is therefore requeued with it, under the same replay rules
+  // at every level.
+  private async requeueFailed(client: RuntimeClient, tenantId: string, runId: string, depth: number): Promise<void> {
+    await client.query('SELECT run_id FROM runtime_jobs WHERE tenant_id=$1 AND run_id=$2 FOR UPDATE', [tenantId, runId]);
+    const snapshot = (await client.query('SELECT snapshot FROM runtime_runs WHERE tenant_id=$1 AND id=$2 FOR UPDATE', [tenantId, runId])).rows[0]?.snapshot as RuntimeSnapshot | undefined;
+    if (!snapshot || snapshot.status !== 'failed') throw new RuntimeConflictError('A run in this tree changed during retry');
+    if (snapshot.steps.some(step => step.status === 'inconclusive' || step.status === 'rejected')) throw new RuntimeConflictError('Uncertain effects and rejected approvals cannot be replayed');
+    const replayed = snapshot.steps.filter(step => step.status === 'failed' || step.status === 'skipped' && step.skipReason !== 'condition');
+    for (const step of [...replayed, ...snapshot.steps.filter(item => item.status === 'pending')]) {
+      if (typeof step.childRunId !== 'string') continue;
+      const child = (await client.query('SELECT status FROM runtime_runs WHERE tenant_id=$1 AND id=$2 AND parent_run_id=$3', [tenantId, step.childRunId, runId])).rows[0];
+      if (child?.status === 'failed' && depth < 5) await this.requeueFailed(client, tenantId, step.childRunId, depth + 1);
+      // A completed child is reused as is; any other outcome (cancelled, rejected, inconclusive) is not ours to replay.
+      else if (!child || !['completed', 'simulated'].includes(child.status)) throw new RuntimeConflictError(`Child run ${step.childRunId} cannot be replayed`);
+    }
+    snapshot.status = 'queued'; delete snapshot.completedAt;
+    for (const step of replayed) { step.status = 'pending'; delete step.error; delete step.completedAt; }
+    await client.query("UPDATE runtime_jobs SET status='queued',available_at=NOW(),retry_count=0,fencing_token=fencing_token+1,lease_owner=NULL,lease_until=NULL,deadline_at=NULL,wake_at=NULL WHERE tenant_id=$1 AND run_id=$2", [tenantId, runId]);
+    await client.query("UPDATE runtime_runs SET status='queued',snapshot=$3,updated_at=NOW() WHERE tenant_id=$1 AND id=$2", [tenantId, runId, JSON.stringify(snapshot)]);
+    await this.writeSteps(client, snapshot);
+    await this.event(client, snapshot, 'execution.retry.requested');
   }
 
   async cancel(tenantId: string, runId: string, userId?: string): Promise<boolean> {

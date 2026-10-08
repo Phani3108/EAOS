@@ -11,6 +11,7 @@ import { getEngineeringSkill } from './engineering-skills-data.js';
 import { getProductSkill } from './product-skills-data.js';
 import { getHRSkill } from './hr-skills-data.js';
 import { getWorkflowRef } from './marketing-workflows-data.js';
+import { deploymentTenant } from './deployment-tenant.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,7 +26,8 @@ export interface ScheduledJob {
      * Owning tenant, captured from the creating principal.
      *
      * Optional only for backward compatibility with jobs persisted before this
-     * field existed; those fall back to 'default'. A scheduled run produces a
+     * field existed; those stay quarantined (executeJob refuses them) until an
+     * explicit ownership migration is reviewed. A scheduled run produces a
      * real execution, so without this the run — and everything attributed from
      * it — would be tenant-less.
      */
@@ -236,6 +238,8 @@ export class Scheduler {
         ];
 
         for (const job of demo) {
+            // Seeded by this deployment, so owned by its tenant rather than quarantined as legacy.
+            job.tenantId = deploymentTenant();
             this.jobs.set(job.id, job);
             this.logs.set(job.id, []);
             if (job.eventTrigger) {
@@ -314,7 +318,7 @@ export class Scheduler {
                 // to `timeout` seconds for it to reach a terminal state to record
                 // accurate success/failure in the job log.
                 const persona = this.resolvePersonaForJob(job);
-                if (!job.tenantId || job.tenantId !== (process.env.EAOS_TENANT_ID || 'default')) throw new Error('Legacy job tenant ownership requires review');
+                if (!job.tenantId || job.tenantId !== deploymentTenant()) throw new Error('Legacy job tenant ownership requires review');
                 const exec = await createPersonaExecution(
                     // Pre-existing jobs without verified tenant ownership remain
                     // quarantined until an explicit migration has been reviewed.
@@ -323,7 +327,9 @@ export class Scheduler {
                     skill,
                     job.inputs ?? {},
                     job.createdBy,
-                    /* simulate */ false,
+                    // No choice recorded on the job: the runtime decides (run-mode.ts), so a
+                    // keyless gateway simulates instead of queuing live runs that can only fail.
+                    /* simulate */ undefined,
                 );
 
                 const timeoutMs = (job.timeout ?? 120) * 1000;

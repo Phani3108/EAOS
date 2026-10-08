@@ -3031,6 +3031,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 return;
             }
             const job = scheduler.createJob({
+                // guardRole() above guarantees an authenticated principal. Without the
+                // tenant stamp executeJob quarantines the job as legacy and it never runs.
+                tenantId: authUser!.tenantId,
                 name: name as string,
                 skillId: skillId as string,
                 skillName: (skillName as string) || (skillId as string),

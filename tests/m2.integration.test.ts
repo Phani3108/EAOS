@@ -73,6 +73,44 @@ async function main() {
     });
     const { verifyScheduleStorage } = await import('./m2.storage-contract.js');
     await verifyScheduleStorage(scopedPool, repository, snapshot(a) as any, definition);
+    {
+      const { PostgresScheduleRepository } = await import('../packages/db/dist/schedule-repository.js');
+      const schedules = new PostgresScheduleRepository(scopedPool, repository);
+      const owner = { tenantId: a, userId: `user-${a}` };
+      const receipts = async (id: string) => Number((await pool.query('SELECT count(*) AS total FROM runtime_trigger_receipts WHERE tenant_id=$1 AND source_id=$2', [a, id])).rows[0].total);
+      // A schedule whose admission keeps failing is parked as failed with its reason, instead of staying due and failing every poll.
+      const missingArtifact = { ...snapshot(a), inputs: { attachment: { artifactId: `artifact-missing-${suffix}` } } };
+      const broken = await schedules.create(owner, { name: 'Fixture broken', scheduleType: 'interval', intervalMs: 60_000, nextRunAt: '2020-01-01T00:00:00Z', template: { snapshot: missingArtifact as any, definition, payload: {} } });
+      const healthy = await schedules.create(owner, { name: 'Fixture healthy', scheduleType: 'interval', intervalMs: 60_000, nextRunAt: '2020-01-02T00:00:00Z', template: { snapshot: snapshot(a) as any, definition, payload: {} } });
+      assert.equal(await schedules.dispatchDue(a), undefined);
+      const parked = (await schedules.get(owner, broken.id))!;
+      assert.equal(parked.status, 'failed');
+      assert.match(parked.data.lastError ?? '', /Input artifact is unavailable/);
+      assert.equal(parked.nextRun, broken.nextRun);
+      assert.equal(await receipts(broken.id), 0);
+      const healthyRun = await schedules.dispatchDue(a);
+      assert.ok(healthyRun);
+      // Advancing to the next occurrence is not an operator edit, so the operator's version still pauses it.
+      const advanced = (await schedules.get(owner, healthy.id))!;
+      assert.equal(advanced.version, healthy.version);
+      assert.ok(new Date(advanced.nextRun!).getTime() > Date.now());
+      assert.equal((await schedules.setStatus(owner, healthy.id, 'paused', healthy.version))?.status, 'paused');
+      await repository.cancel(a, healthyRun, owner.userId);
+      // A failure after admission (no next cron occurrence) also undoes that occurrence's run.
+      const horizon = await schedules.create(owner, { name: 'Fixture horizon', scheduleType: 'cron', cronExpression: '* * * * *', template: { snapshot: snapshot(a) as any, definition, payload: {} } });
+      await pool.query(`UPDATE runtime_schedules SET next_run_at='2020-01-01T00:00:00Z',data=jsonb_set(data,'{cronExpression}','"0 0 30 2 *"') WHERE tenant_id=$1 AND id=$2`, [a, horizon.id]);
+      assert.equal(await schedules.dispatchDue(a), undefined);
+      assert.equal((await schedules.get(owner, horizon.id))?.status, 'failed');
+      assert.equal(await receipts(horizon.id), 0);
+      assert.equal(await schedules.dispatchDue(a), undefined);
+      // Stored templates lose the legacy log-wait timeout that capped every scheduled attempt at 120 s.
+      const legacy = await schedules.create(owner, { name: 'Fixture legacy timeout', scheduleType: 'event', eventTrigger: 'fixture.legacy', template: { snapshot: snapshot(a) as any, definition, payload: { timeoutMs: 120_000, maxAttempts: 3 } } });
+      await pool.query("DELETE FROM eaos_schema_migrations WHERE name='026_schedule_attempt_deadline.sql'");
+      await runMigrations(pool);
+      assert.deepEqual((await schedules.get(owner, legacy.id))?.data.template.payload, { maxAttempts: 3 });
+      await schedules.setStatus(owner, legacy.id, 'paused', legacy.version);
+      console.log('PASS failing schedules park with their reason, dispatch keeps the operator version, legacy schedule deadlines are dropped');
+    }
     const capacityRuns = [snapshot(a), snapshot(a), snapshot(a)];
     const capacityClaims = [];
     for (const run of capacityRuns) { await repository.submit(run as any, definition, {}); capacityClaims.push((await repository.claim(a, `capacity-${run.id}`))!); }
@@ -176,6 +214,20 @@ async function main() {
     await assert.rejects(repository.checkpoint(deadlineClaim.lease, { ...deadlineRun, status: 'simulated' } as any));
     await repository.claim(b, 'deadline-sweeper');
     assert.equal((await repository.get(b, deadlineRun.id))?.status, 'failed');
+    // A worker that dies on its last lease attempt mid-effect: the sweep closes the run as completely as a deadline does.
+    const exhausted = { ...snapshot(b), mode: 'live', steps: [{ ...snapshot(b).steps[0], kind: 'tool_effect' }] };
+    await repository.submit(exhausted as any, definition, { maxAttempts: 1 });
+    const exhaustedClaim = (await repository.claim(b, 'crashing-worker'))!;
+    await repository.checkpoint(exhaustedClaim.lease, { ...exhausted, status: 'running', steps: [{ ...exhausted.steps[0], status: 'running' }] } as any);
+    await pool.query("UPDATE runtime_jobs SET lease_until=NOW()-INTERVAL '1 second' WHERE tenant_id=$1 AND run_id=$2", [b, exhausted.id]);
+    assert.equal(await repository.claim(b, 'exhausted-sweeper'), undefined);
+    const closed = (await repository.get(b, exhausted.id))!;
+    assert.equal(closed.status, 'inconclusive');
+    assert.deepEqual(closed.steps.map(step => [step.status, step.error]), [['inconclusive', 'Lease retries exhausted']]);
+    assert.equal((await pool.query("SELECT status FROM runtime_attempts WHERE tenant_id=$1 AND run_id=$2", [b, exhausted.id])).rows.map((row: { status: string }) => row.status).join(), 'expired');
+    assert.equal((await pool.query("SELECT count(*) AS open FROM runtime_step_attempts WHERE tenant_id=$1 AND run_id=$2 AND finished_at IS NULL", [b, exhausted.id])).rows[0].open, '0');
+    assert.equal((await pool.query("SELECT status FROM runtime_steps WHERE tenant_id=$1 AND run_id=$2", [b, exhausted.id])).rows[0].status, 'inconclusive');
+    assert.equal((await pool.query("SELECT count(*) AS total FROM runtime_events WHERE tenant_id=$1 AND run_id=$2 AND type='execution.inconclusive'", [b, exhausted.id])).rows[0].total, '1');
 
     const awaiting = snapshot(a);
     await repository.submit(awaiting as any, definition, {});
