@@ -20,10 +20,15 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  admitModel,
   callLLM,
+  estimateRequestMicros,
+  listPricedModels,
   LLMNotConfiguredError,
   LLMUnavailableError,
   ProviderCallError,
+  UnpricedModelError,
+  type LLMRequest,
 } from './llm-provider.js';
 
 /** Every env var `getAvailableProviders()` reads, so each test starts from zero. */
@@ -44,9 +49,11 @@ describe('durable usage boundary', () => {
     const fetch = stubFetchAnthropicOk();
     const reserve = vi.fn(async () => { throw new Error('Fixture budget denied'); });
     const settle = vi.fn(async () => {});
-    await expect(callLLM({ ...REQ, usage: { reserve, settle } })).rejects.toThrow('Fixture budget denied');
+    const release = vi.fn(async () => {});
+    await expect(callLLM({ ...REQ, usage: { reserve, settle, release } })).rejects.toThrow('Fixture budget denied');
     expect(fetch).not.toHaveBeenCalled();
     expect(settle).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
   });
   it('does not repeat a successful vendor call after settlement fails', async () => {
     process.env.ANTHROPIC_API_KEY = 'fixture';
@@ -54,9 +61,132 @@ describe('durable usage boundary', () => {
     const fetch = stubFetchAnthropicOk();
     const reserve = vi.fn(async () => 'reservation');
     const settle = vi.fn(async () => { throw new Error('Fixture ledger outage'); });
-    await expect(callLLM({ ...REQ, provider: 'anthropic', usage: { reserve, settle } })).rejects.toThrow('Fixture ledger outage');
+    const release = vi.fn(async () => {});
+    await expect(callLLM({ ...REQ, provider: 'anthropic', usage: { reserve, settle, release } })).rejects.toThrow('Fixture ledger outage');
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(settle).toHaveBeenCalledTimes(1);
+    expect(release).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Reservations follow what the provider did. Every attempt reserved and only a
+ * success settled, so a mistyped key or a 429 storm left reservations that never
+ * expire, and the budget ran out with nothing spent.
+ */
+describe('usage reservations of failed attempts', () => {
+  function ledger() {
+    const events: string[] = [];
+    const usage = {
+      reserve: vi.fn(async (request: LLMRequest) => { events.push(`reserve:${request.provider}`); return `r-${request.provider}`; }),
+      settle: vi.fn(async (id: string) => { events.push(`settle:${id}`); }),
+      release: vi.fn(async (id: string) => { events.push(`release:${id}`); }),
+    };
+    return { events, usage };
+  }
+  const openAiOk = () => new Response(JSON.stringify({ choices: [{ message: { content: 'From the fallback provider.' } }], usage: { prompt_tokens: 10, completion_tokens: 5 } }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+  it('releases a refused attempt before the fallback provider reserves its own', async () => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    process.env.OPENAI_API_KEY = 'fixture';
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => String(url).includes('anthropic') ? new Response('invalid x-api-key', { status: 401 }) : openAiOk()));
+    const { events, usage } = ledger();
+    const response = await callLLM({ ...REQ, provider: 'anthropic', usage });
+    expect(response.provider).toBe('openai');
+    expect(events).toEqual(['reserve:anthropic', 'release:r-anthropic', 'reserve:openai', 'settle:r-openai']);
+  });
+
+  it('returns every reservation when the whole chain is refused', async () => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    process.env.OPENAI_API_KEY = 'fixture';
+    stubFetchStatus(429, 'rate_limit_error');
+    const { usage } = ledger();
+    await expect(callLLM({ ...REQ, usage })).rejects.toThrow(LLMUnavailableError);
+    expect(usage.release.mock.calls.map(([id]) => id).sort()).toEqual(['r-anthropic', 'r-openai']);
+    expect(usage.settle).not.toHaveBeenCalled();
+  });
+
+  it('releases when the connection was never established', async () => {
+    process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:1';
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:1'), { code: 'ECONNREFUSED' }) }); }));
+    const { usage } = ledger();
+    await expect(callLLM({ ...REQ, usage })).rejects.toThrow(LLMUnavailableError);
+    expect(usage.release).toHaveBeenCalledWith('r-ollama');
+  });
+
+  it.each([
+    ['a connection reset after the request was sent', () => { throw new TypeError('fetch failed', { cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }) }); }],
+    ['a gateway timeout', () => new Response('upstream timed out', { status: 504 })],
+    ['a 2xx body that could not be read', () => new Response('<html>not json</html>', { status: 200 })],
+  ])('keeps the reservation after %s: the request may have been billed', async (_case, respond) => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    vi.stubGlobal('fetch', vi.fn(async () => respond()));
+    const { usage } = ledger();
+    await expect(callLLM({ ...REQ, usage })).rejects.toThrow(LLMUnavailableError);
+    expect(usage.reserve).toHaveBeenCalledTimes(1);
+    expect(usage.release).not.toHaveBeenCalled();
+  });
+
+  it('keeps the reservation when the run is aborted mid-request', async () => {
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    const controller = new AbortController();
+    vi.stubGlobal('fetch', vi.fn(async () => { controller.abort(); throw new DOMException('The operation was aborted', 'AbortError'); }));
+    const { usage } = ledger();
+    await expect(callLLM({ ...REQ, signal: controller.signal, usage })).rejects.toThrow();
+    expect(usage.release).not.toHaveBeenCalled();
+  });
+});
+
+describe('priced models', () => {
+  it('prices an operator Azure deployment and Ollama model by provider, as their cost is recorded', () => {
+    process.env.AZURE_OPENAI_ENDPOINT = 'https://fixture.openai.azure.invalid';
+    process.env.AZURE_OPENAI_KEY = 'fixture';
+    process.env.AZURE_OPENAI_DEPLOYMENT = 'contoso-gpt4o-prod';
+    process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:11434';
+    process.env.OLLAMA_MODEL = 'qwen2.5-coder';
+    // callAzureOpenAI records every deployment's cost at gpt-4o rates; callOllama records 0.
+    expect(estimateRequestMicros({ ...REQ, provider: 'azure-openai' })).toBe(estimateRequestMicros({ ...REQ, provider: 'openai', model: 'gpt-4o' }));
+    expect(estimateRequestMicros({ ...REQ, provider: 'ollama' })).toBe(0);
+    expect(estimateRequestMicros({ ...REQ, provider: 'ollama', model: 'llama3.1' })).toBe(0);
+  });
+
+  it('never invents a price for an unknown hosted model', () => {
+    expect(() => estimateRequestMicros({ ...REQ, provider: 'anthropic', model: 'claude-sonnet-4-6-20251001' })).toThrow(/no known price/);
+  });
+
+  it('lists exactly the models a reservation can price, and admits each of them', () => {
+    process.env.AZURE_OPENAI_DEPLOYMENT = 'contoso-gpt4o-prod';
+    process.env.OLLAMA_MODEL = 'qwen2.5-coder';
+    process.env.ANTHROPIC_API_KEY = 'fixture';
+    const models = listPricedModels();
+    for (const entry of models) {
+      expect(() => estimateRequestMicros({ ...REQ, provider: entry.provider, model: entry.id })).not.toThrow();
+      expect(admitModel(entry.provider, entry.id)).toEqual({ provider: entry.provider, model: entry.id });
+    }
+    expect(models).toContainEqual(expect.objectContaining({ id: 'claude-sonnet-4-6', provider: 'anthropic', providerDefault: true, available: true }));
+    expect(models).toContainEqual(expect.objectContaining({ id: 'contoso-gpt4o-prod', provider: 'azure-openai', inputUsdPerMTok: 2.5, available: false }));
+    expect(models).toContainEqual(expect.objectContaining({ id: 'qwen2.5-coder', provider: 'ollama', inputUsdPerMTok: 0, outputUsdPerMTok: 0 }));
+    // Previously offered by the persona hubs, never priced: refused rather than listed.
+    for (const unpriced of ['claude-sonnet-4-6-20251001', 'o3-mini', 'llama3.1', 'azure-gpt-4o']) expect(models.some(entry => entry.id === unpriced)).toBe(false);
+  });
+
+  it('refuses an unpriced or mismatched model with a 400 that names the alternatives', () => {
+    let refused: unknown;
+    try { admitModel('anthropic', 'claude-sonnet-4-6-20251001'); } catch (error) { refused = error; }
+    expect(refused).toBeInstanceOf(UnpricedModelError);
+    expect(refused).toMatchObject({ statusCode: 400, model: 'claude-sonnet-4-6-20251001', provider: 'anthropic' });
+    expect((refused as UnpricedModelError).allowedModels).toContain('claude-sonnet-4-6');
+    expect((refused as Error).message).toContain('claude-sonnet-4-6,');
+    expect(() => admitModel('ollama', 'gpt-4o')).toThrow(UnpricedModelError);
+    expect(() => admitModel(undefined, 'llama3.1')).toThrow(/Choose one of: .*llama3\.2/);
+  });
+
+  it('routes a model named without a provider to the configured provider that prices it', () => {
+    expect(admitModel(undefined, 'gpt-4o-mini')).toEqual({ provider: 'openai', model: 'gpt-4o-mini' });
+    process.env.AZURE_OPENAI_ENDPOINT = 'https://fixture.openai.azure.invalid';
+    process.env.AZURE_OPENAI_KEY = 'fixture';
+    expect(admitModel(undefined, 'gpt-4o')).toEqual({ provider: 'azure-openai', model: 'gpt-4o' });
+    expect(admitModel('anthropic', undefined)).toEqual({ provider: 'anthropic', model: undefined });
   });
 });
 

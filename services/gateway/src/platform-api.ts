@@ -106,8 +106,11 @@ export async function platformRequest(repository: PlatformRepository | undefined
       const input = validate(z.object({ hash, expectedRevision: version }).strict(), await readBody());
       return { status: 200, data: await repository.activateVersion(principal, pkg[1]!, input.hash, input.expectedRevision) };
     }
+    // `simulate` is the caller's choice, not the run's mode: preparePersonaExecution
+    // decides that from the principal (a demo visitor is always simulated, whatever
+    // it sends) and, when the field is omitted, from whether a provider is configured.
     if (method === 'POST' && pkg[2] === 'preview') {
-      const input = validate(z.object({ hash, inputs: z.record(z.string(), z.unknown()), simulate: z.boolean(), requestKey: z.string().min(1).max(160) }).strict(), await readBody());
+      const input = validate(z.object({ hash, inputs: z.record(z.string(), z.unknown()), simulate: z.boolean().optional(), requestKey: z.string().min(1).max(160) }).strict(), await readBody());
       const candidate = await repository.candidateVersion(principal, pkg[1]!, input.hash);
       const definition = compileDefinition(candidate.definition as unknown as UnifiedSkillDef);
       if (definition.definitionHash !== candidate.hash || requiredPersonas(definition).some(persona => !requirePersonaAccess(user, persona))) return { status: 403, data: { error: 'Candidate scope denied' } };
@@ -116,7 +119,7 @@ export async function platformRequest(repository: PlatformRepository | undefined
       return { status: 201, data: { execution: await repository.submitCandidate(principal, runs, candidate.packageId, prepared.exec as unknown as RuntimeSnapshot, { ...definition }, prepared.payload, `candidate:${input.requestKey}`) } };
     }
     if (method === 'POST' && pkg[2] === 'execute') {
-      const input = validate(z.object({ inputs: z.record(z.string(), z.unknown()), simulate: z.boolean(), requestKey: z.string().min(1).max(160) }).strict(), await readBody());
+      const input = validate(z.object({ inputs: z.record(z.string(), z.unknown()), simulate: z.boolean().optional(), requestKey: z.string().min(1).max(160) }).strict(), await readBody());
       const active = await repository.getActiveVersion(principal, pkg[1]!);
       const definition = compileDefinition(active.definition as unknown as UnifiedSkillDef);
       if (definition.definitionHash !== active.hash || requiredPersonas(definition).some(persona => !requirePersonaAccess(user, persona))) return { status: 403, data: { error: 'Active version cannot be executed by this principal' } };

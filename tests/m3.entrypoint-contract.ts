@@ -19,7 +19,14 @@ export async function verifyEntrypointParity(h: {
         { id: 'b', agent: 'docs-writer', kind: 'transform', transform: { value: 'b' }, depends_on: [], phase: 'main', parallel_group: 'parallel' },
         { id: 'join', agent: 'code-reviewer', kind: 'join', depends_on: ['a','b'], phase: 'main', parallel_group: null },
     ], phases: { main: {} }, quality_gates: [], checkpoints: [], feedback_loops: [], shared_state: {} };
-    const soman = await h.request(h.tenantId, '/api/pipeline/execute', { intent: 'Fixture SOMAN run', persona: 'engineering', graphConfig });
+    // This gateway has no LLM provider: a launch that makes no run-mode choice (as the
+    // UI's pipeline and swarm views do) is a labelled simulation, not a live run.
+    const unchosen = await h.request(h.tenantId, '/api/pipeline/execute', { intent: 'Fixture SOMAN run without a mode choice', persona: 'engineering', graphConfig });
+    assert.equal(unchosen.status, 200);
+    assert.equal(unchosen.data.mode, 'simulation');
+    await h.waitStatus(h.tenantId, unchosen.data.id, 'simulated');
+    // A deterministic graph needs no model, so an explicit live run completes without one.
+    const soman = await h.request(h.tenantId, '/api/pipeline/execute', { intent: 'Fixture SOMAN run', persona: 'engineering', graphConfig, simulate: false });
     assert.equal(soman.status, 200);
     const somanRun = await h.waitStatus(h.tenantId, soman.data.id, 'completed');
     assert.deepEqual(somanRun.steps.map((step: { status: string }) => step.status), ['completed','completed','completed']);
@@ -31,7 +38,7 @@ export async function verifyEntrypointParity(h: {
     assert.equal(fullSoman.status, 200, JSON.stringify(fullSoman.data));
     await h.waitStatus(h.tenantId, fullSoman.data.id, 'simulated');
     assert.equal((await h.request(h.tenantId, '/api/pipeline/graph?persona=../../')).status, 400);
-    const approval = await h.request(h.tenantId, '/api/pipeline/execute', { intent: 'Fixture approval graph', persona: 'engineering', graphConfig: { ...graphConfig, checkpoints: [{ id: 'approval', before_node: 'join', type: 'human_approval', description: 'Confirm fixture', requires_fields: ['fixture_confirmed'] }] } });
+    const approval = await h.request(h.tenantId, '/api/pipeline/execute', { intent: 'Fixture approval graph', persona: 'engineering', simulate: false, graphConfig: { ...graphConfig, checkpoints: [{ id: 'approval', before_node: 'join', type: 'human_approval', description: 'Confirm fixture', requires_fields: ['fixture_confirmed'] }] } });
     assert.equal(approval.status, 200);
     const paused = await h.waitStatus(h.tenantId, approval.data.id, 'paused');
     const gate = paused.steps.find((step: { status: string }) => step.status === 'approval_required');
@@ -46,7 +53,7 @@ export async function verifyEntrypointParity(h: {
     assert.equal((await h.runs.children(h.tenantId, swarmId)).length, 5);
     assert.equal((await h.request(h.tenantId, `/api/a2a/swarms/${swarmId}`)).data.swarm.status, 'simulated');
     assert.equal((await h.request(h.tenantId, `/api/swarms/${swarmId}/advance`, {})).status, 409);
-    const cancelled = await h.request(h.tenantId, '/api/swarms/launch', { type: 'campaign_pod', mission: 'Fixture cancel before activation' });
+    const cancelled = await h.request(h.tenantId, '/api/swarms/launch', { type: 'campaign_pod', mission: 'Fixture cancel before activation', simulate: false });
     assert.equal(cancelled.status, 201);
     await h.waitStatus(h.tenantId, cancelled.data.id, 'paused');
     assert.equal((await h.request(h.foreignTenant, `/api/swarms/${cancelled.data.id}/dissolve`, {})).status, 404);

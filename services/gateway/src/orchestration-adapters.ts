@@ -34,6 +34,10 @@ export async function submitChatExecution(principal: AuthUser, session: ChatSess
         inputs = { conversation };
     }
     if (requiredPersonas(definition).some(persona => !requirePersonaAccess(principal, persona))) throw new Error('Skill command requires additional persona permissions');
-    const execution = await createPersonaExecution(principal.tenantId, definition.persona, definition, inputs, principal.id, false, undefined, undefined, undefined, `chat:${session.sessionId}:${messageId}`);
+    // Chat offers no run-mode choice, so none is passed: the runtime decides from
+    // the principal (demo visitors are always simulated) and from whether any
+    // LLM provider is configured. A hardcoded `false` here made every message —
+    // a public demo visitor's included — a live, billable run.
+    const execution = await createPersonaExecution(principal.tenantId, definition.persona, definition, inputs, principal.id, undefined, undefined, undefined, undefined, `chat:${session.sessionId}:${messageId}`);
     return execution.id;
 }

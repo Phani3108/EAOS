@@ -14,6 +14,7 @@
 
 import { addMessage, buildConversationContext, getSession, usesDurableChat } from './chat-store.js';
 import { callLLM } from './llm-provider.js';
+import { resolveSimulate } from './run-mode.js';
 import { broadcastEvent } from './ws.js';
 import { eventBus } from './event-bus.js';
 import { createUTCPPacket, storePacket } from './utcp-protocol.js';
@@ -88,7 +89,12 @@ export async function postMessage(params: {
         message: userMsg,
     }, params.tenantId);
 
-    if (usesDurableChat()) {
+    // Chat offers no run-mode choice, so the shared rule decides (run-mode.ts):
+    // a demo visitor, or a gateway with no LLM provider, gets a simulation. The
+    // file store's direct reply below calls a provider with no budget at all, so
+    // a simulated message takes the canonical execution path instead — a
+    // labelled simulated run, never prose presented as the agent's answer.
+    if (usesDurableChat() || resolveSimulate(params.userId)) {
         try {
             if (!submitExecution || !params.principal || params.principal.id !== params.userId || params.principal.tenantId !== params.tenantId) throw new Error('Verified chat execution context is required');
             const context = await buildConversationContext(params.sessionId, params, { maxMessages: 20 });

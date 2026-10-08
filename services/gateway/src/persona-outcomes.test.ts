@@ -30,7 +30,8 @@ beforeEach(async () => {
 afterEach(() => { vi.useRealTimers(); });
 
 async function start(skill = structuredClone(definition), simulate = false) {
-  const run = await api.createPersonaExecution('fixture-tenant', 'engineering', skill, {}, 'fixture-user', simulate, undefined, 'anthropic', 'fixture');
+  // A live run must name a priced model: an unpriced one is refused at submission.
+  const run = await api.createPersonaExecution('fixture-tenant', 'engineering', skill, {}, 'fixture-user', simulate, undefined, 'anthropic', 'claude-sonnet-4-6');
   return { run, work: mocks.enqueue.mock.calls.at(-1)![0].payload };
 }
 

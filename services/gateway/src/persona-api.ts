@@ -10,6 +10,7 @@
 
 import type { PersonaSkillDef, SkillStep } from './engineering-skills-data.js';
 import {
+  admitModel,
   callLLM as callLLMProvider,
   LLMNotConfiguredError,
   LLMUnavailableError,
@@ -18,6 +19,7 @@ import {
   type ProviderAttempt,
   estimateRequestMicros,
 } from './llm-provider.js';
+import { resolveSimulate } from './run-mode.js';
 import { tracedLLMCall } from './llm-tracer.js';
 import { containsPII, redact as redactPII } from './pii-redactor.js';
 import { routedLLMCall, recordCostEntry, detectComplexity, BudgetExceededError, CircuitOpenError } from './model-router.js';
@@ -424,6 +426,7 @@ async function callLLMUnified(
         return usageRepository!.reserveUsage(owner, context.lease.runId, context.stepId!, context.lease.attempt * 1000 + sequence, estimateRequestMicros(request));
       },
       settle: (id, response) => usageRepository!.settleUsage(owner, id, Math.ceil(response.cost * 1_000_000)),
+      release: id => usageRepository!.releaseUsage(owner, id),
     } });
   }
   // Use model router for intelligent routing when no specific model requested
@@ -2215,11 +2218,25 @@ export function getAgentKPI(agentId: string): AgentKPI | undefined {
 // Public API
 // ---------------------------------------------------------------------------
 
-export function preparePersonaExecution(tenantId: string, persona: WorkflowPersona, skill: PersonaSkillDef, inputs: Record<string, unknown>, userId: string | undefined, simulate = false, customPrompt?: string, provider?: LLMProviderId, modelId?: string) {
+/**
+ * Build a run for admission. Every run is created here — whichever route,
+ * schedule or parent workflow asked — so this is where its mode is decided.
+ *
+ * @param simulate the caller's choice of run mode; omit it when the caller
+ *   expressed none. It is an input to the decision, never the decision itself.
+ */
+export function preparePersonaExecution(tenantId: string, persona: WorkflowPersona, skill: PersonaSkillDef, inputs: Record<string, unknown>, userId: string | undefined, simulate?: boolean, customPrompt?: string, provider?: LLMProviderId, modelId?: string) {
   if (!tenantId || !userId) throw new Error('Execution tenant and principal are required');
+  // From the run's owner: demo principals are simulated whatever was asked, and
+  // with no choice, no configured provider means simulation (run-mode.ts).
+  simulate = resolveSimulate(userId, simulate);
   const definition = compileDefinition(skill);
   if (definition.persona !== persona) throw new Error('Execution persona does not match its definition');
   inputs = validateSkillInputs(definition.inputs, inputs);
+  // A live run reserves budget at its model's price before every provider call,
+  // so an unpriced model is refused now, with the models to choose from, rather
+  // than admitted to fail at its first step.
+  if (!simulate) ({ provider, model: modelId } = admitModel(provider, modelId));
   if (!simulate && !integrationRepository && definition.inputs.some(field => field.type === 'file' && inputs[field.id] !== undefined)) throw new ExecutionOutcomeError('unsupported', 'File artifacts must be resolved through a tenant-scoped artifact repository');
   const id = `${persona}-exec-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const exec: PersonaExecutionRecord = {
@@ -2246,6 +2263,7 @@ export async function createPersonaExecution(
   skill: PersonaSkillDef,
   inputs: Record<string, unknown>,
   userId?: string,
+  /** The caller's choice, or undefined for none; preparePersonaExecution decides. */
   simulate?: boolean,
   customPrompt?: string,
   provider?: LLMProviderId,
@@ -2253,11 +2271,13 @@ export async function createPersonaExecution(
   requestKey?: string,
   source?: PersonaExecutionRecord['source'],
 ): Promise<PersonaExecutionRecord> {
-  const { exec, definition, payload } = preparePersonaExecution(tenantId, persona, skill, inputs, userId, simulate === true, customPrompt, provider, modelId);
+  const { exec, definition, payload } = preparePersonaExecution(tenantId, persona, skill, inputs, userId, simulate, customPrompt, provider, modelId);
   const id = exec.id;
   if (source) exec.source = structuredClone(source);
   skill = definition;
   inputs = exec.inputs;
+  // The admitted run, not the request: its mode and model were decided above.
+  ({ simulate, provider, modelId } = payload);
 
   if (runtimeRepository) {
     const accepted = await runtimeRepository.submit(exec as unknown as RuntimeSnapshot, definition as unknown as Record<string, unknown>, { ...payload, ...(source?.timeoutMs ? { timeoutMs: source.timeoutMs } : {}), ...(source?.globalTimeoutMs ? { runTimeoutMs: source.globalTimeoutMs } : {}), ...(source?.priority ? { priority: ({ low: 10, normal: 50, high: 80, critical: 100 } as Record<string, number>)[String(source.priority)] ?? 50 } : {}) }, requestKey);
@@ -2301,7 +2321,7 @@ export async function createPersonaExecution(
         persona,
         skill,
         inputs,
-        simulate: simulate ?? false,
+        simulate,
         customPrompt,
         provider,
         modelId,

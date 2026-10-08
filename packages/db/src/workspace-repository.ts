@@ -146,6 +146,23 @@ export class PostgresWorkspaceRepository {
       await client.query("UPDATE runtime_usage_reservations SET actual_micros=$3,status='settled',settled_at=NOW() WHERE tenant_id=$1 AND id=$2", [owner.tenantId, id, actualMicros]);
     });
   }
+  /**
+   * Return a reservation whose provider attempt provably produced no billable
+   * completion (the caller decides which failures qualify). Without this, every
+   * refused attempt — a bad key, a 429, an unknown model — held its estimate
+   * forever, and a tenant could exhaust its budget having spent nothing.
+   * Idempotent; a settled reservation is final and is never released.
+   */
+  async releaseUsage(owner: WorkspaceOwner, id: string): Promise<void> {
+    await this.transaction(owner, async client => {
+      await client.query('SELECT tenant_id FROM runtime_usage_budgets WHERE tenant_id=$1 FOR UPDATE', [owner.tenantId]);
+      const entry = (await client.query('SELECT u.status FROM runtime_usage_reservations u JOIN runtime_runs r ON r.tenant_id=u.tenant_id AND r.id=u.run_id WHERE u.tenant_id=$1 AND u.id=$2 AND r.user_id=$3 FOR UPDATE OF u', [owner.tenantId, id, owner.userId])).rows[0];
+      if (!entry) throw new RuntimeConflictError('Usage reservation is unavailable');
+      if (entry.status === 'released') return;
+      if (entry.status !== 'reserved') throw new RuntimeConflictError('Usage was already finalized');
+      await client.query("UPDATE runtime_usage_reservations SET status='released',settled_at=NOW() WHERE tenant_id=$1 AND id=$2", [owner.tenantId, id]);
+    });
+  }
   async usage(owner: WorkspaceOwner): Promise<{ reservedMicros: number; spentMicros: number; limitMicros: number | null }> {
     return this.transaction(owner, async client => {
       const totals = (await client.query("SELECT COALESCE(sum(estimate_micros) FILTER (WHERE status='reserved'),0) AS reserved,COALESCE(sum(actual_micros) FILTER (WHERE status='settled'),0) AS spent FROM runtime_usage_reservations WHERE tenant_id=$1", [owner.tenantId])).rows[0]!;

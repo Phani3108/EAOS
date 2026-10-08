@@ -18,7 +18,16 @@ export type LLMProviderId = 'anthropic' | 'openai' | 'azure-openai' | 'gemini' |
 
 export interface LLMRequest {
   signal?: AbortSignal;
-  usage?: { reserve: (request: LLMRequest) => Promise<string>; settle: (id: string, response: LLMResponse) => Promise<void> };
+  /**
+   * Durable budget ledger. Each provider attempt reserves before dispatch; a
+   * success settles its observed cost, and an attempt that provably produced
+   * no billable completion is released (see `attemptWasNotBilled`).
+   */
+  usage?: {
+    reserve: (request: LLMRequest) => Promise<string>;
+    settle: (id: string, response: LLMResponse) => Promise<void>;
+    release: (id: string) => Promise<void>;
+  };
   provider?: LLMProviderId;
   model?: string;
   systemPrompt: string;
@@ -108,30 +117,45 @@ export class LLMUnavailableError extends Error {
 // Cost estimates per 1M tokens (input / output)
 // ---------------------------------------------------------------------------
 
-const COST_TABLE: Record<string, { input: number; output: number }> = {
+interface ModelPrice { input: number; output: number }
+
+const COST_TABLE: Record<string, ModelPrice & { provider: LLMProviderId }> = {
   // Anthropic Claude 4.x (current)
-  'claude-opus-4-7': { input: 15, output: 75 },
-  'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-haiku-4-5-20251001': { input: 0.8, output: 4 },
+  'claude-opus-4-7': { provider: 'anthropic', input: 15, output: 75 },
+  'claude-sonnet-4-6': { provider: 'anthropic', input: 3, output: 15 },
+  'claude-haiku-4-5-20251001': { provider: 'anthropic', input: 0.8, output: 4 },
   // Anthropic Claude 3.x (legacy)
-  'claude-3-5-sonnet-20241022': { input: 3, output: 15 },
-  'claude-3-opus-20240229': { input: 15, output: 75 },
-  'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+  'claude-3-5-sonnet-20241022': { provider: 'anthropic', input: 3, output: 15 },
+  'claude-3-opus-20240229': { provider: 'anthropic', input: 15, output: 75 },
+  'claude-3-haiku-20240307': { provider: 'anthropic', input: 0.25, output: 1.25 },
   // OpenAI
-  'gpt-4o': { input: 2.5, output: 10 },
-  'gpt-4o-mini': { input: 0.15, output: 0.6 },
-  'gpt-4-turbo': { input: 10, output: 30 },
-  'o1': { input: 15, output: 60 },
-  'o1-mini': { input: 3, output: 12 },
+  'gpt-4o': { provider: 'openai', input: 2.5, output: 10 },
+  'gpt-4o-mini': { provider: 'openai', input: 0.15, output: 0.6 },
+  'gpt-4-turbo': { provider: 'openai', input: 10, output: 30 },
+  'o1': { provider: 'openai', input: 15, output: 60 },
+  'o1-mini': { provider: 'openai', input: 3, output: 12 },
   // Gemini
-  'gemini-1.5-pro': { input: 1.25, output: 5 },
-  'gemini-1.5-flash': { input: 0.075, output: 0.3 },
-  'gemini-2.0-flash': { input: 0.1, output: 0.4 },
+  'gemini-1.5-pro': { provider: 'gemini', input: 1.25, output: 5 },
+  'gemini-1.5-flash': { provider: 'gemini', input: 0.075, output: 0.3 },
+  'gemini-2.0-flash': { provider: 'gemini', input: 0.1, output: 0.4 },
   // Ollama / local — free
-  'llama3.2': { input: 0, output: 0 },
-  'mistral': { input: 0, output: 0 },
-  'phi-3': { input: 0, output: 0 },
+  'llama3.2': { provider: 'ollama', input: 0, output: 0 },
+  'mistral': { provider: 'ollama', input: 0, output: 0 },
+  'phi-3': { provider: 'ollama', input: 0, output: 0 },
 };
+
+/**
+ * The rate a request is billed at, by the same rule its recorded cost uses:
+ * Ollama is local and free (callOllama records 0), and every Azure deployment
+ * is costed at gpt-4o rates (callAzureOpenAI) — so an operator's own deployment
+ * name or OLLAMA_MODEL is priced even though it is not a table key. Other
+ * providers are priced by model; `undefined` means no known price.
+ */
+function priceOf(provider: LLMProviderId | undefined, model: string | undefined): ModelPrice | undefined {
+  if (provider === 'ollama') return { input: 0, output: 0 };
+  if (provider === 'azure-openai') return COST_TABLE['gpt-4o'];
+  return model ? COST_TABLE[model] : undefined;
+}
 
 function estimateCost(model: string, inputTokens: number, outputTokens: number): number {
   const rates = COST_TABLE[model] ?? { input: 2, output: 10 };
@@ -451,6 +475,70 @@ export function hasAnyLLMKey(): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Priced models — what a live run may request
+// ---------------------------------------------------------------------------
+
+export interface PricedModel {
+  id: string;
+  provider: LLMProviderId;
+  /** USD per 1M tokens: the rate budget is reserved at and cost is recorded at. */
+  inputUsdPerMTok: number;
+  outputUsdPerMTok: number;
+  /** The provider's model when a run names none. */
+  providerDefault: boolean;
+  /** The provider has credentials on this gateway. */
+  available: boolean;
+}
+
+/**
+ * Every model a live run may name: each provider's priced models, plus the
+ * operator's Azure deployment and Ollama model (priced by provider, see
+ * `priceOf`). A live run reserves budget at its model's price before dispatch,
+ * so a model without one could never run — it is refused at submission
+ * (`admitModel`) instead of failing at its first step.
+ */
+export function listPricedModels(): PricedModel[] {
+  return getAvailableProviders().flatMap(config => {
+    // Azure routes to a named deployment, and only the configured one is known to exist.
+    const ids = config.id === 'azure-openai'
+      ? [config.defaultModel]
+      : [...new Set([...Object.keys(COST_TABLE).filter(id => COST_TABLE[id]!.provider === config.id), config.defaultModel])];
+    return ids.flatMap(id => {
+      const price = priceOf(config.id, id);
+      return price ? [{ id, provider: config.id, inputUsdPerMTok: price.input, outputUsdPerMTok: price.output, providerDefault: id === config.defaultModel, available: config.available }] : [];
+    });
+  });
+}
+
+/** A live run named a model this gateway has no price for. 400: the request is fixable. */
+export class UnpricedModelError extends Error {
+  readonly name = 'UnpricedModelError';
+  readonly statusCode = 400;
+  constructor(readonly model: string, readonly provider: LLMProviderId | undefined, readonly allowedModels: string[]) {
+    super(
+      `Model "${model}"${provider ? ` is not a priced ${provider} model` : ' has no known price'}, so a live run cannot reserve budget for it. ` +
+        `Choose one of: ${allowedModels.join(', ')} — or omit modelId to use the provider default.`,
+    );
+  }
+}
+
+/**
+ * Admit a client-chosen model for a live run. With no provider named, the run
+ * goes to the provider that prices the model (preferring a configured one), so
+ * `gpt-4o` is not sent to whichever provider happens to be the default.
+ *
+ * @throws {UnpricedModelError} the model is unknown, or not one of `provider`'s
+ */
+export function admitModel(provider: LLMProviderId | undefined, model: string | undefined): { provider?: LLMProviderId; model?: string } {
+  if (!model) return { provider, model };
+  const candidates = listPricedModels().filter(entry => !provider || entry.provider === provider);
+  const matches = candidates.filter(entry => entry.id === model);
+  const match = matches.find(entry => entry.available) ?? matches[0];
+  if (!match) throw new UnpricedModelError(model, provider, [...new Set(candidates.map(entry => entry.id))]);
+  return { provider: match.provider, model };
+}
+
+// ---------------------------------------------------------------------------
 // Unified call — the single entry point for all LLM calls in the gateway
 // ---------------------------------------------------------------------------
 
@@ -461,6 +549,46 @@ const PROVIDER_DISPATCH: Record<LLMProviderId, (req: LLMRequest) => Promise<LLMR
   gemini: callGemini,
   ollama: callOllama,
 };
+
+/**
+ * Upper bound, in micro-USD, of what one provider attempt can cost: every input
+ * byte counted as a token plus the full output allowance. Reserved before
+ * dispatch, so a tenant budget is never overrun by requests in flight.
+ *
+ * Throws only for a model with no known price — never invented. Submission
+ * refuses such models (`admitModel`), so reaching this means a run admitted
+ * before that check existed.
+ */
+export function estimateRequestMicros(request: LLMRequest): number {
+  const config = getAvailableProviders().find(provider => provider.id === request.provider);
+  const model = request.model ?? config?.defaultModel;
+  const price = priceOf(request.provider, model);
+  if (!price) throw new Error(`Model "${model ?? 'unspecified'}" has no known price, so usage cannot be reserved for it`);
+  const inputBound = Buffer.byteLength(request.systemPrompt + request.userPrompt, 'utf8') + 256;
+  return Math.ceil(inputBound * price.input + (request.maxTokens ?? 4096) * price.output);
+}
+
+/**
+ * Gateway timeouts: the provider stopped answering, not refused — the request
+ * may still have completed, and been billed, upstream.
+ */
+const UNCERTAIN_HTTP_STATUSES = new Set([504, 524]);
+/** Connection-setup failures: the request never reached the provider. */
+const NEVER_SENT_CODES = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
+
+/**
+ * True when a failed attempt cannot have produced a billable completion, so its
+ * reservation can go back to the budget: the provider answered with an error
+ * status, the request was refused before dispatch (a missing credential), or the
+ * connection was never established. Everything else — an abort or reset after
+ * the request was sent, or a 2xx body that could not be read — may have been
+ * billed, and keeps its reservation rather than inventing zero cost.
+ */
+function attemptWasNotBilled(err: unknown): boolean {
+  if (err instanceof ProviderCallError) return err.status === undefined || !UNCERTAIN_HTTP_STATUSES.has(err.status);
+  const code = (err as { cause?: { code?: unknown } } | undefined)?.cause?.code;
+  return typeof code === 'string' && NEVER_SENT_CODES.has(code);
+}
 
 /**
  * Unified LLM call with automatic fallback chain.
@@ -478,15 +606,6 @@ const PROVIDER_DISPATCH: Record<LLMProviderId, (req: LLMRequest) => Promise<LLMR
  * @throws {LLMNotConfiguredError} no provider has credentials — not retryable
  * @throws {LLMUnavailableError}   every configured provider failed — retryable
  */
-export function estimateRequestMicros(request: LLMRequest): number {
-  const config = getAvailableProviders().find(provider => provider.id === request.provider);
-  const model = request.model ?? config?.defaultModel;
-  const price = model ? COST_TABLE[model] : undefined;
-  if (!price) throw new Error('A known model price is required for usage reservation');
-  const inputBound = Buffer.byteLength(request.systemPrompt + request.userPrompt, 'utf8') + 256;
-  return Math.ceil(inputBound * price.input + (request.maxTokens ?? 4096) * price.output);
-}
-
 export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
   req.signal?.throwIfAborted();
   const providers = getAvailableProviders();
@@ -522,6 +641,10 @@ export async function callLLM(req: LLMRequest): Promise<LLMResponse> {
       const status = err instanceof ProviderCallError ? err.status : undefined;
       const message = (err as Error).message;
       attempts.push({ id: providerId, status, message });
+      // Before the next provider reserves its own share: a fallback chain that
+      // kept every refused attempt's reservation would drain the budget with
+      // calls that cost nothing — permanently, since reservations do not expire.
+      if (reservation !== undefined && attemptWasNotBilled(err)) await req.usage!.release(reservation);
       const isLast = providerId === chain[chain.length - 1];
       console.warn(
         `[llm-provider] ${providerId} failed: ${message}${isLast ? '' : ' — trying next provider'}`,

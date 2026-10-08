@@ -95,7 +95,8 @@ import { getFsSkills, reloadFsSkills, getAllFsSkills, warmAllFsSkills } from './
 import { runReviewPipeline, getReviewChain } from './review-pipeline.js';
 import { ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT_PLACEHOLDERS } from './prompts/orchestrator-prompt.js';
 import type { AfterActionReport, RetrainingFlag } from './persona-api.js';
-import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
+import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey, listPricedModels } from './llm-provider.js';
+import { resolveSimulate as decideSimulation } from './run-mode.js';
 import { getFullRegistry, getAgentIdentity, getAgentsByPersona, getCSuiteAgents, getAllCSuiteProfiles, getCSuiteProfile, getChainOfCommand, getOrgTree } from './agent-registry.js';
 import { processCognitivePipeline, decompose, reason, reflect, groundCheck, getCognitiveResult, getCognitiveTrace, type CognitiveRequest } from './cognitive-pipeline.js';
 import { eventBus } from './event-bus.js';
@@ -867,7 +868,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (authUser && requestMeasurements) res.once('finish', () => requestMeasurements.record(authUser.tenantId, method, path, res.statusCode, Math.max(0, performance.now() - requestStarted)));
     const tenantScopedRuntimeRoute = Boolean(runRepository && (
         isPlatformRoute(path) || isIntegrationRoute(path, method) || isEntrypointRoute(path, method) || isWorkspaceRoute(path, method) || isScheduleRoute(path, method) || /^\/api\/chat\/sessions(?:\/[^/]+(?:\/messages)?)?$/.test(path) ||
-        ['/api/execute', '/api/executions', '/api/catalog', '/api/certification', '/api/workflows/inspect-yaml', '/api/openapi.json', '/api/classify', '/api/auth/me', '/api/auth/token', '/api/auth/logout', '/api/auth/ws-ticket'].includes(path) ||
+        ['/api/execute', '/api/executions', '/api/catalog', '/api/certification', '/api/workflows/inspect-yaml', '/api/openapi.json', '/api/classify', '/api/llm/models', '/api/auth/me', '/api/auth/token', '/api/auth/logout', '/api/auth/ws-ticket'].includes(path) ||
         /^\/api\/users\/apikeys(?:\/[^/]+(?:\/rotate)?)?$/.test(path) ||
         /^\/api\/(engineering|product|marketing|hr|ta|program)\/(skills|execute|executions)$/.test(path) ||
         /^\/api\/(?:(?:engineering|product|marketing|hr|ta|program)\/)?executions\/[^/]+(?:\/(?:approve|reject)\/[^/]+|\/cancel|\/complete|\/trace|\/retry)?$/.test(path) ||
@@ -939,14 +940,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     // principal can only read runs it owns.
     if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && !isDemoPrincipal(authUser) && guardRole('operator')) return;
     /**
-     * Run mode is decided here, once per request, and recorded on the run
-     * (`exec.mode`). A client may choose; with no choice, no configured LLM
-     * provider means a labelled simulation rather than a run that is accepted
-     * and then fails. Public demo visitors are always simulated — they must not
-     * spend this deployment's LLM budget.
+     * Run mode follows one rule (run-mode.ts): demo visitors are always
+     * simulated, otherwise a client may choose, and with no choice no configured
+     * LLM provider means a labelled simulation rather than a run that is
+     * accepted and then fails. preparePersonaExecution applies it to every run
+     * it creates, so this request-level copy is for the paths that call a model
+     * without creating a run (the review pipeline, /api/query) and for labelling
+     * responses — it is not what keeps a run from going live.
      */
-    const resolveSimulate = (requested?: unknown): boolean =>
-        (env.EAOS_DEMO_MODE === 'public' && isDemoPrincipal(authUser)) || (typeof requested === 'boolean' ? requested : !hasAnyLLMKey());
+    const resolveSimulate = (requested?: unknown): boolean => decideSimulation(authUser?.id, requested);
     const IS_PRODUCTION = process.env.NODE_ENV === 'production';
     const enforceExecutionOwnership = (): boolean => {
         if (authUser?.role === 'admin' || authUser?.role === 'operator') return false;
@@ -1835,6 +1837,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const { query } = body;
             if (!query || typeof query !== 'string') {
                 sendJSON(res, 400, { error: 'Missing query field' });
+                return;
+            }
+            // A query calls a model directly and has no simulated form, so a request
+            // the run-mode rule would simulate — a demo visitor's, or any caller's
+            // while no LLM provider is configured — is refused before any provider
+            // is called, instead of spending the deployment's key on it.
+            if (resolveSimulate(body.simulate)) {
+                sendJSON(res, 422, { code: 'simulation_only', error: 'This request runs as a simulation (demo session, simulate requested, or no LLM provider configured), and queries have no simulated form; no model was called' });
                 return;
             }
 
@@ -5326,6 +5336,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const providers = getAvailableProviders();
             const defaultProvider = getDefaultProvider();
             sendJSON(res, 200, { providers, defaultProvider });
+            return;
+        }
+
+        // GET /api/llm/models — the models a live run may name, with the price its
+        // budget is reserved at. Anything else is refused at submission, so a model
+        // picker should offer only these. Pricing and availability only: no tenant data.
+        if (path === '/api/llm/models' && method === 'GET') {
+            sendJSON(res, 200, { models: listPricedModels(), llmConfigured: hasAnyLLMKey(), defaultProvider: hasAnyLLMKey() ? getDefaultProvider() : null });
             return;
         }
 

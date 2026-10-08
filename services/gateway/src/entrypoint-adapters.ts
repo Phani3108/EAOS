@@ -6,17 +6,23 @@ import { getAgentIdentity, getAgentsByPersona } from './agent-registry.js';
 import { requirePersonaAccess, type AuthUser } from './auth.js';
 import { validate } from './validation.js';
 import { SWARM_TEMPLATES } from './swarm-manager.js';
+import { resolveSimulate } from './run-mode.js';
 
 export interface EntrypointAdmission {
     definition: CompiledDefinition;
     inputs: Record<string, unknown>;
-    simulate: boolean;
+    /** The client's choice, undefined when it made none; the runtime decides the mode (run-mode.ts). */
+    simulate?: boolean;
     provider?: 'anthropic' | 'openai' | 'azure-openai' | 'gemini' | 'ollama';
     modelId?: string;
     source: { type: 'goal' | 'soman' | 'swarm'; label: string; [key: string]: unknown };
 }
 const id = z.string().regex(/^[a-zA-Z][a-zA-Z0-9_-]{0,79}$/);
-const common = { simulate: z.boolean().default(false), persona: z.enum(WORKFLOW_PERSONAS).optional(), provider: z.enum(['anthropic','openai','azure-openai','gemini','ollama']).optional(), model: z.string().max(200).optional() };
+// No default for `simulate`: defaulting a missing field to false made every
+// pipeline and swarm launched from the UI (which sends none) a live run, even on
+// a gateway with no LLM provider. A missing field is "no choice", and the
+// runtime decides.
+const common = { simulate: z.boolean().optional(), persona: z.enum(WORKFLOW_PERSONAS).optional(), provider: z.enum(['anthropic','openai','azure-openai','gemini','ollama']).optional(), model: z.string().max(200).optional() };
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0,24);
 function permitted(principal: AuthUser, definition: CompiledDefinition): void {
     if (!principal.tenantId || !principal.id || requiredPersonas(definition).some(persona => !requirePersonaAccess(principal, persona))) throw Object.assign(new Error('Entrypoint requires additional persona permissions'), { statusCode: 403 });
@@ -39,7 +45,10 @@ export function compileGoalRequest(principal: AuthUser, body: unknown): Entrypoi
     let compiled: CompiledDefinition;
     if (suppliedPlan !== undefined) compiled = compileTaskPlan(suppliedPlan, candidates, persona);
     else {
-        if (input.simulate) throw Object.assign(new Error('Simulated goals require an explicit task plan'), { statusCode: 422 });
+        // Planning needs a live model, so the run's mode must be known here — the
+        // same decision the runtime will make — to refuse a plan-less goal that
+        // would be simulated instead of admitting a run that cannot succeed.
+        if (resolveSimulate(principal.id, input.simulate)) throw Object.assign(new Error(input.simulate === true ? 'Simulated goals require an explicit task plan' : 'This goal would run as a simulation (demo session or no LLM provider configured), and simulated goals require an explicit task plan'), { statusCode: 422 });
         if (!candidates.length) throw new Error('No authorized planning candidates');
         compiled = compileDefinition(definition('Goal planning and execution', persona, [{ id: 'plan', order: 1, name: 'Compile and execute goal plan', agent: primaryAgent(persona), agentPersona: persona, kind: 'planner', outputKey: 'result', planCandidates: candidates }]));
     }

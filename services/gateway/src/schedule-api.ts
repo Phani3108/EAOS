@@ -12,7 +12,9 @@ const inputSchema = z.object({
   name: z.string().trim().min(1).max(240), skillId: z.string().min(1).max(200), personaId: z.enum(WORKFLOW_PERSONAS),
   scheduleType: z.enum(['one-time','once','interval','cron','event']), cronExpression: z.string().max(100).optional(),
   intervalMs: z.number().int().min(1000).max(31_536_000_000).optional(), eventTrigger: z.string().min(1).max(200).optional(),
-  oneTimeAt: z.string().datetime({ offset: true }).optional(), inputs: z.record(z.string(), z.unknown()).default({}), simulate: z.boolean().default(false),
+  // Optional, not default(false): a missing choice lets the runtime decide (run-mode.ts)
+  // when the template is prepared, so a keyless gateway does not schedule runs that can only fail.
+  oneTimeAt: z.string().datetime({ offset: true }).optional(), inputs: z.record(z.string(), z.unknown()).default({}), simulate: z.boolean().optional(),
   timezone: z.string().min(1).max(100).default('UTC'), overlapPolicy: z.enum(['allow','skip']).default('skip'), inputBindings: z.record(z.string().max(100), z.string().max(500)).optional(),
   skillName: z.string().optional(), tags: z.array(z.string()).max(30).optional(), timeout: z.number().int().min(1).max(86_400).optional(), retries: z.number().int().nonnegative().max(9).optional(),
 }).strict();
