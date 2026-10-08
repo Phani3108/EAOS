@@ -86,6 +86,7 @@ import { describeWorkflowSupport, inspectStarterYaml } from './workflow-certific
 import { isWorkspaceRoute, workspaceRequest } from './workspace-api.js';
 import { PostgresScheduleRepository } from '@agentos/db/schedule-repository';
 import { isScheduleRoute, scheduleRequest } from './schedule-api.js';
+import { isLegacySchedulerWrite, legacySchedulerRequest } from './legacy-scheduler-api.js';
 import { getCompiledCatalog, getCompiledDefinition, requiredPersonas } from './definition-registry.js';
 import { executionOpenApi, ExecutionListQuerySchema } from './execution-api-contract.js';
 import { getQueueStats, listTasks, getTask, cancelTask as cancelQueueTask, retryTask as retryQueueTask } from './task-queue.js';
@@ -3022,32 +3023,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
-        if (path === '/api/scheduler/jobs' && method === 'POST') {
+        // Create, change, delete, run and toggle: persona and ownership checks live
+        // in legacy-scheduler-api.ts, mirroring the durable schedule-api.ts.
+        if (isLegacySchedulerWrite(path, method)) {
             if (guardRole('operator')) return;
-            const body = await readBody(req);
-            const { name, skillId, skillName, personaId, scheduleType, cronExpression, intervalMs, eventTrigger, oneTimeAt, timeout, retries, tags, inputs } = body as Record<string, unknown>;
-            if (!name || !skillId || !scheduleType) {
-                sendJSON(res, 400, { error: 'Missing required fields: name, skillId, scheduleType' });
-                return;
-            }
-            const job = scheduler.createJob({
-                name: name as string,
-                skillId: skillId as string,
-                skillName: (skillName as string) || (skillId as string),
-                personaId: (personaId as string) || 'general',
-                scheduleType: scheduleType as Parameters<typeof scheduler.createJob>[0]['scheduleType'],
-                cronExpression: cronExpression as string | undefined,
-                intervalMs: intervalMs as number | undefined,
-                eventTrigger: eventTrigger as string | undefined,
-                oneTimeAt: oneTimeAt as string | undefined,
-                timeout: timeout as number | undefined,
-                retries: retries as number | undefined,
-                tags: (tags as string[]) || [],
-                inputs: inputs as Record<string, unknown> | undefined,
-                status: 'active',
-                createdBy: userId,
-            });
-            sendJSON(res, 201, { job });
+            const result = await legacySchedulerRequest(scheduler, authUser!, path, method, await readBody(req) as Record<string, unknown>);
+            sendJSON(res, result.status, result.data);
             return;
         }
 
@@ -3057,44 +3038,6 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
             const logs = scheduler.getJobLogs(jobId);
             sendJSON(res, 200, { job, logs });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+$/) && method === 'PATCH') {
-            if (guardRole('operator')) return;
-            const jobId = path.split('/').pop()!;
-            const body = await readBody(req);
-            const job = scheduler.updateJob(jobId, body as Parameters<typeof scheduler.updateJob>[1]);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            sendJSON(res, 200, { job });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+$/) && method === 'DELETE') {
-            if (guardRole('operator')) return;
-            const jobId = path.split('/').pop()!;
-            const ok = scheduler.deleteJob(jobId);
-            if (!ok) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            sendJSON(res, 200, { deleted: jobId });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+\/run$/) && method === 'POST') {
-            const jobId = path.split('/')[4];
-            const job = scheduler.getJob(jobId);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            const log = await scheduler.executeJob(jobId, 'manual');
-            sendJSON(res, 200, { log, job: scheduler.getJob(jobId) });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+\/toggle$/) && method === 'POST') {
-            const jobId = path.split('/')[4];
-            const job = scheduler.getJob(jobId);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            const newStatus = job.status === 'active' ? 'paused' : 'active';
-            const updated = scheduler.updateJob(jobId, { status: newStatus });
-            sendJSON(res, 200, { job: updated });
             return;
         }
 

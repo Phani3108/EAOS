@@ -46,7 +46,7 @@ export function nextCronTime(expression: string, after = new Date(), timezone = 
 }
 
 export interface RunTemplate { snapshot: RuntimeSnapshot; definition: Record<string, unknown>; payload: Record<string, unknown> }
-export interface ScheduleInput { name: string; scheduleType: 'once' | 'interval' | 'event' | 'cron'; cronExpression?: string; nextRunAt?: string; intervalMs?: number; eventTrigger?: string; template: RunTemplate; timezone?: string; overlapPolicy?: 'allow' | 'skip'; inputBindings?: Record<string, string>; lastLocalTime?: string }
+export interface ScheduleInput { name: string; scheduleType: 'once' | 'interval' | 'event' | 'cron'; cronExpression?: string; nextRunAt?: string; intervalMs?: number; eventTrigger?: string; template: RunTemplate; timezone?: string; overlapPolicy?: 'allow' | 'skip'; inputBindings?: Record<string, string>; lastLocalTime?: string; lastError?: string }
 export interface ScheduleRecord extends WorkspaceOwner { id: string; status: 'active' | 'paused' | 'completed' | 'failed'; version: number; nextRun: string | null; data: ScheduleInput }
 const rowView = (row: Record<string, any>): ScheduleRecord => ({ id: row.id, tenantId: row.tenant_id, userId: row.user_id, status: row.status, version: row.version, nextRun: row.next_run_at?.toISOString() ?? null, data: row.data });
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -120,13 +120,32 @@ export class PostgresScheduleRepository {
       const schedule = rowView(row);
       const allowed = (await client.query('SELECT runtime_actor_active($1,$2,$3::jsonb) AS active', [tenantId, schedule.userId, JSON.stringify(schedule.data.template.snapshot.requiredPersonas ?? [schedule.data.template.snapshot.persona])])).rows[0]?.active;
       if (!allowed) { await client.query("UPDATE runtime_schedules SET status='paused',version=version+1,data=jsonb_set(data,'{lastError}','\"Execution authority revoked\"') WHERE tenant_id=$1 AND id=$2", [tenantId, schedule.id]); return undefined; }
-      const overlap = schedule.data.overlapPolicy === 'skip' && (await client.query("SELECT 1 FROM runtime_trigger_receipts t JOIN runtime_runs r ON r.tenant_id=t.tenant_id AND r.id=t.run_id WHERE t.tenant_id=$1 AND t.source_id=$2 AND r.status IN ('queued','running','paused') LIMIT 1", [tenantId, schedule.id])).rows.length > 0;
-      const runId = overlap ? undefined : await this.admit(client, schedule, `due:${schedule.nextRun}`, {});
-      const localTime = schedule.nextRun ? cronLocalTime(new Date(schedule.nextRun), schedule.data.timezone ?? 'UTC').key : undefined;
-      const next = schedule.data.scheduleType === 'interval' ? new Date(Date.now() + schedule.data.intervalMs!) : schedule.data.scheduleType === 'cron' ? nextCronTime(schedule.data.cronExpression!, new Date(), schedule.data.timezone ?? 'UTC', localTime) : null;
-      const data = { ...schedule.data, lastLocalTime: localTime, lastSkipReason: overlap ? 'overlap' : undefined };
-      await client.query('UPDATE runtime_schedules SET next_run_at=$3,status=$4,data=$5,version=version+1,updated_at=NOW() WHERE tenant_id=$1 AND id=$2', [tenantId, schedule.id, next, next ? 'active' : overlap ? 'paused' : 'completed', JSON.stringify(data)]);
-      return runId;
+      // Admission and the next occurrence can fail for reasons that will not change
+      // on their own (an archived input artifact, a cron with no occurrence in the
+      // horizon). Rolled back with the whole transaction, the schedule would stay
+      // due and fail again on every poll, so only this attempt is undone and the
+      // schedule is parked as failed while its row lock is still held.
+      await client.query('SAVEPOINT schedule_dispatch');
+      try {
+        const overlap = schedule.data.overlapPolicy === 'skip' && (await client.query("SELECT 1 FROM runtime_trigger_receipts t JOIN runtime_runs r ON r.tenant_id=t.tenant_id AND r.id=t.run_id WHERE t.tenant_id=$1 AND t.source_id=$2 AND r.status IN ('queued','running','paused') LIMIT 1", [tenantId, schedule.id])).rows.length > 0;
+        const runId = overlap ? undefined : await this.admit(client, schedule, `due:${schedule.nextRun}`, {});
+        const localTime = schedule.nextRun ? cronLocalTime(new Date(schedule.nextRun), schedule.data.timezone ?? 'UTC').key : undefined;
+        const next = schedule.data.scheduleType === 'interval' ? new Date(Date.now() + schedule.data.intervalMs!) : schedule.data.scheduleType === 'cron' ? nextCronTime(schedule.data.cronExpression!, new Date(), schedule.data.timezone ?? 'UTC', localTime) : null;
+        const data = { ...schedule.data, lastLocalTime: localTime, lastSkipReason: overlap ? 'overlap' : undefined, lastError: undefined };
+        // The version guards operator edits (pause, resume, archive). Advancing to
+        // the next occurrence is not one, so it only moves when the status does;
+        // otherwise every firing would turn the operator's next click into a 409.
+        await client.query('UPDATE runtime_schedules SET next_run_at=$3,status=$4,data=$5,version=version+CASE WHEN status<>$4 THEN 1 ELSE 0 END,updated_at=NOW() WHERE tenant_id=$1 AND id=$2', [tenantId, schedule.id, next, next ? 'active' : overlap ? 'paused' : 'completed', JSON.stringify(data)]);
+        return runId;
+      } catch (error) {
+        // A database fault (it carries a SQLSTATE code) may be transient: leave the schedule due and let the caller retry.
+        if (typeof (error as { code?: unknown })?.code === 'string') throw error;
+        await client.query('ROLLBACK TO SAVEPOINT schedule_dispatch');
+        const reason = (error instanceof Error ? error.message : 'Scheduled dispatch failed').slice(0, 500);
+        // next_run_at is kept, so resuming the schedule retries the occurrence that failed.
+        await client.query("UPDATE runtime_schedules SET status='failed',version=version+1,data=jsonb_set(data,'{lastError}',to_jsonb($3::text)),updated_at=NOW() WHERE tenant_id=$1 AND id=$2", [tenantId, schedule.id, reason]);
+        return undefined;
+      }
     });
   }
 }

@@ -144,12 +144,21 @@ export function startDurableWorkers(options: {
     const instance = randomUUID();
     const worker = async (index: number) => {
         const workerId = `${instance}:${index}`;
+        let next = 0;
         while (!shuttingDown) {
             let found = false;
             try {
-                for (const tenantId of await options.tenants()) {
+                const tenants = await options.tenants();
+                // Each pass starts one tenant further on. A worker breaks out after
+                // every run it executes, so always starting at tenants[0] let one
+                // tenant's backlog keep every worker from reaching the others.
+                const start = tenants.length ? next % tenants.length : 0;
+                next = start + 1;
+                for (const tenantId of [...tenants.slice(start), ...tenants.slice(0, start)]) {
                     if (shuttingDown) break;
-                    await options.schedule?.(tenantId);
+                    // Schedule dispatch is best effort per pass: a schedule that keeps
+                    // failing must not stop this tenant's (or later tenants') runs from being claimed.
+                    try { await options.schedule?.(tenantId); } catch { console.error('[durable-worker] Schedule dispatch failed; claiming runs anyway'); }
                     const claimed = await options.repository.claim(tenantId, workerId);
                     if (!claimed) continue;
                     found = true;

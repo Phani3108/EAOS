@@ -61,5 +61,37 @@ export async function verifyChildLifecycle(runs: PostgresRunRepository, tenantId
     assert.equal(await runs.claim(tenantId, 'deadline-sweep'), undefined);
     assert.equal((await runs.get(tenantId, expiring.id))?.status, 'failed');
     assert.equal((await runs.get(tenantId, expiringChild.id))?.status, 'cancelled');
+
+    // A parent that failed because its child failed is retried with that child: the
+    // parent step keeps its childRunId and a step admits one child, so replaying the
+    // parent alone would only re-read the failed child.
+    const composite = { id: 'composite', version: '1', definitionHash: 'e'.repeat(64), steps: [{ id: 'step', kind: 'subworkflow', outputKey: 'result', subworkflow: { definition: leaf } }] };
+    const failedRoot = snapshot(composite as typeof parent);
+    await runs.submit(failedRoot, composite, {});
+    const failedRootClaim = (await runs.claim(tenantId, 'composite-parent'))!;
+    const failedChild = await runs.spawnChild(failedRootClaim.lease, failedRootClaim.snapshot, 'step', snapshot(leaf), leaf, {});
+    await runs.park(failedRootClaim.lease, (await runs.get(tenantId, failedRoot.id))!);
+    const failingChild = (await runs.claim(tenantId, 'composite-child'))!;
+    assert.equal(failingChild.snapshot.id, failedChild.id);
+    await runs.fail(failingChild.lease, { ...failingChild.snapshot, steps: [{ ...failingChild.snapshot.steps[0]!, status: 'failed' }] }, 'Fixture provider outage', false);
+    const wokenRoot = (await runs.claim(tenantId, 'composite-parent-resume'))!;
+    assert.equal(wokenRoot.snapshot.id, failedRoot.id);
+    await runs.fail(wokenRoot.lease, { ...wokenRoot.snapshot, steps: [{ ...wokenRoot.snapshot.steps[0]!, status: 'failed', error: `Required child ${failedChild.id} did not complete` }] }, 'Required child did not complete', false);
+    // Retrying only the child would be accepted and then cancelled by claim(), so it is refused.
+    await assert.rejects(runs.retryFailed(tenantId, failedChild.id), /Retry the parent run/);
+    assert.equal(await runs.retryFailed(foreignTenant, failedRoot.id), false);
+    assert.equal(await runs.retryFailed(tenantId, failedRoot.id), true);
+    assert.equal((await runs.get(tenantId, failedChild.id))?.status, 'queued');
+    const retriedRoot = (await runs.claim(tenantId, 'composite-retry-parent'))!;
+    assert.equal(retriedRoot.snapshot.id, failedRoot.id);
+    assert.deepEqual(retriedRoot.snapshot.steps.map(step => [step.status, step.childRunId]), [['pending', failedChild.id]]);
+    await runs.park(retriedRoot.lease, retriedRoot.snapshot);
+    const retriedChild = (await runs.claim(tenantId, 'composite-retry-child'))!;
+    assert.equal(retriedChild.snapshot.id, failedChild.id);
+    await runs.checkpoint(retriedChild.lease, { ...retriedChild.snapshot, status: 'simulated', outputs: { result: 'retried leaf' }, steps: [{ ...retriedChild.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    const finishedRoot = (await runs.claim(tenantId, 'composite-retry-resume'))!;
+    assert.equal(finishedRoot.snapshot.id, failedRoot.id);
+    await runs.checkpoint(finishedRoot.lease, { ...finishedRoot.snapshot, status: 'simulated', outputs: { result: 'retried root' }, steps: [{ ...finishedRoot.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    assert.equal((await runs.get(tenantId, failedRoot.id))?.status, 'simulated');
     console.log('PASS atomic child admission/replay, nested continuation, tenant isolation, recursive cancellation, monotonic checkpoints and tree deadlines');
 }

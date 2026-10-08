@@ -23,6 +23,8 @@ interface ScheduledJob {
   eventTrigger?: string;
   oneTimeAt?: string;
   status: JobStatus;
+  /** Why the runtime last paused or failed this schedule, as recorded by the server. */
+  lastError?: string;
   lastRun?: string;
   nextRun?: string;
   runCount: number;
@@ -224,6 +226,10 @@ function JobDetail({ job, onClose, onToggle, onRun }: {
             </div>
           ))}
         </div>
+
+        {job.lastError && job.status !== 'active' && (
+          <div role="status" className="text-xs p-3 rounded-xl bg-red-50 text-red-700">{job.lastError}</div>
+        )}
 
         {/* Config */}
         <div className="space-y-2">
@@ -465,10 +471,12 @@ export function ExecutionScheduler() {
   const [apiStats, setApiStats] = useState<{ total: number; active: number; paused: number; failed: number } | null>(null);
   const tickRef = useRef<ReturnType<typeof setInterval>>();
 
+  const loadJobs = () => getScheduledJobs().then((d) => {
+    setJobs((d.jobs || []).map((j) => ({ ...j, logs: (j as unknown as ScheduledJob).logs || [] })));
+  }).catch(() => {});
+
   useEffect(() => {
-    getScheduledJobs().then((d) => {
-      setJobs((d.jobs || []).map((j) => ({ ...j, logs: (j as unknown as ScheduledJob).logs || [] })));
-    }).catch(() => {});
+    void loadJobs();
     getSchedulerStats().then((d) => {
       const s = d as Record<string, unknown>;
       if (s && typeof s.total === 'number') {
@@ -499,7 +507,11 @@ export function ExecutionScheduler() {
       if (selectedJob?.id === jobId) {
         setSelectedJob((prev) => prev ? { ...prev, status: mapped.status } : prev);
       }
-    }).catch(cause => { setError(cause instanceof Error ? cause.message : 'Schedule update failed'); });
+    }).catch(cause => {
+      setError(cause instanceof Error ? cause.message : 'Schedule update failed');
+      // A conflict means this view is stale; reload so the next click carries the current version.
+      void loadJobs();
+    });
   };
 
   const handleRunNow = (jobId: string) => {
@@ -530,7 +542,10 @@ export function ExecutionScheduler() {
     deleteScheduledJob(jobId, jobs.find(job => job.id === jobId)?.version).then(() => {
       setJobs((prev) => prev.filter((j) => j.id !== jobId));
       if (selectedJob?.id === jobId) setSelectedJob(null);
-    }).catch(cause => { setError(cause instanceof Error ? cause.message : 'Schedule was not archived'); });
+    }).catch(cause => {
+      setError(cause instanceof Error ? cause.message : 'Schedule was not archived');
+      void loadJobs();
+    });
   };
 
   const handleNewJob = (data: Partial<ScheduledJob>) => {

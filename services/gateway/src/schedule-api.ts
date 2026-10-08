@@ -20,7 +20,7 @@ const inputSchema = z.object({
 }).strict();
 const route = /^\/api\/scheduler\/jobs(?:\/([^/]+)(?:\/(run|toggle))?)?$/;
 export const isScheduleRoute = (path: string, method: string) => route.test(path) && ['GET','POST','PATCH','DELETE'].includes(method) || ['/api/scheduler/events','/api/scheduler/stats'].includes(path) && ['GET','POST'].includes(method);
-const view = (record: ScheduleRecord) => ({ id: record.id, tenantId: record.tenantId, createdBy: record.userId, name: record.data.name, status: record.status, version: record.version, nextRun: record.nextRun, scheduleType: record.data.scheduleType === 'once' ? 'one-time' : record.data.scheduleType, skillId: record.data.template.snapshot.skillId, skillName: record.data.template.snapshot.skillName, personaId: record.data.template.snapshot.persona, inputs: record.data.template.snapshot.inputs, intervalMs: record.data.intervalMs, cronExpression: record.data.cronExpression, eventTrigger: record.data.eventTrigger, timezone: record.data.timezone ?? 'UTC', overlapPolicy: record.data.overlapPolicy ?? 'allow', inputBindings: record.data.inputBindings });
+const view = (record: ScheduleRecord) => ({ id: record.id, tenantId: record.tenantId, createdBy: record.userId, name: record.data.name, status: record.status, version: record.version, nextRun: record.nextRun, scheduleType: record.data.scheduleType === 'once' ? 'one-time' : record.data.scheduleType, skillId: record.data.template.snapshot.skillId, skillName: record.data.template.snapshot.skillName, personaId: record.data.template.snapshot.persona, inputs: record.data.template.snapshot.inputs, intervalMs: record.data.intervalMs, cronExpression: record.data.cronExpression, eventTrigger: record.data.eventTrigger, timezone: record.data.timezone ?? 'UTC', overlapPolicy: record.data.overlapPolicy ?? 'allow', inputBindings: record.data.inputBindings, lastError: record.data.lastError });
 
 export async function scheduleRequest(repository: PostgresScheduleRepository, principal: AuthUser, path: string, method: string, body: Record<string, unknown>): Promise<{ status: number; data: unknown }> {
   if (!['admin','operator'].includes(principal.role)) return { status: 403, data: { error: 'Operator role required' } };
@@ -46,8 +46,12 @@ export async function scheduleRequest(repository: PostgresScheduleRepository, pr
     if (!requirePersonaAccess(principal, definition.persona) || requiredPersonas(definition).some(persona => !requirePersonaAccess(principal, persona))) return { status: 403, data: { error: 'Schedule requires additional persona permissions' } };
     if (input.scheduleType === 'interval' && !input.intervalMs || input.scheduleType === 'event' && !input.eventTrigger || input.scheduleType === 'cron' && !input.cronExpression) return { status: 400, data: { error: 'Missing schedule timing or trigger' } };
     const prepared = preparePersonaExecution(owner.tenantId, input.personaId, definition, { ...input.inputs, ...Object.fromEntries(Object.keys(input.inputBindings ?? {}).map(field => [field, '<event-bound>'])) }, owner.userId, input.simulate);
+    // `timeout` is accepted for the legacy scheduler UI, where it only bounded how
+    // long the job log waited for a result. It is not mapped to timeoutMs: that is
+    // the hard deadline of each durable attempt, and the UI's default of 120 s
+    // failed any scheduled run that /api/execute would have finished.
     const job = await repository.create(owner, { name: input.name, scheduleType: input.scheduleType === 'one-time' ? 'once' : input.scheduleType, nextRunAt: input.oneTimeAt, intervalMs: input.intervalMs, cronExpression: input.cronExpression, eventTrigger: input.eventTrigger, timezone: input.timezone, overlapPolicy: input.overlapPolicy, inputBindings: input.inputBindings,
-      template: { snapshot: prepared.exec as unknown as RuntimeSnapshot, definition: { ...prepared.definition }, payload: { ...prepared.payload, timeoutMs: (input.timeout ?? 120) * 1000, maxAttempts: (input.retries ?? 2) + 1 } } });
+      template: { snapshot: prepared.exec as unknown as RuntimeSnapshot, definition: { ...prepared.definition }, payload: { ...prepared.payload, maxAttempts: (input.retries ?? 2) + 1 } } });
     return { status: 201, data: { job: view(job) } };
   }
   const job = await repository.get(owner, match[1]!);
