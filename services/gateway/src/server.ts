@@ -3300,7 +3300,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/observability/agents' && method === 'GET') {
             // Real agent data from KPI store + registry
             const kpis = getAgentKPIs();
-            const stats = getExecutionStats();
+            const stats = await getExecutionStats();
             const activeSet = new Set(stats.activeAgents);
             const agents = kpis.map(k => {
                 const identity = getAgentIdentity(k.agentId);
@@ -3325,7 +3325,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
 
         if (path === '/api/observability/metrics' && method === 'GET') {
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const kpis = getAgentKPIs();
             sendJSON(res, 200, {
                 gateway: { status: 'healthy', uptime: process.uptime(), memoryMb: Math.round(process.memoryUsage().heapUsed / 1_000_000 * 100) / 100, wsClients: getWSClientCount() },
@@ -3813,7 +3813,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/governance/costs' && method === 'GET') {
             if (guardRole('operator')) return;
             // Real cost attribution from actual execution data
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const now = new Date();
             const period = `${now.toLocaleString('en', { month: 'long' })} ${now.getFullYear()}`;
             const breakdown = Object.entries(execStats.byPersona).map(([persona, data]) => ({

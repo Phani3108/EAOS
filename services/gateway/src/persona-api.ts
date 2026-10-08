@@ -2440,46 +2440,48 @@ export function getAllExecutions(tenantId = legacyTenantId()): PersonaExecutionR
   return Array.from(executions.values()).filter(execution => execution.tenantId === tenantId);
 }
 
-/** Computed stats from actual execution data */
-export function getExecutionStats(): {
+export interface ExecutionStats {
   totalExecutions: number;
   byPersona: Record<string, { count: number; totalCost: number; avgQuality: number }>;
   totalCost: number;
   avgQuality: number;
   activeAgents: string[];
-} {
-  const execs = Array.from(executions.values()).filter(execution => execution.mode === 'live' && execution.tenantId === legacyTenantId());
-  const byPersona: Record<string, { count: number; totalCost: number; qualitySum: number; qualityCount: number }> = {};
+}
 
-  let totalCost = 0;
-  let qualitySum = 0;
-  let qualityCount = 0;
+function foldExecutionStats(byPersona: Array<{ persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>, activeAgents: string[]): ExecutionStats {
+  const result: ExecutionStats['byPersona'] = {};
+  let totalExecutions = 0, totalCost = 0, qualitySum = 0, qualityCount = 0;
+  for (const v of byPersona) {
+    result[v.persona] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
+    totalExecutions += v.count; totalCost += v.totalCost; qualitySum += v.qualitySum; qualityCount += v.qualityCount;
+  }
+  return { totalExecutions, byPersona: result, totalCost, avgQuality: qualityCount ? qualitySum / qualityCount : 0, activeAgents };
+}
+
+/**
+ * Computed stats from actual execution data. Durable runs are aggregated in
+ * the repository: runDurableExecution evicts each working copy when its lease
+ * ends, so counting the map would report only in-flight runs (near zero).
+ */
+export async function getExecutionStats(tenantId = legacyTenantId()): Promise<ExecutionStats> {
+  if (runtimeRepository) {
+    const stats = await runtimeRepository.stats(tenantId);
+    return foldExecutionStats(stats.byPersona, stats.activeAgents);
+  }
+  const byPersona = new Map<string, { persona: string; count: number; totalCost: number; qualitySum: number; qualityCount: number }>();
   const activeAgentSet = new Set<string>();
-
-  for (const exec of execs) {
-    const pc = byPersona[exec.persona] ?? { count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
+  for (const exec of executions.values()) {
+    if (exec.mode !== 'live' || exec.tenantId !== tenantId) continue;
+    const pc = byPersona.get(exec.persona) ?? { persona: exec.persona, count: 0, totalCost: 0, qualitySum: 0, qualityCount: 0 };
     pc.count++;
-    if (exec.totalTokenCost) { pc.totalCost += exec.totalTokenCost; totalCost += exec.totalTokenCost; }
-    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; qualitySum += exec.avgQualityScore; qualityCount++; }
-    byPersona[exec.persona] = pc;
-
+    if (exec.totalTokenCost) pc.totalCost += exec.totalTokenCost;
+    if (exec.avgQualityScore) { pc.qualitySum += exec.avgQualityScore; pc.qualityCount++; }
+    byPersona.set(exec.persona, pc);
     for (const step of exec.steps) {
       if (step.status === 'running') activeAgentSet.add(step.agent);
     }
   }
-
-  const result: Record<string, { count: number; totalCost: number; avgQuality: number }> = {};
-  for (const [p, v] of Object.entries(byPersona)) {
-    result[p] = { count: v.count, totalCost: v.totalCost, avgQuality: v.qualityCount ? v.qualitySum / v.qualityCount : 0 };
-  }
-
-  return {
-    totalExecutions: execs.length,
-    byPersona: result,
-    totalCost,
-    avgQuality: qualityCount ? qualitySum / qualityCount : 0,
-    activeAgents: Array.from(activeAgentSet),
-  };
+  return foldExecutionStats([...byPersona.values()], Array.from(activeAgentSet));
 }
 
 export function approvePersonaStep(execId: string, stepId: string, approverId: string): { success: boolean; message: string } {
