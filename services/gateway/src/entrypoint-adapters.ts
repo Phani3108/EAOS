@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { canonicalPersona, WORKFLOW_PERSONAS, type UnifiedSkillDef, type UnifiedStepDef, type WorkflowPersona } from '@agentos/skills/schema';
 import { compileDefinition, compileTaskPlan, getCompiledCatalog, requiredPersonas, type CompiledDefinition } from './definition-registry.js';
-import { getAgentIdentity, getAgentsByPersona } from './agent-registry.js';
+import { getAgentIdentity, primaryWorkflowAgent } from './agent-registry.js';
 import { requirePersonaAccess, type AuthUser } from './auth.js';
 import { validate } from './validation.js';
 import { SWARM_TEMPLATES } from './swarm-manager.js';
@@ -27,11 +27,6 @@ const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(valu
 function permitted(principal: AuthUser, definition: CompiledDefinition): void {
     if (!principal.tenantId || !principal.id || requiredPersonas(definition).some(persona => !requirePersonaAccess(principal, persona))) throw Object.assign(new Error('Entrypoint requires additional persona permissions'), { statusCode: 403 });
 }
-function primaryAgent(persona: WorkflowPersona): string {
-    const agent = persona === 'program' ? getAgentIdentity('pmo-director') : getAgentsByPersona(persona === 'ta' ? 'hr' : persona)[0];
-    if (!agent) throw new Error('No canonical agent for persona');
-    return agent.id;
-}
 function definition(name: string, persona: WorkflowPersona, steps: UnifiedStepDef[], outputs = steps.map(step => step.outputKey)): UnifiedSkillDef {
     return { id: `entry-${hash([name,steps])}`, slug: 'canonical-entrypoint', name, description: name, icon: '', persona, executableType: 'workflow', cluster: 'Orchestration', complexity: 'complex', estimatedTime: '', executionMode: 'dag', inputs: [], steps, outputs, requiredTools: [], optionalTools: [], tags: ['canonical-adapter'] };
 }
@@ -50,7 +45,7 @@ export function compileGoalRequest(principal: AuthUser, body: unknown): Entrypoi
         // would be simulated instead of admitting a run that cannot succeed.
         if (resolveSimulate(principal.id, input.simulate)) throw Object.assign(new Error(input.simulate === true ? 'Simulated goals require an explicit task plan' : 'This goal would run as a simulation (demo session or no LLM provider configured), and simulated goals require an explicit task plan'), { statusCode: 422 });
         if (!candidates.length) throw new Error('No authorized planning candidates');
-        compiled = compileDefinition(definition('Goal planning and execution', persona, [{ id: 'plan', order: 1, name: 'Compile and execute goal plan', agent: primaryAgent(persona), agentPersona: persona, kind: 'planner', outputKey: 'result', planCandidates: candidates }]));
+        compiled = compileDefinition(definition('Goal planning and execution', persona, [{ id: 'plan', order: 1, name: 'Compile and execute goal plan', agent: primaryWorkflowAgent(persona), agentPersona: persona, kind: 'planner', outputKey: 'result', planCandidates: candidates }]));
     }
     permitted(principal, compiled);
     return { definition: compiled, inputs: { goal: input.description, context: input.context }, simulate: input.simulate, provider: input.provider, modelId: input.model, source: { type: 'goal', label: input.description, priority: input.priority } };
