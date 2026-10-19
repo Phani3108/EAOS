@@ -240,6 +240,273 @@ EAOS harvests and adapts best-in-class open-source agent tooling into EAOS-nativ
 
 ---
 
+## Production Readiness
+
+Review date: 2026-10-26. Audited at commit `ae84b84` on `main`, using `.claude/skills/project-completion-gate/SKILL.md`. Evidence is from the repo only. Anything not in the repo is marked "Not found in repo".
+
+**Coverage.** This is a sample, not a full read.
+- Read: `README.md`, `TASKS.md`, `mcp.servers.json`, `turbo.json`, `pnpm-workspace.yaml`, `.claude/settings.json`, `.github/workflows/ci.yml`, `deploy/*`, `tests/` (headers), `docs/architecture/{production-readiness,brutal-audit}.md`.
+- Sampled: `services/gateway/src` (`server.ts`, `model-router.ts`, `rate-limiter.ts`, `validation.ts`, `approval-bus.ts`, `pii-redactor.ts`, `llm-tracer.ts`, `gdpr-api.ts`, `health.ts`, `tenant-middleware.ts`, `mcp-executor.ts`, `pipeline-engine.ts`, `agent-evals.ts`), `packages/{auth,approval,db,sandbox,observability,evaluation}`, `packages/db/migrations`.
+- Not sampled: `agents/marketing`, `workers/*` (only `engineering/worker.yaml` listed), `connectors/*`, `skills/*`, `skills-unported`, `workflows/*`, `prompt-library`, `apps/web` source, `third_party`, most of `packages/*`, and the 20 files under `docs/architecture` beyond the two above. Findings do not cover these.
+
+### Scorecard
+
+| Dimension | Status |
+|---|---|
+| 1. Guardrails | Partial |
+| 2. Evals | Partial |
+| 3. Observability | Partial |
+| 4. Security | Partial |
+| 5. Human in the loop | Partial |
+| 6. Architecture diagrams | Partial (this section adds them; older docs not checked against code) |
+
+### 1. Guardrails: Partial
+- Present
+  - Zod request validation: `services/gateway/src/validation.ts`, used in `server.ts` (`/api/execute`, UTCP packets).
+  - Body size cap 5 MB: `server.ts` (`MAX_BODY_BYTES`).
+  - Per-role and per-persona rate limits: `services/gateway/src/rate-limiter.ts`.
+  - Hourly cost cap, provider circuit breaker, `maxTokens` by complexity: `services/gateway/src/model-router.ts`.
+  - Tool risk tiers; high tiers return "requires human approval": `packages/sandbox/src/sandbox.ts`, `services/gateway/src/mcp-executor.ts`.
+  - Skill scan gate for prompt-injection in skills: `services/gateway/src/skill-scan.ts` (needs `SKILLSPECTOR_CMD`, see `mcp.servers.json`; otherwise returns `engine: 'none (not configured)'`).
+  - PII redaction: `services/gateway/src/pii-redactor.ts`, exposed at `POST /api/governance/pii/scan` and imported in `persona-api.ts`.
+- Missing or unverified
+  - Prompt-injection handling for runtime content (tool results, fetched documents): Not found in repo.
+  - Output schema or policy check on every LLM response: not verified. `packages/output-schemas` and `packages/policy` exist but were not traced into the gateway path.
+  - Per-run loop and retry ceiling for agents: not verified.
+- If it stays this way
+  - Untrusted text from connectors can steer an agent into a tool call.
+  - PII can reach outputs if redaction is only called on demand.
+  - Without the scan tool configured, skills are not screened.
+- Action: wire `redactPII` and an output-schema check into the single LLM call path in `model-router.ts`, and make `SKILLSPECTOR_CMD` required when `NODE_ENV=production`.
+
+### 2. Evals: Partial
+- Present
+  - Eval cases with rubric in the repo: `packages/evaluation/tests/evaluation-tests.yaml` (method `llm-judge`).
+  - Runtime agent health, drift and cost alerts: `services/gateway/src/agent-evals.ts`.
+  - API and integration tests: `tests/api.test.ts`, `tests/integration.test.ts`, `tests/load-test.ts`.
+- Missing
+  - No CI step runs the eval YAML or blocks on a threshold: `.github/workflows/ci.yml`.
+  - `pnpm test` runs `vitest run --passWithNoTests` in packages (e.g. `packages/evaluation/package.json`). Only four test files exist outside `third_party` and all are in `tests/`; they need a running gateway and are not run by `turbo run test` (`package.json`: `test:api`, `test:integration`).
+  - Judge calibration: Not found in repo.
+  - `TASKS.md` lists "Task quality scoring (LLM-as-judge)" and "Regression detection" as unchecked.
+  - `agent-evals.ts` header says seed data is random at boot; scores can be synthetic until real executions exist.
+- If it stays this way
+  - A change can ship that lowers output quality and nothing fails.
+  - CI shows green while running almost no tests.
+- Action: add a CI job that runs `evaluation-tests.yaml` with a pass threshold, and add `tests/` to CI against the gateway started in the smoke step.
+
+### 3. Observability: Partial
+- Present
+  - OpenTelemetry package: `packages/observability/src/{otel,tracer}.ts`; LLM spans and token/cost counters: `services/gateway/src/llm-tracer.ts`.
+  - Health and Prometheus-style metrics: `services/gateway/src/health.ts`.
+  - Collector, Prometheus and Grafana in `deploy/otel-config.yaml`, `deploy/prometheus.yaml`, `deploy/docker-compose.production.yml`.
+  - Hash-chained audit log with user, action, target: `server.ts` (`recordAudit`), `packages/db/migrations/006_audit_persistence.sql`; verify route `/api/governance/audit/verify`.
+- Gaps
+  - Traces are exported to `debug` only: `deploy/otel-config.yaml`. No trace backend is configured.
+  - `deploy/prometheus.yaml` scrapes `gateway:3000` with `metrics_path: /api/health`; `health.ts` mentions a `/metrics` endpoint. Which path is correct was not verified.
+  - Alert rules and Grafana dashboards: Not found in repo (`TASKS.md` lists both unchecked).
+  - Structured logs with run IDs and trace propagation across worker chains: not verified; `TASKS.md` lists propagation unchecked.
+- If it stays this way
+  - Failures and cost spikes are found by users, not by alerts.
+  - A run cannot be followed across services.
+- Action: point the traces pipeline at a real backend, fix the scrape path, and add alert rules for error rate and hourly spend.
+
+### 4. Security: Partial
+- Present
+  - Production refuses to start without `JWT_SECRET`/`AUTH_SECRET`; dev API keys and anonymous fallback are off in production: `packages/auth/src/middleware.ts`.
+  - CORS allowlist via `CORS_ALLOWED_ORIGINS`: `server.ts`.
+  - Tenant isolation through row-level security: `services/gateway/src/tenant-middleware.ts`, `packages/db/migrations/005_multi_tenancy.sql`.
+  - GDPR erase: `services/gateway/src/gdpr-api.ts`.
+  - `.env` ignored, `.env.example` committed: `.gitignore`, `.env.example`.
+  - Container runs as non-root user `eaos`: `deploy/Dockerfile`.
+  - Secrets package: `packages/secrets/src/vault.ts`.
+- Gaps
+  - Default secrets in the production compose file: `JWT_SECRET` falls back to `agentos-production-secret-change-me`, `POSTGRES_PASSWORD` to `eaos-dev-password`, Grafana admin password to `admin` (`deploy/docker-compose.production.yml`). Because the JWT fallback is non-empty, the startup check in `middleware.ts` would pass with the public default.
+  - CORS is `*` when `CORS_ALLOWED_ORIGINS` is unset: `server.ts`.
+  - The production compose file builds `deploy/Dockerfile.gateway` and `deploy/Dockerfile.web`; only `deploy/Dockerfile` exists. The documented Docker path cannot build as written.
+  - `README.md` Quick Start says `cp deploy/.env.example .env`; the file is `.env.example` at the repo root.
+  - `SECURITY.md`: Not found in repo. Dependency and container scanning: Not found in repo (`.github` has only `workflows/ci.yml`).
+  - Security response headers: Not found in repo (searched `server.ts`).
+  - Upload and URL-fetch limits: not verified.
+  - `TASKS.md` lists secrets management, mTLS and prompt sanitisation as unchecked.
+  - Licence text conflicts: `README.md` says MIT; `package.json` says `UNLICENSED`.
+- If it stays this way
+  - A deploy with unset variables runs with publicly known credentials.
+  - Vulnerable dependencies go unnoticed.
+  - Researchers have no reporting path.
+- Action: remove the compose fallbacks (use `${VAR:?}`), set a CORS default of deny, add the two missing Dockerfiles or point to `deploy/Dockerfile`, add `SECURITY.md` and a dependency scan job.
+
+### 5. Human in the loop: Partial
+- Present
+  - Approval bus with pending list, approve/reject, 24 h SLA summary: `services/gateway/src/approval-bus.ts`; routes `/api/approvals/*` in `server.ts`; audit entries `approval.granted` / `approval.rejected`.
+  - Pipeline state `waiting_approval`, plus `paused` and `cancelled`: `services/gateway/src/pipeline-engine.ts`.
+  - Side-effecting tool calls blocked pending approval by risk tier: `mcp-executor.ts`, `packages/sandbox/src/sandbox.ts`.
+  - Approval tables: `packages/db/migrations/001_initial.sql` (`approval_requests`).
+  - Reviewer decisions are recorded in the audit log (see above).
+- Gaps
+  - `TASKS.md` shows "Human-in-the-loop approval gates in workflows", routing, timeout/escalation and notifications unchecked. The code has an approval bus, so `TASKS.md` and the code disagree. The owner should decide which is current.
+  - `packages/approval/src/engine.ts` (policy-based `ApprovalEngine`) was not traced to the gateway; the gateway imports `approval-bus.ts`. Two approval implementations exist.
+  - Global kill switch: Not found in repo.
+  - Confidence-based escalation: Not found in repo.
+- If it stays this way
+  - Approvals can sit pending with no escalation.
+  - There is no single stop control during an incident.
+- Action: pick one approval implementation, add timeout escalation, and add a kill switch route that sets all running pipelines to `paused`.
+
+### 6. Architecture diagrams: Partial
+- Existing: 20 Mermaid-bearing files in `docs/architecture/`. They were not checked against code; `docs/architecture/brutal-audit.md` and `production-readiness.md` describe a state (no auth, no persistence) that differs from the code now present. Treat them as stale until reviewed.
+- Below: diagrams derived from the sampled code. Elements not seen in code are not drawn.
+- Not drawn: swimlane and waterfall (not code-derived artefacts, so the gate's "from code only" rule excludes them); NATS flows (NATS is in `deploy/docker-compose.production.yml` but no gateway code using it was found in the sample; `docs/architecture/brutal-audit.md` says the same).
+
+C4 L1, context
+```mermaid
+flowchart LR
+  U[User / operator] -->|browser| EAOS[EAOS]
+  EAOS -->|LLM calls| LLM[Anthropic / OpenAI / Google]
+  EAOS -->|connectors| EXT[Jira, GitHub, Slack, Teams]
+  EAOS -->|MCP stdio/http| MCP[voicebox, code-memory, skillspector]
+```
+
+C4 L2, containers (from `deploy/docker-compose.production.yml`, `vercel.json`)
+```mermaid
+flowchart LR
+  Web[web: Next.js, apps/web] --> GW[gateway: Node HTTP, services/gateway]
+  GW --> PG[(postgres pgvector)]
+  GW --> RD[(redis)]
+  GW -.->|OTLP| OT[otel-collector]
+  OT --> PR[prometheus metrics]
+  PR --> GF[grafana]
+  NATS[(nats)]:::unused
+  classDef unused stroke-dasharray: 4 4
+```
+- `nats` is deployed in compose; no client code found in the sample (dashed).
+
+C4 L3, gateway components (files in `services/gateway/src`)
+```mermaid
+flowchart TB
+  S[server.ts router] --> A[auth via packages/auth]
+  S --> RL[rate-limiter.ts]
+  S --> V[validation.ts Zod]
+  S --> PE[pipeline-engine.ts]
+  S --> AB[approval-bus.ts]
+  S --> MR[model-router.ts]
+  S --> MX[mcp-executor.ts / mcp-client.ts]
+  S --> AU[audit hash chain]
+  S --> PII[pii-redactor.ts]
+  PE --> AB
+  PE --> MR
+  MR --> LT[llm-tracer.ts]
+  MX --> SB[packages/sandbox]
+  S --> TM[tenant-middleware.ts]
+  TM --> DB[(Postgres RLS)]
+```
+
+Data flow
+```mermaid
+flowchart LR
+  R[HTTP request] --> A[authenticateRequest] --> L[rate limit] --> Z[Zod validate]
+  Z --> P[pipeline / skill run]
+  P --> M[model-router: budget, circuit breaker]
+  M --> LLM[provider]
+  P --> T[tool call via sandbox tier]
+  T -->|high tier| H[approval bus]
+  P --> AUD[audit log]
+  AUD --> ST[(file / memory / Postgres)]
+```
+
+Sequence, execution with approval (`server.ts` approval routes, `approval-bus.ts`)
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant G as Gateway
+  participant B as Approval bus
+  participant M as Model router
+  C->>G: POST /api/execute
+  G->>G: auth, rate limit, validate
+  G->>M: routedLLMCall
+  M-->>G: result
+  G->>B: waitForApproval(execId, stepId)
+  C->>G: POST approve/:stepId
+  G->>B: approve
+  B-->>G: resolved
+  G->>G: recordAudit approval.granted
+  G-->>C: result
+```
+
+State machine (`pipeline-engine.ts`: `PipelineStatus`)
+```mermaid
+stateDiagram-v2
+  [*] --> initializing
+  initializing --> running
+  running --> waiting_approval
+  waiting_approval --> running
+  running --> retrying
+  retrying --> running
+  running --> completed
+  running --> failed
+  running --> paused
+  paused --> running
+  running --> cancelled
+```
+- Exact transitions were not read; edges shown are the ones implied by statuses seen at `pipeline-engine.ts` lines near `waiting_approval` and `running`. Transitions to `paused`/`cancelled` are unverified.
+
+Deployment (`deploy/docker-compose.production.yml`)
+```mermaid
+flowchart TB
+  subgraph compose[docker compose network]
+    gateway --> postgres
+    gateway --> redis
+    web --> gateway
+    gateway -.-> otel-collector --> grafana
+    nats
+  end
+  note[gateway/web build files deploy/Dockerfile.gateway and .web: Not found in repo]
+```
+
+ER (tables and foreign keys from `packages/db/migrations/*.sql`; sampled tables only)
+```mermaid
+erDiagram
+  users ||--o{ api_keys : has
+  users ||--o{ executions : runs
+  executions ||--o{ execution_steps : contains
+  sessions ||--o{ execution_history : groups
+  vision_statements ||--o{ program_records : cascades
+  innovation_experiments ||--o{ innovation_graduations : graduates
+  notification_channels ||--o{ notification_rules : has
+  approval_requests
+  audit_log
+```
+- `users`→`api_keys` is drawn from table order in `003_unified_execution.sql`; its foreign key was not confirmed. `vision_statements`→`program_records` is from `REFERENCES vision_statements` at `004_missing_tables.sql:119`; the child table at that line was not confirmed to be `program_records`. Treat both as unverified.
+
+### Open items register
+
+| # | Item | Owner | Date |
+|---|---|---|---|
+| 1 | Remove default JWT, Postgres and Grafana secrets from the production compose file | Phani Marupaka | 2026-10-26 |
+| 2 | Add or repoint `deploy/Dockerfile.gateway` and `deploy/Dockerfile.web` | Phani Marupaka | 2026-10-26 |
+| 3 | Decide the default CORS policy when `CORS_ALLOWED_ORIGINS` is unset | Phani Marupaka | 2026-10-26 |
+| 4 | Add eval run with pass threshold to CI; add `tests/` to CI | Phani Marupaka | 2026-10-26 |
+| 5 | Remove `continue-on-error` from typecheck, lint and smoke test, or record why it stays | Phani Marupaka | 2026-10-26 |
+| 6 | Choose one approval implementation (`approval-bus.ts` or `packages/approval`); add timeout escalation | Phani Marupaka | 2026-10-26 |
+| 7 | Add a kill switch route | Phani Marupaka | 2026-10-26 |
+| 8 | Add prompt-injection handling for tool results and fetched content | Phani Marupaka | 2026-10-26 |
+| 9 | Add `SECURITY.md` and a dependency/container scan job | Phani Marupaka | 2026-10-26 |
+| 10 | Point OTel traces at a backend; confirm Prometheus scrape path; add alert rules | Phani Marupaka | 2026-10-26 |
+| 11 | Fix README Quick Start env path (`deploy/.env.example` does not exist) and licence mismatch (MIT vs UNLICENSED) | Phani Marupaka | 2026-10-26 |
+| 12 | Review `docs/architecture/*` against code; mark stale files | Phani Marupaka | 2026-10-26 |
+| 13 | Review the groups not sampled (workers, connectors, agents, skills, apps/web) | Phani Marupaka | 2026-10-26 |
+
+### Verdict: Not ready
+
+Per the gate, Ready needs no Missing on Guardrails, Security or Human in the loop, and evals gating the release. Here none of the three is Missing, but evals do not gate release and several Partial items carry real risk. Blockers, in order:
+1. Default production secrets in `deploy/docker-compose.production.yml` (item 1).
+2. Production compose cannot build as written (item 2).
+3. No eval or test gate in CI; `continue-on-error` on typecheck, lint and smoke test (items 4, 5).
+4. No kill switch, and approval escalation is open (items 6, 7).
+5. No prompt-injection handling for runtime content (item 8).
+
+---
+
 ## 📜 License
 
 MIT
