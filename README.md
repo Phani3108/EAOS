@@ -18,6 +18,49 @@ EAOS is a **control plane for enterprise work**. You describe the outcome in pla
 
 ---
 
+## 🛡️ Guardrails and evals
+
+### Guardrails
+
+| Guardrail | What it prevents | Where it is enforced | Default |
+|---|---|---|---|
+| Roles and persona scopes | Users acting outside their role or function | `packages/auth/src/middleware.ts`, `server.ts` route guards, every step's persona | On |
+| Demo isolation | Demo visitors seeing others' work or spending budget | `run-mode.ts`, `server.ts` `/api/auth/demo`, artifact quota (20 files / 2 MB, 24 h) | Demo off unless `EAOS_DEMO_MODE` set; local demo only from this machine |
+| Server-decided run mode | Hidden live runs; failed keyless runs | `run-mode.ts` in `preparePersonaExecution` (every run) | On |
+| Priced-model admission | Unbudgetable model calls | `admitModel` in `llm-provider.ts` | On for live runs |
+| Budget reservations | Overspend | `reserveUsage` (`limit_micros`), released when not billed | Live calls refused until a budget exists |
+| Human approval gates | Unapproved external actions; approving a changed draft | `runtime_approvals`: digest, expiry, confirmations, named approvers | Per skill step |
+| PII redaction | Personal data reaching the model | `pii-redactor.ts`, applied to the step task prompt | On (agent steps; review and chat prompts not yet) |
+| Prompt-injection hardening | Knowledge or task text acting as instructions | Knowledge labelled "evidence, not instructions"; planner limited to the catalogue | Partial; no classifier |
+| Outbound guard (SSRF) | Calls to internal networks or unexpected hosts | `outbound-http.ts`: HTTPS, host allowlist, DNS pinned, private ranges blocked, no redirects | On for connectors and Vault |
+| Policy check | Disallowed tool calls | `checkPolicy` in `mcp-executor.ts` (deny-first) | File-mode tool path |
+| Skill security scan | Unsafe adopted skills | SkillSpector via MCP (risk ≥ 50 or high finding fails) | Only when configured; fails open by default |
+| Origin / CSRF checks | Cross-site requests riding a session | Cookie writes, demo, refresh, OIDC exchange | On |
+| Rate limits | Abuse and floods | `rate-limiter.ts`: unauthenticated 10, sign-in 60, user 120, operator 300, admin 500 per minute | On |
+| Tenant isolation | Cross-tenant reads and writes | Row-level security on every runtime table; production refuses an owner/superuser DB role | On |
+| Idempotency | Duplicate runs from retries | `request_key` + body hash; mismatch → 409 | When the client sends a key |
+| Artifact limits | Oversized or unsafe input files | Allowlist, ≤512 KB, sanitised names, immutable after commit | On |
+| Secrets never returned | Credential leaks | Secret references only; HMAC-hashed API keys shown once; redacted configs | On |
+| Honest failure | Fabricated success | LLM wrapper throws; uncertain effects become inconclusive | On |
+| Audit trail | Unattributed actions | `platform_audit`, `integration_audit`, `runtime_events`; hash chain in file mode | On |
+
+### Evals and quality gates
+
+| Eval | What it measures | When it runs | Threshold | Status |
+|---|---|---|---|---|
+| Per-step quality score | Output quality heuristic (0–10) | Every live LLM step; averaged per run | Shown on the step | Live |
+| Output contract | Required sections, citations, handoff fields | Every step | Missing → retry once, then inconclusive | Live |
+| Evaluation datasets | Labelled pass/fail per case, with reasons | Recorded by operators (`/api/evaluations`) | 1–100 cases per dataset | Live |
+| Registry release gate | Readiness to activate a skill package | On review | ≥3 live cases, 100% pass, reviewer ≠ publisher | Live |
+| Workflow certification | Execution readiness per definition | `GET /api/certification` | Vendor sandbox: not yet certified | Partial |
+| Catalogue certification (M5) | All 81 definitions complete simulated with outputs | CI (M2 runner) | 100% | Live in CI |
+| Review pipeline | Multi-role review verdicts | On request | Approve / changes requested | Live; results not stored |
+| Agent KPIs, after-action reports | Agent performance over time | After runs | — | File mode only; on PostgreSQL planned (G13) |
+| Test suites | Correctness: 427 Vitest unit and contract tests, Postgres acceptance M0 (2 suites) and M2 (20 sections) (M3–M7 contracts), browser sign-in | Every pull request | All must pass | Live; blocking |
+| CI gates | Audit (high), typecheck, lint, compose config, build, tests, Postgres acceptance, browser auth, gateway smoke (ready ≤60 s, clean SIGTERM) | Every push and pull request | All blocking | Live |
+
+---
+
 ## 🗺️ End-to-end workflow
 
 How a request becomes an agent run, an approved action and an audited outcome. The diagram shows every LLM call, platform API call, integration, data store, guardrail and eval the flow depends on.
@@ -144,49 +187,6 @@ Connector calls resolve their secret from Vault at call time. All outbound conne
 | Redis (optional) | Pub/sub | WebSocket fan-out across instances | `REDIS_URL` |
 | OpenTelemetry (optional) | OTLP HTTP traces and metrics | Observability | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | Slack / Teams webhooks (file mode) | Webhook POST | Completion notifications | `SLACK_WEBHOOK_URL` |
-
-</details>
-
-<details><summary><b>Guardrails</b></summary>
-
-| Guardrail | What it prevents | Where it is enforced | Default |
-|---|---|---|---|
-| Roles and persona scopes | Users acting outside their role or function | `packages/auth/src/middleware.ts`, `server.ts` route guards, every step's persona | On |
-| Demo isolation | Demo visitors seeing others' work or spending budget | `run-mode.ts`, `server.ts` `/api/auth/demo`, artifact quota (20 files / 2 MB, 24 h) | Demo off unless `EAOS_DEMO_MODE` set; local demo only from this machine |
-| Server-decided run mode | Hidden live runs; failed keyless runs | `run-mode.ts` in `preparePersonaExecution` (every run) | On |
-| Priced-model admission | Unbudgetable model calls | `admitModel` in `llm-provider.ts` | On for live runs |
-| Budget reservations | Overspend | `reserveUsage` (`limit_micros`), released when not billed | Live calls refused until a budget exists |
-| Human approval gates | Unapproved external actions; approving a changed draft | `runtime_approvals`: digest, expiry, confirmations, named approvers | Per skill step |
-| PII redaction | Personal data reaching the model | `pii-redactor.ts`, applied to the step task prompt | On (agent steps; review and chat prompts not yet) |
-| Prompt-injection hardening | Knowledge or task text acting as instructions | Knowledge labelled "evidence, not instructions"; planner limited to the catalogue | Partial; no classifier |
-| Outbound guard (SSRF) | Calls to internal networks or unexpected hosts | `outbound-http.ts`: HTTPS, host allowlist, DNS pinned, private ranges blocked, no redirects | On for connectors and Vault |
-| Policy check | Disallowed tool calls | `checkPolicy` in `mcp-executor.ts` (deny-first) | File-mode tool path |
-| Skill security scan | Unsafe adopted skills | SkillSpector via MCP (risk ≥ 50 or high finding fails) | Only when configured; fails open by default |
-| Origin / CSRF checks | Cross-site requests riding a session | Cookie writes, demo, refresh, OIDC exchange | On |
-| Rate limits | Abuse and floods | `rate-limiter.ts`: unauthenticated 10, sign-in 60, user 120, operator 300, admin 500 per minute | On |
-| Tenant isolation | Cross-tenant reads and writes | Row-level security on every runtime table; production refuses an owner/superuser DB role | On |
-| Idempotency | Duplicate runs from retries | `request_key` + body hash; mismatch → 409 | When the client sends a key |
-| Artifact limits | Oversized or unsafe input files | Allowlist, ≤512 KB, sanitised names, immutable after commit | On |
-| Secrets never returned | Credential leaks | Secret references only; HMAC-hashed API keys shown once; redacted configs | On |
-| Honest failure | Fabricated success | LLM wrapper throws; uncertain effects become inconclusive | On |
-| Audit trail | Unattributed actions | `platform_audit`, `integration_audit`, `runtime_events`; hash chain in file mode | On |
-
-</details>
-
-<details><summary><b>Evals and quality gates</b></summary>
-
-| Eval | What it measures | When it runs | Threshold | Status |
-|---|---|---|---|---|
-| Per-step quality score | Output quality heuristic (0–10) | Every live LLM step; averaged per run | Shown on the step | Live |
-| Output contract | Required sections, citations, handoff fields | Every step | Missing → retry once, then inconclusive | Live |
-| Evaluation datasets | Labelled pass/fail per case, with reasons | Recorded by operators (`/api/evaluations`) | 1–100 cases per dataset | Live |
-| Registry release gate | Readiness to activate a skill package | On review | ≥3 live cases, 100% pass, reviewer ≠ publisher | Live |
-| Workflow certification | Execution readiness per definition | `GET /api/certification` | Vendor sandbox: not yet certified | Partial |
-| Catalogue certification (M5) | All 81 definitions complete simulated with outputs | CI (M2 runner) | 100% | Live in CI |
-| Review pipeline | Multi-role review verdicts | On request | Approve / changes requested | Live; results not stored |
-| Agent KPIs, after-action reports | Agent performance over time | After runs | — | File mode only; on PostgreSQL planned (G13) |
-| Test suites | Correctness: 427 Vitest unit and contract tests, Postgres acceptance M0 (2 suites) and M2 (20 sections) (M3–M7 contracts), browser sign-in | Every pull request | All must pass | Live; blocking |
-| CI gates | Audit (high), typecheck, lint, compose config, build, tests, Postgres acceptance, browser auth, gateway smoke (ready ≤60 s, clean SIGTERM) | Every push and pull request | All blocking | Live |
 
 </details>
 
