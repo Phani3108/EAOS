@@ -750,6 +750,7 @@ export async function addForumComment(threadId: string, body: string, authorName
 
 export interface ScheduledJobEntry {
     id: string;
+    version?: number;
     name: string;
     skillId: string;
     skillName: string;
@@ -791,26 +792,26 @@ export async function createScheduledJob(data: Partial<ScheduledJobEntry> & { na
     return res.json();
 }
 
-export async function runJobNow(jobId: string): Promise<{ log: unknown; job: ScheduledJobEntry }> {
-    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${jobId}/run`, {
+export async function runJobNow(jobId: string): Promise<{ log?: unknown; job?: ScheduledJobEntry; executionId?: string }> {
+    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${encodeURIComponent(jobId)}/run`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ deliveryId: crypto.randomUUID() }),
     });
     if (!res.ok) throw new Error(`API error ${res.status}`);
     return res.json();
 }
 
-export async function toggleJob(jobId: string): Promise<{ job: ScheduledJobEntry }> {
-    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${jobId}/toggle`, {
+export async function toggleJob(jobId: string, version?: number): Promise<{ job: ScheduledJobEntry }> {
+    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${encodeURIComponent(jobId)}/toggle`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({}),
+        body: JSON.stringify({ version }),
     });
     if (!res.ok) throw new Error(`API error ${res.status}`);
     return res.json();
 }
 
-export async function deleteScheduledJob(jobId: string): Promise<{ deleted: string }> {
-    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${jobId}`, { method: 'DELETE' });
+export async function deleteScheduledJob(jobId: string, version?: number): Promise<{ archived?: boolean; deleted?: string }> {
+    const res = await fetch(`${GATEWAY_URL}/api/scheduler/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ version }) });
     if (!res.ok) throw new Error(`API error ${res.status}`);
     return res.json();
 }
@@ -824,7 +825,7 @@ export async function getSchedulerStats(): Promise<unknown> {
 export async function dispatchEvent(trigger: string, data?: Record<string, unknown>): Promise<{ triggered: string[]; count: number }> {
     const res = await fetch(`${GATEWAY_URL}/api/scheduler/events`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ trigger, data: data ?? {}, source: 'frontend' }),
+        body: JSON.stringify({ trigger, data: data ?? {}, deliveryId: crypto.randomUUID() }),
     });
     if (!res.ok) throw new Error(`API error ${res.status}`);
     return res.json();

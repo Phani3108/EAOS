@@ -981,9 +981,64 @@ const callSignMap = new Map<string, AgentIdentity>(
   AGENT_IDENTITIES.map(a => [a.callSign.toLowerCase(), a])
 );
 
+const CATALOG_AGENT_ALIASES: Record<string, Record<string, string>> = {
+  engineering: {
+    'Code Reviewer': 'code-reviewer', 'Security Analyst': 'security-agent', 'Performance Engineer': 'performance-agent',
+    'Doc Writer': 'docs-writer', 'QA Engineer': 'test-writer', 'Test Engineer': 'test-writer', 'CI Analyst': 'ci-debugger',
+    'SRE Analyst': 'debug-specialist', 'Code Explainer': 'docs-writer', Architect: 'architecture-reviewer', 'Tech Lead': 'tech-lead',
+    'Captain Prometheus': 'architecture-reviewer', 'Corporal Mercury': 'sprint-planner', 'Colonel Atlas': 'engineering-director', 'Sergeant Vulcan': 'debug-specialist',
+  },
+  product: {
+    Research: 'user-researcher', Strategy: 'product-strategist', Product: 'prd-writer', Writer: 'spec-writer',
+    'Captain Odin': 'prd-writer', 'Corporal Freya': 'spec-writer', 'Colonel Themis': 'product-director',
+  },
+  marketing: {
+    Strategy: 'brand-strategist', Copy: 'copy-assistant', Campaign: 'campaign-manager', Research: 'content-strategist',
+    Design: 'creative-lead', Competitor: 'brand-strategist', Analytics: 'analytics-assistant',
+    'Colonel Hyperion': 'marketing-director', 'Captain Iris': 'brand-strategist', 'Captain Apollo': 'content-strategist', 'Corporal Nova': 'campaign-manager',
+  },
+  hr: {
+    'TA Strategist': 'ta-lead', 'TA Writer': 'jd-drafter', 'People Ops': 'people-ops-lead', 'DEI Analyst': 'dei-lead',
+    'Resume Parser': 'ta-lead', 'TA Coordinator': 'ta-lead', 'HR Ops': 'people-ops-lead', 'Compliance Analyst': 'hr-director',
+    'IT Coordinator': 'onboarding-assistant', 'People Analytics': 'people-analytics', HRBP: 'hr-director', 'Comp Analyst': 'comp-analyst',
+    'HR Writer': 'people-ops-lead', 'Colonel Rhea': 'hr-director',
+  },
+  ta: {
+    'JD Specialist': 'jd-drafter', 'Inclusion Reviewer': 'dei-lead', 'Scorecard Analyst': 'interview-designer',
+    'Panel Designer': 'interview-designer', 'Resume Parser': 'ta-lead', 'Candidate Matcher': 'ta-lead', 'Bias Checker': 'dei-lead',
+    'Outreach Specialist': 'ta-lead', 'Interview Designer': 'interview-designer', 'Debrief Analyst': 'interview-designer',
+    'Comparison Analyst': 'people-analytics', 'Market Analyst': 'ta-lead',
+  },
+  program: {
+    'Status Analyst': 'pmo-director', 'Risk Analyst': 'pmo-director', 'Report Compiler': 'pmo-director', 'RAID Analyst': 'pmo-director',
+    'Dependency Mapper': 'pmo-director', 'Launch Coordinator': 'pmo-director', 'Program Lead': 'pmo-director', 'Program Planner': 'pmo-director',
+    'Comms Specialist': 'pmo-director', 'Dependency Analyst': 'pmo-director', 'Retro Facilitator': 'pmo-director', 'Executive Analyst': 'pmo-director',
+    'Captain Hermes': 'pmo-director', 'Colonel Chronos': 'pmo-director',
+  },
+};
+
+export function resolveCatalogAgent(reference: string, persona: string): AgentIdentity | undefined {
+  const direct = identityMap.get(reference);
+  if (direct) return direct;
+  const aliases = CATALOG_AGENT_ALIASES[persona];
+  const id = aliases && Object.hasOwn(aliases, reference) ? aliases[reference] : undefined;
+  return id ? identityMap.get(id) : undefined;
+}
+
 /** Look up agent by ID (e.g., 'code-reviewer') or callSign (e.g., 'Thor') */
 export function getAgentIdentity(idOrCallSign: string): AgentIdentity | undefined {
   return identityMap.get(idOrCallSign) ?? callSignMap.get(idOrCallSign.toLowerCase());
+}
+
+/**
+ * The agent a workflow persona's own runs default to: its director (the first
+ * agent listed for it). TA runs under HR's agents and program under the PMO
+ * director, matching CATALOG_AGENT_ALIASES.
+ */
+export function primaryWorkflowAgent(persona: 'engineering' | 'product' | 'marketing' | 'hr' | 'ta' | 'program'): string {
+  const agent = persona === 'program' ? getAgentIdentity('pmo-director') : getAgentsByPersona(persona === 'ta' ? 'hr' : persona)[0];
+  if (!agent) throw new Error('No canonical agent for persona');
+  return agent.id;
 }
 
 /** Get all agents for a persona */

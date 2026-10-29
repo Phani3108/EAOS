@@ -1,0 +1,97 @@
+import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import type { PostgresRunRepository, RuntimeSnapshot } from '../packages/db/dist/run-repository.js';
+
+export async function verifyChildLifecycle(runs: PostgresRunRepository, tenantId: string, foreignTenant: string) {
+    const leaf = { id: 'leaf', version: '1', definitionHash: 'd'.repeat(64), steps: [{ id: 'step', kind: 'transform', outputKey: 'result' }] };
+    const child = { id: 'child', version: '1', definitionHash: 'c'.repeat(64), steps: [{ id: 'step', kind: 'subworkflow', outputKey: 'result', subworkflow: { definition: leaf } }] };
+    const parent = { id: 'parent', version: '1', definitionHash: 'b'.repeat(64), steps: [{ id: 'step', kind: 'subworkflow', outputKey: 'result', subworkflow: { definition: child } }] };
+    const snapshot = (definition: typeof leaf | typeof child | typeof parent): RuntimeSnapshot => ({ id: randomUUID(), tenantId, userId: `user-${tenantId}`, persona: 'engineering', status: 'queued', mode: 'simulation', definitionHash: definition.definitionHash, schemaVersion: 1, inputs: {}, outputs: {}, steps: [{ stepId: 'step', agent: 'code-reviewer', kind: definition.steps[0]!.kind, outputKey: 'result', status: 'pending', provenance: 'none' }] });
+    const root = snapshot(parent);
+    await runs.submit(root, parent, {});
+    const rootClaim = (await runs.claim(tenantId, 'parent-worker'))!;
+    const nested = await runs.spawnChild(rootClaim.lease, rootClaim.snapshot, 'step', snapshot(child), child, {});
+    const replay = await runs.spawnChild(rootClaim.lease, rootClaim.snapshot, 'step', snapshot(child), child, {});
+    assert.equal(replay.id, nested.id);
+    await assert.rejects(runs.spawnChild(rootClaim.lease, rootClaim.snapshot, 'step', { ...snapshot(child), tenantId: foreignTenant }, child, {}));
+    const waitingRoot = (await runs.get(tenantId, root.id))!;
+    await runs.park(rootClaim.lease, waitingRoot);
+    const childClaim = (await runs.claim(tenantId, 'child-worker'))!;
+    assert.equal(childClaim.snapshot.id, nested.id);
+    const grandchild = await runs.spawnChild(childClaim.lease, childClaim.snapshot, 'step', snapshot(leaf), leaf, {});
+    await runs.park(childClaim.lease, (await runs.get(tenantId, nested.id))!);
+    const leafClaim = (await runs.claim(tenantId, 'leaf-worker'))!;
+    assert.equal(leafClaim.snapshot.id, grandchild.id);
+    await runs.checkpoint(leafClaim.lease, { ...leafClaim.snapshot, status: 'simulated', outputs: { result: 'leaf result' }, steps: [{ ...leafClaim.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    const resumedChild = (await runs.claim(tenantId, 'resume-child'))!;
+    assert.equal(resumedChild.snapshot.id, nested.id);
+    await runs.checkpoint(resumedChild.lease, { ...resumedChild.snapshot, status: 'simulated', outputs: { result: 'child result' }, steps: [{ ...resumedChild.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    const resumedParent = (await runs.claim(tenantId, 'resume-parent'))!;
+    assert.equal(resumedParent.snapshot.id, root.id);
+    await runs.checkpoint(resumedParent.lease, { ...resumedParent.snapshot, status: 'simulated', outputs: { result: 'root result' }, steps: [{ ...resumedParent.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    assert.equal((await runs.children(tenantId, root.id))[0]?.id, nested.id);
+    assert.equal((await runs.children(foreignTenant, root.id)).length, 0);
+
+    const cancelled = snapshot(parent);
+    await runs.submit(cancelled, parent, {});
+    const cancelledClaim = (await runs.claim(tenantId, 'cancel-parent'))!;
+    const cancelledChild = await runs.spawnChild(cancelledClaim.lease, cancelledClaim.snapshot, 'step', snapshot(child), child, {});
+    const activeChild = (await runs.claim(tenantId, 'cancel-child'))!;
+    assert.equal(activeChild.snapshot.id, cancelledChild.id);
+    const cancelledLeaf = await runs.spawnChild(activeChild.lease, activeChild.snapshot, 'step', snapshot(leaf), leaf, {});
+    assert.equal(await runs.cancel(foreignTenant, cancelled.id), false);
+    assert.equal(await runs.cancel(tenantId, cancelled.id), true);
+    for (const id of [cancelled.id, cancelledChild.id, cancelledLeaf.id]) assert.equal((await runs.get(tenantId, id))?.status, 'cancelled');
+    assert.equal(await runs.heartbeat(activeChild.lease), false);
+    await assert.rejects(runs.checkpoint(activeChild.lease, { ...activeChild.snapshot, status: 'simulated' }));
+    const monotonic = snapshot(leaf);
+    await runs.submit(monotonic, leaf, {});
+    const monotonicClaim = (await runs.claim(tenantId, 'monotonic-checkpoint'))!;
+    const committed = { ...monotonicClaim.snapshot, status: 'running' as const, outputs: { result: 'committed fixture' }, steps: [{ ...monotonicClaim.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] };
+    await runs.checkpoint(monotonicClaim.lease, committed);
+    await assert.rejects(runs.checkpoint(monotonicClaim.lease, monotonicClaim.snapshot));
+    await runs.checkpoint(monotonicClaim.lease, { ...committed, status: 'simulated' });
+    const expiring = snapshot(parent);
+    await runs.submit(expiring, parent, { runTimeoutMs: 1000 });
+    const expiringClaim = (await runs.claim(tenantId, 'deadline-parent'))!;
+    const expiringChild = await runs.spawnChild(expiringClaim.lease, expiringClaim.snapshot, 'step', snapshot(child), child, {});
+    await runs.park(expiringClaim.lease, (await runs.get(tenantId, expiring.id))!);
+    await delay(1100);
+    assert.equal(await runs.claim(tenantId, 'deadline-sweep'), undefined);
+    assert.equal((await runs.get(tenantId, expiring.id))?.status, 'failed');
+    assert.equal((await runs.get(tenantId, expiringChild.id))?.status, 'cancelled');
+
+    // A parent that failed because its child failed is retried with that child: the
+    // parent step keeps its childRunId and a step admits one child, so replaying the
+    // parent alone would only re-read the failed child.
+    const composite = { id: 'composite', version: '1', definitionHash: 'e'.repeat(64), steps: [{ id: 'step', kind: 'subworkflow', outputKey: 'result', subworkflow: { definition: leaf } }] };
+    const failedRoot = snapshot(composite as typeof parent);
+    await runs.submit(failedRoot, composite, {});
+    const failedRootClaim = (await runs.claim(tenantId, 'composite-parent'))!;
+    const failedChild = await runs.spawnChild(failedRootClaim.lease, failedRootClaim.snapshot, 'step', snapshot(leaf), leaf, {});
+    await runs.park(failedRootClaim.lease, (await runs.get(tenantId, failedRoot.id))!);
+    const failingChild = (await runs.claim(tenantId, 'composite-child'))!;
+    assert.equal(failingChild.snapshot.id, failedChild.id);
+    await runs.fail(failingChild.lease, { ...failingChild.snapshot, steps: [{ ...failingChild.snapshot.steps[0]!, status: 'failed' }] }, 'Fixture provider outage', false);
+    const wokenRoot = (await runs.claim(tenantId, 'composite-parent-resume'))!;
+    assert.equal(wokenRoot.snapshot.id, failedRoot.id);
+    await runs.fail(wokenRoot.lease, { ...wokenRoot.snapshot, steps: [{ ...wokenRoot.snapshot.steps[0]!, status: 'failed', error: `Required child ${failedChild.id} did not complete` }] }, 'Required child did not complete', false);
+    // Retrying only the child would be accepted and then cancelled by claim(), so it is refused.
+    await assert.rejects(runs.retryFailed(tenantId, failedChild.id), /Retry the parent run/);
+    assert.equal(await runs.retryFailed(foreignTenant, failedRoot.id), false);
+    assert.equal(await runs.retryFailed(tenantId, failedRoot.id), true);
+    assert.equal((await runs.get(tenantId, failedChild.id))?.status, 'queued');
+    const retriedRoot = (await runs.claim(tenantId, 'composite-retry-parent'))!;
+    assert.equal(retriedRoot.snapshot.id, failedRoot.id);
+    assert.deepEqual(retriedRoot.snapshot.steps.map(step => [step.status, step.childRunId]), [['pending', failedChild.id]]);
+    await runs.park(retriedRoot.lease, retriedRoot.snapshot);
+    const retriedChild = (await runs.claim(tenantId, 'composite-retry-child'))!;
+    assert.equal(retriedChild.snapshot.id, failedChild.id);
+    await runs.checkpoint(retriedChild.lease, { ...retriedChild.snapshot, status: 'simulated', outputs: { result: 'retried leaf' }, steps: [{ ...retriedChild.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    const finishedRoot = (await runs.claim(tenantId, 'composite-retry-resume'))!;
+    assert.equal(finishedRoot.snapshot.id, failedRoot.id);
+    await runs.checkpoint(finishedRoot.lease, { ...finishedRoot.snapshot, status: 'simulated', outputs: { result: 'retried root' }, steps: [{ ...finishedRoot.snapshot.steps[0]!, status: 'simulated', provenance: 'simulated' }] });
+    assert.equal((await runs.get(tenantId, failedRoot.id))?.status, 'simulated');
+    console.log('PASS atomic child admission/replay, nested continuation, tenant isolation, recursive cancellation, monotonic checkpoints and tree deadlines');
+}

@@ -20,7 +20,7 @@
   },
   "packageManager": "pnpm@10.14.0",
   "engines": {
-    "node": ">=20.0.0",
+    "node": ">=22.20.0",
     "pnpm": ">=9.0.0"
   },
   "pnpm": {
@@ -33,12 +33,37 @@
       "prisma",
       "sharp",
       "@swc/core"
-    ]
+    ],
+    "overrides": {
+      "hono": "4.13.5",
+      "@hono/node-server": "1.19.15",
+      "protobufjs@^7.0.0": "7.6.5",
+      "@protobufjs/utf8": "1.1.1",
+      "@grpc/grpc-js": "1.14.5",
+      "postcss@^8.0.0": "8.5.23",
+      "fast-uri": "3.1.8",
+      "nanoid@^3.0.0": "3.3.18",
+      "ip-address": "10.3.1",
+      "qs": "6.16.0",
+      "yaml@^1.0.0": "1.10.3",
+      "source-map-js": "1.2.2",
+      "proxy-addr": "2.0.8",
+      "sharp@^0.35.0": "0.35.5"
+    }
   },
   "scripts": {
     "build": "turbo run build",
-    "dev": "turbo run dev",
-    "test": "turbo run test",
+    "dev": "node scripts/dev.mjs",
+    "dev:db:down": "docker compose -f deploy/docker-compose.dev.yml down",
+    "test": "vitest run",
+    "test:m0": "tsx tests/m0.integration.test.ts",
+    "test:m2": "tsx tests/m2.integration.test.ts",
+    "test:m3": "tsx tests/m2.integration.test.ts",
+    "test:m4": "tsx tests/m2.integration.test.ts",
+    "test:m5": "tsx tests/m2.integration.test.ts",
+    "test:m6": "tsx tests/m2.integration.test.ts",
+    "test:m7": "tsx tests/m2.integration.test.ts",
+    "test:browser": "GATEWAY_INTERNAL_URL=http://127.0.0.1:32199 pnpm --filter @agentos/web build && playwright test tests/auth.browser.spec.ts --workers=1",
     "test:api": "node --experimental-strip-types tests/api.test.ts",
     "test:integration": "tsx tests/integration.test.ts",
     "test:all": "bash scripts/test-all.sh",
@@ -48,6 +73,7 @@
     "record-demos": "python3 scripts/record-demos.py"
   },
   "devDependencies": {
+    "@playwright/test": "1.58.2",
     "@types/node": "^20.11.0",
     "eslint": "^9.0.0",
     "prettier": "^3.2.0",

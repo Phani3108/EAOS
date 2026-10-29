@@ -14,9 +14,9 @@
 
 export type ExecutionMode = 'sequential' | 'dag';
 export type ExecutableType = 'skill' | 'workflow' | 'goal';
-export type PersonaId = 'engineering' | 'product' | 'hr' | 'marketing';
-export type ExecutionStatus = 'queued' | 'running' | 'completed' | 'failed' | 'paused';
-export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'approval_required' | 'skipped';
+export type PersonaId = import('@agentos/skills/schema').WorkflowPersona;
+export type ExecutionStatus = import('@agentos/skills/schema').ExecutionStatus;
+export type StepStatus = import('@agentos/skills/schema').StepStatus;
 
 // ---------------------------------------------------------------------------
 // Unified Execution Record — replaces PersonaExecutionRecord AND

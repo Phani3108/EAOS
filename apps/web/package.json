@@ -4,20 +4,21 @@
     "private": true,
     "description": "EAOS Mission Control — Frontend",
     "scripts": {
-        "dev": "next dev --port 3010",
+        "dev": "next dev --port 3010 --hostname 127.0.0.1",
         "build": "next build",
         "start": "next start --port 3010",
         "lint": "next lint"
     },
     "dependencies": {
         "@agentos/gateway": "workspace:*",
+        "@agentos/skills": "workspace:*",
         "@emotion/react": "^11.11.0",
         "@emotion/styled": "^11.11.0",
         "@mui/icons-material": "^5.15.0",
         "@mui/material": "^5.15.0",
         "@tanstack/react-query": "^5.28.0",
         "framer-motion": "^11.0.0",
-        "next": "^14.2.0",
+        "next": "^15.5.24",
         "react": "^18.3.0",
         "react-dom": "^18.3.0",
         "reactflow": "^11.11.0",
@@ -29,8 +30,8 @@
         "@types/react-dom": "^18.3.0",
         "autoprefixer": "^10.4.0",
         "eslint": "^8.57.1",
-        "eslint-config-next": "^14.2.35",
-        "postcss": "^8.4.0",
+        "eslint-config-next": "^15.5.24",
+        "postcss": "8.5.23",
         "tailwindcss": "^3.4.0",
         "typescript": "^5.4.0"
     }

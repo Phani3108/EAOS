@@ -59,9 +59,16 @@ interface StageResult {
 interface CognitiveResult {
     requestId: string;
     output: unknown;
-    confidence: number;
-    grounded: boolean;
-    groundingScore: number;
+    /**
+     * These three are optional on purpose. Each is undefined when its stage was
+     * disabled or returned an unreadable verdict. They were previously seeded
+     * with `true` / `1.0` / a default score, so a pipeline that skipped
+     * grounding entirely still reported perfect grounding — and a caller had no
+     * way to tell a measured verdict from a manufactured one.
+     */
+    confidence?: number;
+    grounded?: boolean;
+    groundingScore?: number;
     stages: StageResult[];
     totalDurationMs: number;
     tokensUsed: number;
@@ -74,9 +81,21 @@ const results = new Map<string, CognitiveResult>();
 // LLM Call
 // ---------------------------------------------------------------------------
 
+/** Raised when this service has no credential. Not retryable. */
+export class CognitiveNotConfiguredError extends Error {
+    readonly name = 'CognitiveNotConfiguredError';
+    constructor() {
+        super('ANTHROPIC_API_KEY is not set — the cognitive engine cannot run.');
+    }
+}
+
 async function callLLM(system: string, user: string, modelId?: string): Promise<string> {
     const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) return `[No ANTHROPIC_API_KEY] System: ${system.slice(0, 100)}`;
+    // Previously returned `[No ANTHROPIC_API_KEY] System: <prompt slice>` — an
+    // echo of our own prompt that every stage below then JSON-parse-failed on
+    // and replaced with a confident hardcoded verdict. A missing key must stop
+    // the pipeline, not produce a fabricated one.
+    if (!apiKey) throw new CognitiveNotConfiguredError();
 
     const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
@@ -101,6 +120,23 @@ async function callLLM(system: string, user: string, modelId?: string): Promise<
 // ---------------------------------------------------------------------------
 // Pipeline Stages
 // ---------------------------------------------------------------------------
+
+/**
+ * Extract the first JSON object from a model response.
+ *
+ * Returns `null` when nothing parseable is present. Callers must decide what an
+ * unreadable response means for their stage — the one thing none of them may do
+ * is substitute a confident verdict, which is what all five stages used to do.
+ */
+function parseJsonObject<T>(raw: string): T | null {
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+        return JSON.parse(match[0]) as T;
+    } catch {
+        return null;
+    }
+}
 
 async function decompose(goal: string, modelId?: string): Promise<{ subtasks: string[] }> {
     const raw = await callLLM(
@@ -130,46 +166,55 @@ async function plan(goal: string, subtasks: string[], modelId?: string): Promise
     }
 }
 
-async function reason(goal: string, planText: string, modelId?: string): Promise<{ reasoning: string; confidence: number }> {
+async function reason(
+    goal: string,
+    planText: string,
+    modelId?: string,
+): Promise<{ reasoning: string; confidence?: number; parseFailed?: boolean }> {
     const raw = await callLLM(
         'You are a reasoning engine. Analyze the plan, identify risks and optimizations. Return JSON: {"reasoning": "...", "confidence": 0.0-1.0}',
         `Goal: ${goal}\nPlan: ${planText}`,
         modelId,
     );
-    try {
-        const match = raw.match(/\{[\s\S]*\}/);
-        return match ? JSON.parse(match[0]) : { reasoning: raw, confidence: 0.7 };
-    } catch {
-        return { reasoning: raw, confidence: 0.7 };
-    }
+    const parsed = parseJsonObject<{ reasoning?: string; confidence?: number }>(raw);
+    // The model's own stated confidence, or nothing. The previous 0.7 was our
+    // invention presented as the model's judgement.
+    if (!parsed) return { reasoning: raw, parseFailed: true };
+    return { reasoning: parsed.reasoning ?? raw, confidence: parsed.confidence };
 }
 
-async function reflect(output: string, goal: string, modelId?: string): Promise<{ score: number; feedback: string }> {
+async function reflect(
+    output: string,
+    goal: string,
+    modelId?: string,
+): Promise<{ score?: number; feedback: string; parseFailed?: boolean }> {
     const raw = await callLLM(
         'You are a quality reflection engine. Evaluate the output quality. Return JSON: {"score": 0.0-1.0, "feedback": "..."}',
         `Goal: ${goal}\n\nOutput to evaluate:\n${output.slice(0, 2000)}`,
         modelId,
     );
-    try {
-        const match = raw.match(/\{[\s\S]*\}/);
-        return match ? JSON.parse(match[0]) : { score: 0.8, feedback: raw };
-    } catch {
-        return { score: 0.8, feedback: raw };
-    }
+    const parsed = parseJsonObject<{ score?: number; feedback?: string }>(raw);
+    // No score rather than a default 0.8. A quality score we made up is worse
+    // than no quality score, because downstream code cannot tell them apart.
+    if (!parsed) return { feedback: raw, parseFailed: true };
+    return { score: parsed.score, feedback: parsed.feedback ?? raw };
 }
 
-async function groundCheck(output: string, context: Record<string, unknown>, modelId?: string): Promise<{ grounded: boolean; score: number }> {
+async function groundCheck(
+    output: string,
+    context: Record<string, unknown>,
+    modelId?: string,
+): Promise<{ grounded?: boolean; score?: number; parseFailed?: boolean }> {
     const raw = await callLLM(
         'You are a hallucination checker. Evaluate if the output is grounded in the provided context. Return JSON: {"grounded": true/false, "score": 0.0-1.0}',
         `Context: ${JSON.stringify(context).slice(0, 1500)}\n\nOutput to check:\n${output.slice(0, 2000)}`,
         modelId,
     );
-    try {
-        const match = raw.match(/\{[\s\S]*\}/);
-        return match ? JSON.parse(match[0]) : { grounded: true, score: 0.85 };
-    } catch {
-        return { grounded: true, score: 0.85 };
-    }
+    const parsed = parseJsonObject<{ grounded?: boolean; score?: number }>(raw);
+    // A hallucination checker that fails open is worse than no checker at all.
+    // On an unreadable verdict the answer is "unknown" — never `grounded: true`.
+    if (!parsed) return { parseFailed: true };
+    return { grounded: parsed.grounded, score: parsed.score };
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +260,9 @@ async function processPipeline(request: CognitiveRequest): Promise<CognitiveResu
     }
 
     // 6. Ground (hallucination check)
-    let grounded = true;
-    let groundingScore = 1.0;
+    // Undefined until the check actually runs and returns a readable verdict.
+    let grounded: boolean | undefined;
+    let groundingScore: number | undefined;
     if (config.enableGrounding) {
         const t6 = Date.now();
         const check = await groundCheck(output, request.context, modelId);

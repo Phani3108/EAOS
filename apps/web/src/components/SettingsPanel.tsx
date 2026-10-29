@@ -11,6 +11,8 @@ import { TOUR_STEPS } from '../lib/tour-data';
 import { resetAllPreferences, getSelectedRole, getPreference, setPreference } from '../lib/storage';
 import { useEAOSStore } from '../store/eaos-store';
 import { useConnectionsStore } from '../store/connections-store';
+import { authRequest, clearUserState } from '../lib/auth-client';
+import { useAuthSession } from './AuthGate';
 
 const API = process.env.NEXT_PUBLIC_GATEWAY_URL || 'http://localhost:3000';
 
@@ -157,10 +159,33 @@ export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProp
   const get = (key: string, fallback: unknown = '') => settings[key] ?? fallback;
 
   // ── API Keys state ──
-  const [apiKeys, setApiKeys] = useState<{ id: string; name: string; prefix: string; created: string; lastUsed: string; scopes: string[] }[]>([
-    { id: 'ak-1', name: 'Production', prefix: 'eaos_prod_...x4f2', created: '2026-03-15', lastUsed: '2026-04-07', scopes: ['read', 'execute'] },
-    { id: 'ak-2', name: 'Development', prefix: 'eaos_dev_...r8k1', created: '2026-04-01', lastUsed: '2026-04-08', scopes: ['read', 'execute', 'admin'] },
-  ]);
+  const [apiKeys, setApiKeys] = useState<{ id: string; name: string; prefix: string; created: string; lastUsed: string; scopes: string[] }[]>([]);
+  const [keyError, setKeyError] = useState('');
+  const [keyBusy, setKeyBusy] = useState(false);
+  const session = useAuthSession();
+  const loadKeys = useCallback(async () => {
+    const data = await authRequest('/api/users/apikeys');
+    setApiKeys(data.keys.map((key: { id: string; label: string; keyPrefix: string; createdAt: string; lastUsedAt?: string; scopes: string[] }) => ({
+      id: key.id, name: key.label, prefix: key.keyPrefix, created: key.createdAt.slice(0, 10), lastUsed: key.lastUsedAt?.slice(0, 10) ?? 'Never', scopes: key.scopes,
+    })));
+  }, []);
+  useEffect(() => {
+    if (activeTab === 'api-keys') void loadKeys().catch(err => setKeyError(err.message));
+  }, [activeTab, loadKeys]);
+  async function manageKey(action: 'create' | 'rotate' | 'revoke', id?: string) {
+    if (action !== 'create' && !window.confirm('This ends your current sessions. Make sure you have saved another sign-in credential. Continue?')) return;
+    setKeyBusy(true); setKeyError('');
+    try {
+      const path = action === 'create' ? '/api/users/apikeys' : `/api/users/apikeys/${id}${action === 'rotate' ? '/rotate' : ''}`;
+      const data = await authRequest(path, {
+        method: action === 'revoke' ? 'DELETE' : 'POST', headers: { 'Content-Type': 'application/json' },
+        ...(action === 'revoke' ? {} : { body: JSON.stringify(action === 'create' ? { label: `Key ${apiKeys.length + 1}` } : {}) }),
+      });
+      if (data.rawKey) session?.showKey(data.rawKey);
+      else { clearUserState(); window.location.assign('/'); }
+    } catch (err) { setKeyError(err instanceof Error ? err.message : 'Key operation failed'); }
+    finally { setKeyBusy(false); }
+  }
 
   // ── Compliance state ──
   const complianceItems = [
@@ -390,6 +415,7 @@ export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProp
         {/* ═══ API KEYS TAB ═══ */}
         {activeTab === 'api-keys' && (
           <>
+            {keyError && <p role="alert" className="mb-3 text-sm text-red-700">{keyError}</p>}
             <Section title="Your API Keys">
               {apiKeys.map(key => (
                 <div key={key.id} className="px-4 py-3.5">
@@ -401,8 +427,8 @@ export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProp
                       ))}
                     </div>
                     <div className="flex items-center gap-2">
-                      <button className="text-xs text-blue-600 hover:text-blue-700 font-medium">Rotate</button>
-                      <button className="text-xs text-red-500 hover:text-red-700 font-medium">Revoke</button>
+                      <button disabled={keyBusy} onClick={() => void manageKey('rotate', key.id)} className="text-xs text-blue-600 hover:text-blue-700 font-medium">Rotate</button>
+                      <button disabled={keyBusy} onClick={() => void manageKey('revoke', key.id)} className="text-xs text-red-500 hover:text-red-700 font-medium">Revoke</button>
                     </div>
                   </div>
                   <div className="flex items-center gap-4 text-xs text-slate-500">
@@ -415,14 +441,8 @@ export default function SettingsPanel({ onRestartOnboarding }: SettingsPanelProp
             </Section>
 
             <button
-              onClick={() => setApiKeys(prev => [...prev, {
-                id: `ak-${Date.now()}`,
-                name: `Key ${prev.length + 1}`,
-                prefix: `eaos_new_...${Math.random().toString(36).slice(-4)}`,
-                created: new Date().toISOString().slice(0, 10),
-                lastUsed: 'Never',
-                scopes: ['read'],
-              }])}
+              disabled={keyBusy}
+              onClick={() => void manageKey('create')}
               className="btn btn-primary"
             >
               Generate New Key

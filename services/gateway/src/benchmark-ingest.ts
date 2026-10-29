@@ -71,6 +71,12 @@ export async function contributeExecution(
 ): Promise<{ submitted: boolean; reason?: string }> {
   if (!isEnabled()) return { submitted: false, reason: 'BENCHMARK_CONTRIBUTE not enabled' };
   if (exec.simulated) return { submitted: false, reason: 'simulated executions are excluded' };
+  // Only measured observations of the SKILL enter the corpus. A provider outage
+  // or a budget cap says nothing about skill quality, so contributing it would
+  // silently push our own downtime into every consumer's success-rate figures.
+  if (exec.infraFailure) {
+    return { submitted: false, reason: 'infrastructure failures are excluded (measures the provider, not the skill)' };
+  }
 
   const salt = tenantSalt();
   const record: BenchmarkRecord = {

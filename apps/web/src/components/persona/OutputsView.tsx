@@ -17,7 +17,7 @@ import type { ExecutionStepEvent } from '../../store/marketing-store';
 export interface OutputExecution {
   id: string;
   skillName: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'paused';
+  status: import('@agentos/skills/schema').ExecutionStatus;
   steps: {
     stepId: string;
     stepName: string;

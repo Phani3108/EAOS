@@ -12,9 +12,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { callLLM, hasAnyLLMKey } from './llm-provider.js';
+import { callLLM, hasAnyLLMKey, PROVIDER_CALL_TIMEOUT_MS } from './llm-provider.js';
 
-export type ReviewVerdict = 'approve' | 'changes_requested';
+export type ReviewVerdict = 'approve' | 'changes_requested' | 'inconclusive' | 'simulated';
 
 export interface ReviewerResult {
   role: string;
@@ -92,12 +92,21 @@ function simulatedReview(roleDef: ReviewRoleDef): ReviewerResult {
     role: roleDef.role,
     label: roleDef.label,
     persona: roleDef.persona,
-    verdict: 'approve',
-    summary: `[simulated] ${roleDef.label} found no blocking issues. Configure an LLM API key (ANTHROPIC_API_KEY/OPENAI_API_KEY) for a real review.`,
+    verdict: 'simulated',
+    summary: `[simulated] ${roleDef.label}: no live review was performed.`,
     findings: [],
     simulated: true,
   };
 }
+
+/**
+ * Wall-clock budget for one synchronous review: one provider attempt per
+ * reviewer. The route answers inside the request, so without a bound a chain
+ * that keeps falling back across providers could outlive every proxy and
+ * browser in front of it. Reviewers left when it elapses are reported as
+ * inconclusive rather than run.
+ */
+export const REVIEW_DEADLINE_MS = DEFAULT_REVIEW_CHAIN.length * PROVIDER_CALL_TIMEOUT_MS;
 
 /** The configured review chain (role + lens + persona). */
 export function getReviewChain(): Array<{ role: string; label: string; persona: string; available: boolean }> {
@@ -106,16 +115,31 @@ export function getReviewChain(): Array<{ role: string; label: string; persona: 
 
 export async function runReviewPipeline(
   artifact: string,
-  opts: { roles?: string[]; provider?: string; modelId?: string } = {}
+  opts: { roles?: string[]; provider?: string; modelId?: string; simulate?: boolean; signal?: AbortSignal } = {}
 ): Promise<ReviewPipelineResult> {
   const chain = DEFAULT_REVIEW_CHAIN.filter(r => !opts.roles || opts.roles.includes(r.role));
-  const simulate = !hasAnyLLMKey();
+  const simulate = opts.simulate === true;
   const reviewers: ReviewerResult[] = [];
   let totalCost = 0;
 
   for (const roleDef of chain) {
     if (simulate) {
       reviewers.push(simulatedReview(roleDef));
+      continue;
+    }
+
+    // Deadline elapsed or caller gone: every further call would be billed for
+    // a verdict nobody can receive, so the remaining roles are not run.
+    if (opts.signal?.aborted) {
+      reviewers.push({
+        role: roleDef.role,
+        label: roleDef.label,
+        persona: roleDef.persona,
+        verdict: 'inconclusive',
+        summary: `Review was not run: ${abortReason(opts.signal)}`,
+        findings: [],
+        simulated: false,
+      });
       continue;
     }
 
@@ -145,10 +169,12 @@ export async function runReviewPipeline(
         userPrompt,
         maxTokens: 1500,
         temperature: 0.3,
+        signal: opts.signal,
       });
       totalCost += res.cost;
       const parsed = parseVerdictJson(res.content);
-      const verdict: ReviewVerdict = parsed?.verdict === 'changes_requested' ? 'changes_requested' : 'approve';
+      if (!parsed || !['approve', 'changes_requested'].includes(parsed.verdict ?? '') || typeof parsed.summary !== 'string' || !parsed.summary.trim() || !Array.isArray(parsed.findings) || parsed.findings.some(finding => typeof finding !== 'string')) throw new Error('Invalid reviewer response contract');
+      const verdict = parsed.verdict as ReviewVerdict;
       reviewers.push({
         role: roleDef.role,
         label: roleDef.label,
@@ -166,10 +192,10 @@ export async function runReviewPipeline(
         role: roleDef.role,
         label: roleDef.label,
         persona: roleDef.persona,
-        verdict: 'approve',
-        summary: `Review could not complete: ${(err as Error).message}`,
+        verdict: 'inconclusive',
+        summary: `Review could not complete: ${opts.signal?.aborted ? abortReason(opts.signal) : (err as Error).message}`,
         findings: [],
-        simulated: true,
+        simulated: false,
       });
     }
   }
@@ -181,11 +207,17 @@ export async function runReviewPipeline(
     id: `review-${randomUUID().slice(0, 8)}`,
     artifactPreview: artifact.slice(0, 200),
     reviewers,
-    finalVerdict: changesRequested > 0 ? 'changes_requested' : 'approve',
+    finalVerdict: simulate ? 'simulated' : !reviewers.length || reviewers.some(reviewer => reviewer.verdict === 'inconclusive') ? 'inconclusive' : changesRequested > 0 ? 'changes_requested' : 'approve',
     consolidatedFindings,
-    approvals: reviewers.length - changesRequested,
+    approvals: reviewers.filter(reviewer => reviewer.verdict === 'approve' && !reviewer.simulated).length,
     changesRequested,
     simulated: simulate,
     totalCost,
   };
+}
+
+function abortReason(signal: AbortSignal): string {
+  return signal.reason instanceof DOMException && signal.reason.name === 'TimeoutError'
+    ? `the ${REVIEW_DEADLINE_MS / 1000}s review deadline elapsed`
+    : 'the request was abandoned';
 }

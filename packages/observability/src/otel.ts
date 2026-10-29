@@ -19,6 +19,7 @@ let tracer: unknown;
  * @param serviceName The logical service name (e.g. 'gateway', 'memory')
  */
 export async function initOTel(serviceName: string): Promise<void> {
+    if (process.env.OTEL_SDK_DISABLED === 'true' || !process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return;
     try {
         // Dynamic imports — packages are optional; if missing we log & skip
         const otelApi = await import('@opentelemetry/api');
@@ -32,15 +33,14 @@ export async function initOTel(serviceName: string): Promise<void> {
         const { PeriodicExportingMetricReader } = await import(
             '@opentelemetry/sdk-metrics'
         );
-        const { Resource } = await import('@opentelemetry/resources');
+        const { resourceFromAttributes } = await import('@opentelemetry/resources');
         const { ATTR_SERVICE_NAME } = await import(
             '@opentelemetry/semantic-conventions'
         );
 
-        const endpoint =
-            process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4318';
+        const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT.replace(/\/$/, '');
 
-        const resource = new Resource({
+        const resource = resourceFromAttributes({
             [ATTR_SERVICE_NAME]: serviceName,
         });
 

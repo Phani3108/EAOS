@@ -9,6 +9,7 @@
  */
 
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -16,6 +17,12 @@ import type { Store } from './db.js';
 
 export interface AgentMemoryEntry {
   id: string;
+  /**
+   * Owning tenant. Memory is spliced verbatim into an agent's system prompt, so
+   * an entry crossing a tenant boundary is silent, persistent, unauditable data
+   * exfiltration that surfaces inside generated output.
+   */
+  tenantId: string;
   agentId: string;
   timestamp: string;
   kind: 'learning' | 'correction' | 'pattern' | 'preference';
@@ -36,8 +43,23 @@ export interface AgentMemorySnapshot {
 
 const TABLE = 'agent_memory';
 const MAX_ENTRIES_PER_AGENT = 50;   // Keep memory bounded
+/**
+ * Keyed by `<tenantId>\u0000<agentId>`, never by agentId alone.
+ *
+ * It was keyed by bare agentId, so every tenant running the same catalog agent
+ * shared one memory pool: tenant A's learnings were injected into tenant B's
+ * system prompt by `buildAgentMemoryContext`. A NUL separator is used because it
+ * cannot appear in either identifier, so no pair of ids can collide into the same
+ * key.
+ */
 const memories = new Map<string, AgentMemoryEntry[]>();
 let backingStore: Store | null = null;
+
+/** Compose the tenant-scoped storage key. */
+function memKey(tenantId: string, agentId: string): string {
+  if (!tenantId) throw new Error('agent-memory: tenantId is required — refusing to use an unscoped key');
+  return `${tenantId}\u0000${agentId}`;
+}
 
 /**
  * Remove entries from the backing store when they leave the in-memory Map
@@ -66,12 +88,12 @@ function capEntries(entries: AgentMemoryEntry[]): AgentMemoryEntry[] {
 // Initialization
 // ---------------------------------------------------------------------------
 
-export function initAgentMemory(store: Store): void {
+export async function initAgentMemory(store: Store): Promise<void> {
   backingStore = store;
 
   // Restore from persistence
   try {
-    const rows = store.all(TABLE);
+    const rows = await readAll(store, TABLE);
     for (const row of rows) {
       const entry = row as unknown as AgentMemoryEntry;
       if (!entry.agentId) continue;
@@ -100,13 +122,16 @@ export function initAgentMemory(store: Store): void {
  * Record a new learning/pattern/correction for an agent.
  */
 export function recordAgentMemory(
+  tenantId: string,
   agentId: string,
   kind: AgentMemoryEntry['kind'],
   content: string,
   source: string,
 ): AgentMemoryEntry {
+  const key = memKey(tenantId, agentId);
   const entry: AgentMemoryEntry = {
     id: `amem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    tenantId,
     agentId,
     timestamp: new Date().toISOString(),
     kind,
@@ -115,7 +140,7 @@ export function recordAgentMemory(
     relevance: 1.0,
   };
 
-  const entries = memories.get(agentId) ?? [];
+  const entries = memories.get(key) ?? [];
   entries.push(entry);
 
   // Evict oldest low-relevance entries if over limit
@@ -127,7 +152,7 @@ export function recordAgentMemory(
     deleteFromBackingStore(evicted);
   }
 
-  memories.set(agentId, entries);
+  memories.set(key, entries);
 
   // Persist immediately
   if (backingStore) {
@@ -142,8 +167,8 @@ export function recordAgentMemory(
 /**
  * Get all memory entries for an agent, sorted by relevance.
  */
-export function getAgentMemory(agentId: string): AgentMemoryEntry[] {
-  const entries = memories.get(agentId) ?? [];
+export function getAgentMemory(tenantId: string, agentId: string): AgentMemoryEntry[] {
+  const entries = memories.get(memKey(tenantId, agentId)) ?? [];
   return [...entries].sort((a, b) => b.relevance - a.relevance);
 }
 
@@ -151,8 +176,8 @@ export function getAgentMemory(agentId: string): AgentMemoryEntry[] {
  * Build a context block suitable for injecting into an agent's system prompt.
  * Returns empty string if the agent has no memories.
  */
-export function buildAgentMemoryContext(agentId: string): string {
-  const entries = getAgentMemory(agentId);
+export function buildAgentMemoryContext(tenantId: string, agentId: string): string {
+  const entries = getAgentMemory(tenantId, agentId);
   if (entries.length === 0) return '';
 
   // Take top 10 most relevant entries
@@ -171,6 +196,7 @@ export function buildAgentMemoryContext(agentId: string): string {
  * Called from persona-api after each step execution.
  */
 export function extractAndStoreMemory(
+  tenantId: string,
   agentId: string,
   executionId: string,
   stepName: string,
@@ -186,13 +212,13 @@ export function extractAndStoreMemory(
   for (const { regex, kind } of patterns) {
     let match: RegExpExecArray | null;
     while ((match = regex.exec(output)) !== null) {
-      recordAgentMemory(agentId, kind, match[1].trim(), executionId);
+      recordAgentMemory(tenantId, agentId, kind, match[1].trim(), executionId);
     }
   }
 
   // Always store a brief execution summary as a learning
   const summary = `Executed step "${stepName}" — ${output.length} chars output`;
-  recordAgentMemory(agentId, 'learning', summary, executionId);
+  recordAgentMemory(tenantId, agentId, 'learning', summary, executionId);
 }
 
 // ---------------------------------------------------------------------------
@@ -212,8 +238,8 @@ export interface AgentMemoryDocument {
 }
 
 /** Shape an agent's live memory into the adopted AgentMemory document. */
-export function getAgentMemoryDocument(agentId: string): AgentMemoryDocument {
-  const entries = getAgentMemory(agentId);
+export function getAgentMemoryDocument(tenantId: string, agentId: string): AgentMemoryDocument {
+  const entries = getAgentMemory(tenantId, agentId);
   const facts: MemoryFact[] = entries
     .filter((e) => e.kind !== 'preference')
     .map((e) => ({
@@ -255,13 +281,18 @@ export function decayMemories(decayFactor: number = 0.95): void {
 /**
  * Get summary for all agents that have memory.
  */
-export function getAllAgentMemorySnapshots(): AgentMemorySnapshot[] {
+export function getAllAgentMemorySnapshots(tenantId: string): AgentMemorySnapshot[] {
+  // Iterating the whole Map would now return every tenant's memory AND emit the
+  // composite key as an agentId. Filter on the entries' own tenantId rather than
+  // parsing the key, so the check is on the data itself.
   const snapshots: AgentMemorySnapshot[] = [];
-  for (const [agentId, entries] of memories) {
+  for (const entries of memories.values()) {
+    const mine = entries.filter(e => e.tenantId === tenantId);
+    if (mine.length === 0) continue;
     snapshots.push({
-      agentId,
-      totalEntries: entries.length,
-      entries: [...entries].sort((a, b) => b.relevance - a.relevance),
+      agentId: mine[0]!.agentId,
+      totalEntries: mine.length,
+      entries: [...mine].sort((a, b) => b.relevance - a.relevance),
     });
   }
   return snapshots;

@@ -28,15 +28,15 @@ const themeInitScript = `(function(){try{var t;var raw=window.localStorage.getIt
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
     return (
-        <html lang="en">
+        // The inline theme script sets the html class before hydration, by design.
+        <html lang="en" suppressHydrationWarning>
             <head>
                 <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
             </head>
             <body className="antialiased">
                 <ThemeProvider>
-                    <TourProvider>
-                        {children}
-                    </TourProvider>
+                    {/* The session gate wraps the app shell in page.tsx, not this layout, so the landing page stays public. */}
+                    <TourProvider>{children}</TourProvider>
                 </ThemeProvider>
             </body>
         </html>

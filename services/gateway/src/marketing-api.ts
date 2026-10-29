@@ -13,6 +13,9 @@ import { createProject, createTask, updateProject } from './marketing-program.js
 import { callLLM, type LLMProviderId } from './llm-provider.js';
 import { getAgentIdentity } from './agent-registry.js';
 import { waitForApproval } from './approval-bus.js';
+import { createPersonaExecution, getPersonaExecution, listPersonaExecutions } from './persona-api.js';
+import { getCompiledDefinition, getCompiledCatalog } from './definition-registry.js';
+import { aggregateExecutionStatus, type ExecutionStatus, type RunMode, type StepStatus } from '@agentos/skills/schema';
 
 // In-memory execution store (replace with DB in production)
 const executions = new Map<string, MarketingExecutionRecord>();
@@ -22,7 +25,10 @@ export interface MarketingExecutionRecord {
   id: string;
   workflowId: string;
   workflowName: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'paused';
+  status: ExecutionStatus;
+  tenantId?: string;
+  persona?: 'marketing';
+  mode?: RunMode;
   steps: Array<{
     stepId: string;
     stepName: string;
@@ -93,34 +99,9 @@ const CLUSTER_ICONS: Record<string, string> = {
  * ExecutionScreen can render them the same way as Engineering / Product skills.
  */
 export function getMarketingSkills() {
-  return MARKETING_WORKFLOW_REFS.map(w => {
-    const requiredTools = [...new Set(w.steps.map(s => s.tool).filter(Boolean))] as string[];
-    return {
-      id: w.id,
-      slug: w.slug,
-      name: w.name,
-      description: `${w.cluster} workflow · ${w.steps.length} step${w.steps.length > 1 ? 's' : ''}`,
-      icon: CLUSTER_ICONS[w.cluster] ?? '⚡',
-      cluster: w.cluster,
-      category: w.cluster,
-      estimatedTime: `${w.steps.length * 15}–${w.steps.length * 30}s`,
-      requiredTools,
-      steps: w.steps.map(s => ({
-        id: s.id,
-        name: s.name,
-        agent: s.agent,
-        tool: s.tool,
-        outputKey: s.outputKey,
-        requiresApproval: s.requiresApproval ?? false,
-      })),
-      inputFields: [
-        { key: 'campaign_name', label: 'Campaign / Project Name', type: 'text', required: true, placeholder: 'e.g. Q3 Product Launch' },
-        { key: 'target_audience', label: 'Target Audience', type: 'textarea', required: true, placeholder: 'Describe your ICP, industry, segments…' },
-        { key: 'objectives', label: 'Objectives & Key Messages', type: 'textarea', required: false, placeholder: 'What are the goals and core messages?' },
-        { key: 'brand_notes', label: 'Brand / Tone Notes', type: 'text', required: false, placeholder: 'e.g. Conversational, enterprise, bold…' },
-      ],
-    };
-  });
+  return getCompiledCatalog().filter(definition => definition.persona === 'marketing' && definition.id.startsWith('wf-')).map(definition => ({
+    ...definition, category: definition.cluster, inputFields: definition.inputs.map(field => ({ ...field, key: field.id })),
+  }));
 }
 
 export interface ExecutionPreCheck {
@@ -145,7 +126,14 @@ export function preCheckExecution(workflowId: string, simulate?: boolean): Execu
 // Execution Creation
 // ---------------------------------------------------------------------------
 
-export function createMarketingExecution(
+export async function createMarketingExecution(tenantId: string, workflowId: string, inputs: Record<string, unknown>, userId: string, simulate?: boolean, customPrompt?: string, provider?: LLMProviderId, modelId?: string): Promise<MarketingExecution> {
+  const definition = getCompiledDefinition(workflowId, 'marketing');
+  if (!definition) throw new Error(`Workflow not found: ${workflowId}`);
+  const run = await createPersonaExecution(tenantId, 'marketing', definition, inputs, userId, simulate, customPrompt, provider, modelId);
+  return { ...run, persona: 'marketing', workflowId: run.skillId, workflowName: run.skillName };
+}
+
+function createLegacyMarketingExecution(
   workflowId: string,
   inputs: Record<string, unknown>,
   userId?: string,
@@ -176,6 +164,7 @@ export function createMarketingExecution(
     id,
     workflowId: workflow.id,
     workflowName: workflow.name,
+    mode: simulate === true ? 'simulation' : 'live',
     status: 'queued',
     steps,
     outputs: {},
@@ -240,7 +229,11 @@ export function createMarketingExecution(
 /**
  * Call AI model for content generation via multi-LLM provider.
  * Supports Anthropic, OpenAI, Gemini, Azure OpenAI, and Ollama.
- * Falls back to a rich placeholder if no API keys are configured.
+ *
+ * Throws if no provider is configured or all providers fail — it does not fall
+ * back to placeholder content. Simulated output is an explicit choice made by
+ * the caller via the `simulate` flag, which routes to
+ * `generateMarketingSandboxOutput()` and is labelled as simulated.
  */
 async function callAI(systemPrompt: string, userPrompt: string, provider?: LLMProviderId, modelId?: string): Promise<string> {
   const response = await callLLM({
@@ -251,12 +244,6 @@ async function callAI(systemPrompt: string, userPrompt: string, provider?: LLMPr
     maxTokens: 4096,
   });
   return response.content;
-}
-
-/** Generate a realistic placeholder when no API key is configured */
-function generatePlaceholderOutput(prompt: string): string {
-  const topic = prompt.slice(0, 120).trim();
-  return `# AI-Generated Content\n\n*Note: Configure an API key (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) in gateway environment to enable real AI generation.*\n\n**Task context:** ${topic}\n\n## Sample Output Structure\n\nThis section would contain AI-generated marketing content specific to your inputs. The content would be:\n\n- Tailored to your target audience and objectives\n- Formatted and ready to use across channels\n- Optimized based on best practices for the workflow type\n\n## Next Steps\n\n1. Add your API key to the gateway environment variables\n2. Re-run this workflow to generate real content\n3. Review and approve outputs before publishing\n\n*Generated by AgentOS Marketing Engine*`;
 }
 
 // ---------------------------------------------------------------------------
@@ -905,6 +892,7 @@ async function processExecutionSteps(
         await new Promise((r) => setTimeout(r, 600 + Math.random() * 800));
         output = generateMarketingSandboxOutput(step, workflow.name, inputs, stepOutputs);
       } else {
+        if (step.tool && step.tool !== 'Claude' && step.tool !== 'llm') throw new Error('Legacy tool step has no validated live adapter');
         // Build prompt from step context and user inputs
         const { system, user } = buildStepPrompt(step, workflow.name, inputs, stepOutputs, customPrompt);
         // Inject agent identity into system prompt if available
@@ -958,7 +946,7 @@ async function processExecutionSteps(
         updateMarketingExecution(execId, { status: 'running' });
       } else {
         updateMarketingExecutionStep(execId, step.id, {
-          status: 'completed',
+          status: simulate ? 'simulated' : 'completed',
           completedAt: new Date().toISOString(),
           outputPreview: output.slice(0, 300),
           outputKey,
@@ -974,7 +962,8 @@ async function processExecutionSteps(
         error: message,
         completedAt: new Date().toISOString(),
       });
-      // Continue to next step rather than failing the whole workflow
+      // A failed dependency must stop downstream work
+      break;
     }
   }
 
@@ -985,8 +974,8 @@ async function processExecutionSteps(
   const allDone = allSteps.every((s) => ['completed', 'failed', 'approval_required'].includes(s.status));
 
   updateMarketingExecution(execId, {
-    status: allDone && !anyFailed ? 'completed' : anyFailed ? 'completed' : 'running',
-    completedAt: allDone ? new Date().toISOString() : undefined,
+    status: aggregateExecutionStatus(allSteps.map(step => step.status as StepStatus), simulate ? 'simulation' : 'live'),
+    completedAt: new Date().toISOString(),
   });
 }
 
@@ -995,7 +984,8 @@ async function processExecutionSteps(
 // ---------------------------------------------------------------------------
 
 export function getMarketingExecution(id: string): MarketingExecution | undefined {
-  return executions.get(id);
+  const run = getPersonaExecution(id);
+  return run?.persona === 'marketing' ? { ...run, persona: 'marketing', workflowId: run.skillId, workflowName: run.skillName } : executions.get(id);
 }
 
 export function updateMarketingExecution(id: string, updates: Partial<MarketingExecution>): MarketingExecution | undefined {
@@ -1020,7 +1010,7 @@ export function updateMarketingExecutionStep(
 }
 
 export function getRecentMarketingExecutions(limit = 20): MarketingExecution[] {
-  return Array.from(executions.values())
+  return [...Array.from(executions.values()), ...listPersonaExecutions('marketing', limit).map(run => ({ ...run, persona: 'marketing' as const, workflowId: run.skillId, workflowName: run.skillName }))]
     .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
     .slice(0, limit);
 }

@@ -132,8 +132,11 @@ export async function exchangeOAuthCode(
  * used, otherwise redirects to the ConnectionsHub with a success/error flash.
  */
 export function renderOAuthResultHtml(toolId: string, success: boolean, message?: string): string {
-  const safeMsg = (message ?? '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const title = success ? `${toolId} connected` : `${toolId} connection failed`;
+  const escape = (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const js = (value: string | boolean) => JSON.stringify(value).replace(/</g, '\\u003c');
+  const origin = new URL(process.env.FRONTEND_URL ?? 'http://localhost:3010').origin;
+  const safeMsg = escape(message ?? '');
+  const title = escape(success ? `${toolId} connected` : `${toolId} connection failed`);
   const color = success ? '#16a34a' : '#dc2626';
   return `<!doctype html>
 <html>
@@ -148,11 +151,11 @@ export function renderOAuthResultHtml(toolId: string, success: boolean, message?
 <body>
   <h1>${title}</h1>
   ${safeMsg ? `<div class="msg">${safeMsg}</div>` : ''}
-  <a href="/conn-ai-models">Back to Connections</a>
+  <a href="${origin}/conn-ai-models">Back to Connections</a>
   <script>
     try {
       if (window.opener) {
-        window.opener.postMessage({ type: 'oauth-result', toolId: ${JSON.stringify(toolId)}, success: ${success}, message: ${JSON.stringify(message ?? '')} }, '*');
+        window.opener.postMessage({ type: 'oauth-result', toolId: ${js(toolId)}, success: ${js(success)}, message: ${js(message ?? '')} }, ${js(origin)});
         setTimeout(() => window.close(), 1500);
       }
     } catch (e) { /* ignore */ }

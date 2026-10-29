@@ -11,9 +11,26 @@
  * Provenance: 50 68 61 6e 69 20 4d 61 72 75 70 61 6b 61
  */
 
+import './load-env.js';
 import { InMemoryStore, SessionRepository, ExecutionRepository, executeQuery, classifyIntent } from './core.js';
 import { PersistentStore, PostgresStore } from './db.js';
-import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT } from './auth.js';
+import { createStore } from '@agentos/db/create-store';
+import { loadEnvOrExit } from '@agentos/config';
+import { isPublicPath } from './public-paths.js';
+import { bindDeploymentTenant, deploymentTenant } from './deployment-tenant.js';
+import {
+  initApiKeyStore,
+  lookupApiKey,
+  persistApiKey as persistApiKeyToStore,
+  listApiKeysForUser,
+  API_KEY_TABLE,
+} from './api-key-store.js';
+import { boundedKeyExpiry, resolveApiKeyScopes, resolvePostgresApiKey, revokeApiKey, rotateApiKey } from './api-key-lifecycle.js';
+import { runSetup, SETUP_TABLE } from './setup.js';
+import { authenticateRequest, requirePersonaAccess, requireRole, generateJWT, setApiKeyResolver, setSessionResolver, hashApiKey, isDemoPrincipal, isDemoVisitor, demoPrincipalPermitted, localDemoUser, DEMO_PRINCIPAL_PREFIX, LOCAL_DEMO_PRINCIPAL_ID, DEMO_DISABLED_ERROR } from './auth.js';
+import { DemoTenantMissingError, localDemoProvisioner, provisionDemoUser } from './demo-principals.js';
+import { localDemoVerdict, parseTrustedProxies } from './request-origin.js';
+import { initAuthSessions, createBrowserSession, refreshBrowserSession, getSessionUser, getRefreshUser, revokeBrowserSession, issueLoginCode, consumeLoginCode, readCookie, cookie, setSessionCookies, setSessionRevocationHandler, persistOidcUser, setPrincipalResolver } from './auth-sessions.js';
 import type { AuthUser } from './auth.js';
 import { PromptStore } from './prompt-library-data.js';
 import { CapabilityGraph } from './capability-graph.js';
@@ -46,7 +63,7 @@ import * as marketingApi from './marketing-api.js';
 import { getProject, getProjectTasks, getRecentProjects } from './marketing-program.js';
 import { getCampaignGraph } from './campaign-graph.js';
 import { getMarketingToolConnections, getToolConnectionStatus, connectTool, disconnectTool, testToolConnection, MARKETING_TOOL_CATALOG } from './marketing-tool-connections.js';
-import { getToolConnectFlow, shouldRedirectToOAuth } from './tool-connect-flows.js';
+import { getToolConnectFlow, shouldRedirectToOAuth, beginToolAuthorization, consumeToolAuthorization } from './tool-connect-flows.js';
 import { exchangeOAuthCode, renderOAuthResultHtml } from './oauth-callback.js';
 import { getNotificationConfig, setNotificationConfig } from './marketing-notifications.js';
 import { ENGINEERING_SKILLS, getEngineeringSkill, getEngineeringSkillsByCluster } from './engineering-skills-data.js';
@@ -54,16 +71,36 @@ import { PRODUCT_SKILLS, getProductSkill, getProductSkillsByCluster } from './pr
 import { HR_SKILLS, getHRSkill, getHRSkillsByCluster } from './hr-skills-data.js';
 import { TA_SKILLS, getTASkill, getTASkillsByCluster } from './ta-skills-data.js';
 import { PROGRAM_SKILLS, getProgramSkill, getProgramSkillsByCluster } from './program-skills-data.js';
-import { createPersonaExecution, getPersonaExecution, listPersonaExecutions, approvePersonaStep, getAgentKPIs, getAgentKPI, initPersonaStore, getExecutionStats, getAllExecutions, getAfterActionReport, listAfterActionReports, getRetrainingFlags, getRetrainingFlag, acknowledgeRetrainingFlag, dismissRetrainingFlag, runSkillExecution } from './persona-api.js';
-import { startWorkers, registerTaskHandler } from './task-worker.js';
+import { createPersonaExecution, getPersonaExecution, listPersonaExecutions, approvePersonaStep, getAgentKPIs, getAgentKPI, initPersonaStore, getExecutionStats, getAllExecutions, getAfterActionReport, listAfterActionReports, getRetrainingFlags, getRetrainingFlag, acknowledgeRetrainingFlag, dismissRetrainingFlag, runSkillExecution, runDurableExecution, configureRuntimeRepository, configureUsageRepository, configureIntegrationRuntime, configurePlatformRuntime } from './persona-api.js';
+import { startWorkers, startDurableWorkers, stopWorkers, registerTaskHandler } from './task-worker.js';
+import { PostgresRunRepository } from '@agentos/db/run-repository';
+import { PostgresWorkspaceRepository } from '@agentos/db/workspace-repository';
+import { PostgresIntegrationRepository } from '@agentos/db/integration-repository';
+import { ConnectorService, vaultResolver, compileConnectorManifest } from './connector-service.js';
+import { isIntegrationRoute, integrationRequest } from './integration-api.js';
+import { attachmentDisposition } from './artifact-ingestion.js';
+import { PlatformRepository } from '@agentos/db/platform-repository';
+import { isPlatformRoute, platformRequest } from './platform-api.js';
+import { RequestMeasurements, resolvePlatformPrincipal } from './platform-observability.js';
+import { describeWorkflowSupport, inspectStarterYaml } from './workflow-certification.js';
+import { isWorkspaceRoute, workspaceRequest } from './workspace-api.js';
+import { PostgresScheduleRepository } from '@agentos/db/schedule-repository';
+import { isScheduleRoute, scheduleRequest } from './schedule-api.js';
+import { isLegacySchedulerWrite, legacySchedulerRequest } from './legacy-scheduler-api.js';
+import { getCompiledCatalog, getCompiledDefinition, requiredPersonas } from './definition-registry.js';
+import { executionOpenApi, ExecutionListQuerySchema } from './execution-api-contract.js';
 import { getQueueStats, listTasks, getTask, cancelTask as cancelQueueTask, retryTask as retryQueueTask } from './task-queue.js';
-import { createSession as createChatSession, getSession as getChatSession, listSessions as listChatSessions, archiveSession as archiveChatSession, listMessages as listChatMessages } from './chat-store.js';
-import { postMessage as postChatMessage } from './chat-engine.js';
+import { createSession as createChatSession, getSession as getChatSession, listSessions as listChatSessions, archiveSession as archiveChatSession, listMessages as listChatMessages, configureChatRepository } from './chat-store.js';
+import { postMessage as postChatMessage, configureChatExecutionAdapter } from './chat-engine.js';
+import { submitChatExecution } from './orchestration-adapters.js';
+import { isEntrypointRoute, entrypointRequest } from './entrypoint-api.js';
 import { getFsSkills, reloadFsSkills, getAllFsSkills, warmAllFsSkills } from './skill-fs-loader.js';
-import { runReviewPipeline, getReviewChain } from './review-pipeline.js';
+import { adoptedSkillPersona, synthesizeAdoptedSkill } from './adopted-skills.js';
+import { runReviewPipeline, getReviewChain, REVIEW_DEADLINE_MS } from './review-pipeline.js';
 import { ORCHESTRATOR_PROMPT, ORCHESTRATOR_PROMPT_PLACEHOLDERS } from './prompts/orchestrator-prompt.js';
 import type { AfterActionReport, RetrainingFlag } from './persona-api.js';
-import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey } from './llm-provider.js';
+import { getAvailableProviders, getDefaultProvider, hasAnyLLMKey, listPricedModels } from './llm-provider.js';
+import { resolveSimulate as decideSimulation } from './run-mode.js';
 import { getFullRegistry, getAgentIdentity, getAgentsByPersona, getCSuiteAgents, getAllCSuiteProfiles, getCSuiteProfile, getChainOfCommand, getOrgTree } from './agent-registry.js';
 import { processCognitivePipeline, decompose, reason, reflect, groundCheck, getCognitiveResult, getCognitiveTrace, type CognitiveRequest } from './cognitive-pipeline.js';
 import { eventBus } from './event-bus.js';
@@ -72,15 +109,15 @@ import { PipelineEngine, getPipelineExecution, listPipelineExecutions, cancelPip
 import { pluginRegistry } from './plugin-interfaces.js';
 import { createVision, getVision, listVisions, decomposeVision, cascadeToRegiment, createProgram, getProgram, listPrograms, updateProgram, generatePMOStatusReport, getVisionStatus, initVisionStore } from './vision-api.js';
 import type { VisionStatement, ProgramRecord } from './vision-api.js';
-import { createChannel, getChannel, listChannels, updateChannel, deleteChannel, createRule, getRule, listRules, updateRule, deleteRule, dispatch, dispatchByTrigger, getDeliveryLog, getDelivery, getDeliveryStats, initNotificationStore } from './notification-dispatch.js';
-import { createEndpoint, getEndpoint, listEndpoints, deleteEndpoint, createSubscription, getSubscription, listSubscriptions, deleteSubscription, receiveWebhook, getInboundLog, initWebhookStore } from './webhook-connector.js';
+import { createChannel, getChannel, listChannels, updateChannel, deleteChannel, createRule, getRule, listRules, updateRule, deleteRule, dispatch, dispatchByTrigger, getDeliveryLog, getDelivery, getDeliveryStats, initNotificationStore, redactChannel } from './notification-dispatch.js';
+import { createEndpoint, getEndpoint, listEndpoints, deleteEndpoint, createSubscription, getSubscription, listSubscriptions, deleteSubscription, receiveWebhook, getInboundLog, initWebhookStore, redactEndpoint, redactSubscription } from './webhook-connector.js';
 import { wireNotificationBridge } from './notification-bridge.js';
 import { createExperiment, getExperiment, listExperiments, updateExperiment, transitionExperiment, addExperimentResult, scoreExperiment, deleteExperiment, createHackathon, getHackathon, listHackathons, startHackathon, completeHackathon, addExperimentToHackathon, requestGraduation, reviewGraduation, listGraduations, getInnovationBacklog, initInnovationStore } from './innovation-labs.js';
 import { setBudget, getBudget, listBudgets, deleteBudget, recordSpend, getSpendLog, getBurnRate, listAlerts as listCostAlerts, acknowledgeAlert, getCFODashboard, initBudgetStore } from './budget-intelligence.js';
 import { createReview, getReview, listReviews, createPlan, getPlan, listPlans, updatePlanStatus, updateObjective, submitFeedback, listFeedback, getFeedbackSummary, addExemplar, listExemplars, deleteExemplar, getAgentHealthReport, initImprovementStore } from './agent-improvement.js';
 import { registerStore, initGatewayPersistence, flushGatewayPersistence } from './gateway-persistence.js';
 import { approve as approveViaBus, reject as rejectViaBus, listPending as listPendingApprovals, getDecision as getApprovalDecision, getApprovalSlaSummary } from './approval-bus.js';
-import { getTenantId, withTenantContext, setTenantContext } from './tenant-middleware.js';
+import { withTenantContext } from './tenant-middleware.js';
 import { createPolicy, updatePolicy, deletePolicy, getPolicy, listPolicies, checkPolicy, seedExamplePolicies } from './policy-store.js';
 import { redact as redactPII, containsPII } from './pii-redactor.js';
 import { contributeExecution, getContributionLog, getContributionStats } from './benchmark-ingest.js';
@@ -110,18 +147,67 @@ import { getAgentMemory, getAllAgentMemorySnapshots, recordAgentMemory, getAgent
 // import { executeWorkflow, getWorkflowExecution, resumeWorkflow } from './workflow-bridge.js';
 import { initOTel, shutdownOTel } from '@agentos/observability';
 import { validate, ValidationError, ExecuteSchema, GoalSchema, A2AMessageSchema, UTCPPacketSchema } from './validation.js';
-import { attachWebSocket, broadcastEvent, getWSClientCount, getWSMetrics } from './ws.js';
+import { attachWebSocket, broadcastEvent, getWSClientCount, getWSMetrics, disconnectStreamUser, closeWebSockets, streamChannelKey } from './ws.js';
+import { issueStreamTicket, canReadStreamResource, isAllowedBrowserOrigin } from './stream-access.js';
 import http from 'node:http';
 import fs from 'node:fs';
 import nodePath from 'node:path';
-import { createHash as nodeCreateHash } from 'node:crypto';
+import { createHash as nodeCreateHash, randomBytes, randomUUID } from 'node:crypto';
 import { URL } from 'node:url';
 import { fileURLToPath } from 'node:url';
 
-// Store selection: DATABASE_URL → Postgres, PERSIST=false → In-memory, default → File-backed
-const usePostgres = !!process.env.DATABASE_URL;
-const useInMemory = process.env.PERSIST === 'false';
-const store = usePostgres ? new PostgresStore() : useInMemory ? new InMemoryStore() : new PersistentStore();
+// ── Configuration ────────────────────────────────────────────────────────────
+// Validated first, and BEFORE any module that could fail on a missing value.
+// Prints a set/missing table and exits 78 (EX_CONFIG) on a real problem instead
+// of throwing during module evaluation, which produced no log line and an
+// invisible container restart loop.
+const env = loadEnvOrExit();
+
+// ── Process-level failure handlers ───────────────────────────────────────────
+// There were none. Node's default for an unhandled rejection is to print the
+// reason and exit, so a single floating promise anywhere — and there are many,
+// e.g. `void this.insertAsync(...)` in PostgresStore — took the whole gateway
+// down with no context about which request or subsystem caused it.
+//
+// These log with context and keep serving. That is the right trade for a
+// long-lived server: one dropped background task must not end every in-flight
+// request. A crash-only policy would be defensible if the queue were durable and
+// work resumed on restart — it is not yet (Phase 5/6), so exiting loses work.
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  console.error(`[server] UNHANDLED REJECTION: ${err.message}\n${err.stack ?? ''}`);
+});
+
+process.on('uncaughtException', (err) => {
+  // An uncaught exception means an unknown amount of state is now inconsistent.
+  // Log it fully, then let the supervisor restart us rather than continuing in a
+  // state we cannot reason about.
+  console.error(`[server] UNCAUGHT EXCEPTION — exiting: ${err.message}\n${err.stack ?? ''}`);
+  process.exit(1);
+});
+
+// ── Store selection ──────────────────────────────────────────────────────────
+// `createStore()` never throws. It degrades — Postgres → file → ephemeral — and
+// reports why, so an unwritable data directory or an unreachable database yields
+// a running process that can be diagnosed rather than a boot crash.
+//
+// `PERSIST` is gone: it only ever compared against the literal string 'false',
+// so `PERSIST=true` was a no-op and docker-compose.production.yml set exactly
+// that. Storage is now chosen by DATABASE_URL and DATA_DIR.
+const storeResult = createStore({
+  databaseUrl: env.DATABASE_URL,
+  dataDir: env.DATA_DIR,
+  postgresFactory: () => new PostgresStore(),
+});
+const store = storeResult.store;
+const usePostgres = storeResult.mode === 'postgres';
+
+console.log(
+  `[server] persistence: ${storeResult.mode}${storeResult.path ? ` (${storeResult.path})` : ''}`,
+);
+if (storeResult.degradedReason) {
+  console.warn(`[server] PERSISTENCE DEGRADED: ${storeResult.degradedReason}`);
+}
 
 // Raw pg.Pool for direct queries (API keys, tenant GUC, audit persistence).
 // Only available when DATABASE_URL is set; undefined otherwise.
@@ -132,24 +218,178 @@ let pgPool: {
     connect(): Promise<{ query(...args: any[]): Promise<any>; release(): void }>;
 } | undefined;
 if (usePostgres) {
-    import('@agentos/db/postgres-store').then(m => m.getRawPool()).then(p => { pgPool = p as any; restoreAuditFromDb().catch(() => {}); }).catch(() => {});
+    const { getRawPool } = await import('@agentos/db/postgres-store');
+    pgPool = await getRawPool() as unknown as typeof pgPool;
 }
+// ── API key resolution ───────────────────────────────────────────────────────
+// `resolveApiKey` in @agentos/auth previously returned undefined unconditionally
+// in production — its own comment said "no API key can authenticate in
+// production". Combined with the anonymous fallback being off and the token
+// endpoint sitting behind the auth gate, production had no way to mint or use a
+// credential at all.
+//
+// The resolver is injected so @agentos/auth keeps no database dependency: it is
+// imported very early and must not be able to fail on a driver or a connection.
+setApiKeyResolver(async (rawKey: string) => {
+  if (!/^ak_[a-f0-9]{64}$/.test(rawKey)) return undefined;
+  // No relational store → read the file/ephemeral key store instead.
+  //
+  // This used to `return undefined` here, which meant the default deployment
+  // (no DATABASE_URL) could not authenticate anyone at all: the anonymous
+  // fallback is off by default, so every request 401'd and the key minted by
+  // POST /api/setup was unusable the moment it was handed out.
+  if (!pgPool) return lookupApiKey(rawKey);
+  try {
+    // Resolved through a SECURITY DEFINER function (migration 007), not a direct
+    // SELECT.
+    //
+    // Migration 005 put row-level security on api_keys and users with
+    // `tenant_id = current_setting('app.tenant_id', TRUE)`. That GUC is unset
+    // here — and cannot be set, because the tenant is not known until the key is
+    // resolved; the row is what tells us the tenant. current_setting returns
+    // NULL when unset, so the predicate was NULL rather than true and the direct
+    // query returned zero rows for every key ever presented.
+    //
+    // The function takes a hash, never a raw key, so a database dump still
+    // contains no usable credential and the lookup cannot be used to enumerate.
+    // resolvePostgresApiKey then reads the key's expiry under the tenant it named,
+    // and moves a key found under a pre-API_KEY_HASH_SECRET hash onto the current one.
+    return await resolvePostgresApiKey(pgPool, rawKey);
+  } catch (err) {
+    // A lookup failure must deny, never fall through to a weaker check.
+    console.error('[auth] API key lookup failed:', (err as Error).message);
+    return undefined;
+  }
+});
+
+// Bind the file/ephemeral key store. Must happen before any request is served,
+// because the resolver above reads through it whenever pgPool is absent.
+const deploymentTenantId = deploymentTenant();
+let deploymentBindingError: string | undefined;
+const verifyDeploymentStorage = async () => {
+    if (pgPool && env.NODE_ENV === 'production') {
+        const role = (await pgPool.query('SELECT r.rolsuper,r.rolbypassrls,(r.oid=d.datdba) AS owner FROM pg_roles r JOIN pg_database d ON d.datname=current_database() WHERE r.rolname=current_user')).rows[0];
+        if (!role || role.rolsuper || role.rolbypassrls || role.owner) throw new Error('Use a non-owner application database role without BYPASSRLS; migration credentials must stay separate');
+    }
+    if (pgPool) await pgPool.query('SELECT c.secret_version,c.binding_hash,c.config,a.expires_at FROM workspace_connections c JOIN input_artifacts a ON FALSE JOIN runtime_tool_receipts t ON FALSE JOIN integration_audit i ON FALSE');
+    if (pgPool) await pgPool.query('SELECT p.revision,d.version,m.state,e.stream_sequence,n.execution_run_id FROM platform_registry_packages p JOIN platform_datasets d ON FALSE JOIN platform_memberships m ON FALSE JOIN runtime_events e ON FALSE JOIN platform_http_metrics h ON FALSE JOIN platform_event_offsets o ON FALSE JOIN runtime_deliveries n ON FALSE JOIN runtime_connector_observations co ON FALSE');
+    await bindDeploymentTenant(store, pgPool);
+};
+// The 503 body stays generic (it reaches unauthenticated callers); the cause goes to
+// the log. Both used to be generic, so a misconfigured deployment said nothing at all
+// about why every route answered 503. Logged once per distinct cause, not every 5s.
+let storageCause: string | undefined;
+const reportStorageCause = (error: unknown) => {
+    const cause = error instanceof Error ? error.message : String(error);
+    if (cause !== storageCause) console.error(`[server] DEPLOYMENT STORAGE NOT VERIFIED — ${cause}. Every route but the probes answers 503; retrying every 5s.`);
+    storageCause = cause;
+};
+try { await verifyDeploymentStorage(); } catch (error) {
+    if (!pgPool) throw error;
+    deploymentBindingError = 'Deployment storage ownership or application role is not yet verified';
+    reportStorageCause(error);
+}
+if (pgPool) {
+    let checking = false;
+    setInterval(() => {
+        if (!deploymentBindingError || checking) return;
+        checking = true;
+        // Rehydrate BEFORE lifting the 503: boot skipped it while storage was
+        // unverified, so clearing the error first would serve empty state as if
+        // it were the tenant's real (empty) data.
+        void verifyDeploymentStorage().then(rehydrateStores).then(() => {
+            deploymentBindingError = undefined;
+            storageCause = undefined;
+            console.log('[server] deployment storage verified; serving requests');
+        }).catch(reportStorageCause).finally(() => { checking = false; });
+    }, 5000).unref();
+}
+// The local demo principal acts without a session, so it must exist as a user before
+// its first run. Provisioned on its own — not inside the storage check above, where a
+// missing tenant became a silent permanent 503 that also blocked POST /api/setup, the
+// route that creates the tenant. See localDemoProvisioner.
+const ensureLocalDemoUser = localDemoProvisioner(env.EAOS_DEMO_MODE === 'local' ? pgPool : undefined, localDemoUser());
+if (!deploymentBindingError) await ensureLocalDemoUser();
+// Explicit list of proxies whose X-Forwarded-For names the client (request-origin.ts).
+const trustedProxies = parseTrustedProxies(env.EAOS_TRUSTED_PROXIES);
+const runRepository = pgPool ? new PostgresRunRepository(pgPool) : undefined;
+configureRuntimeRepository(runRepository);
+const workspaceRepository = pgPool ? new PostgresWorkspaceRepository(pgPool) : undefined;
+configureChatRepository(workspaceRepository);
+configureChatExecutionAdapter(submitChatExecution);
+configureUsageRepository(workspaceRepository);
+const integrationRepository = pgPool ? new PostgresIntegrationRepository(pgPool) : undefined;
+const connectors = workspaceRepository && integrationRepository ? new ConnectorService(workspaceRepository, integrationRepository, vaultResolver(integrationRepository)) : undefined;
+configureIntegrationRuntime(integrationRepository, connectors);
+const platformRepository = pgPool ? new PlatformRepository(pgPool, compileConnectorManifest) : undefined;
+configurePlatformRuntime(platformRepository);
+const requestMeasurements = platformRepository ? new RequestMeasurements(platformRepository) : undefined;
+setPrincipalResolver(user => resolvePlatformPrincipal(platformRepository, user));
+const scheduleRepository = pgPool && runRepository ? new PostgresScheduleRepository(pgPool, runRepository) : undefined;
+initApiKeyStore(store);
+initAuthSessions(store, pgPool);
+setSessionResolver(getSessionUser);
+setSessionRevocationHandler(disconnectStreamUser);
+
 const sessions = new SessionRepository(store);
 const executions = new ExecutionRepository(store);
-initPersonaStore(store); // Wire persona executions & KPIs to persistent backing store
-initVisionStore(store); // Wire vision statements, programs & OKRs to persistent store
-initNotificationStore(store); // Wire notification channels, rules & delivery log
-initWebhookStore(store); // Wire webhook endpoints & subscriptions (also re-wires outbound subscriptions to event bus)
+// ── Store rehydration ────────────────────────────────────────────────────────
+// These are AWAITED. They were synchronous calls into `store.all()`, which
+// `PostgresStore` throws from by design — so setting DATABASE_URL, the documented
+// production configuration, crashed the gateway during module evaluation. They
+// now read through `readAll()`, which handles both store shapes.
+//
+// Awaited in parallel because they touch disjoint tables, and awaited at all
+// because an un-awaited restore races the first request: the gateway would serve
+// an empty execution list and then quietly fill it in.
+//
+// Top-level await is available here (ESM + NodeNext), so this needs no wrapper.
+//
+// Failures are caught. An unreachable database at boot is transient and does not
+// warrant refusing to start — a process that is up can report why it is unhealthy,
+// whereas one that exits before opening a port cannot be diagnosed at all. But it
+// must never be silent, so the reason is recorded and reported.
+let rehydrationError: string | undefined;
+// Hoisted so the storage-recovery loop above can run it once the database is
+// verified; at boot it runs only when storage verified first time.
+async function rehydrateStores(): Promise<void> {
+  rehydrationError = undefined;
+  try {
+    await Promise.all([
+      initPersonaStore(store),      // persona executions, KPIs, AARs, retraining flags, agent memory
+      initVisionStore(store),       // vision statements, programs & OKRs
+      initNotificationStore(store), // notification channels, rules & delivery log
+      initWebhookStore(store),      // webhook endpoints & subscriptions
+    ]);
+  } catch (err) {
+    rehydrationError = (err as Error).message;
+    console.error(
+      `[server] REHYDRATION FAILED: ${rehydrationError}\n` +
+        '[server] The gateway is running but started with EMPTY state. Existing executions, ' +
+        'KPIs and webhooks were not restored. Do not treat this instance as healthy.',
+    );
+  }
+  try {
+    await Promise.all([
+      initInnovationStore(store),  // innovation labs experiments, hackathons & graduations
+      initBudgetStore(store),      // agent budgets, spend log & cost alerts
+      initImprovementStore(store), // performance reviews, improvement plans & feedback
+    ]);
+  } catch (err) {
+    rehydrationError ??= (err as Error).message;
+    console.error(`[server] REHYDRATION FAILED (secondary stores): ${(err as Error).message}`);
+  }
+}
+if (!deploymentBindingError) await rehydrateStores();
 wireNotificationBridge(); // Wire event bus patterns → notification dispatch
-initInnovationStore(store); // Wire innovation labs experiments, hackathons & graduations
-initBudgetStore(store); // Wire agent budgets, spend log & cost alerts
-initImprovementStore(store); // Wire performance reviews, improvement plans & feedback
 initAgentStatusReconciler(); // Wire agent status reconciler (subscribes to execution events + 5s ground-truth sweep)
 initSlackNotifier();          // Post execution.completed summaries to SLACK_WEBHOOK_URL for hero workflows
 
 // Seed a consistent demo scenario so first-run dashboards show realistic data.
-// Skipped when real executions already exist, or when SEED_DEMO=false is set.
-if (process.env.SEED_DEMO !== 'false') {
+// Skipped when real executions already exist. Opt-IN via SEED_DEMO=true: it used
+// to be opt-out, so any deployment that did not explicitly disable it served demo
+// data as if it were the tenant's own.
+if (env.SEED_DEMO) {
   try { seedDemoScenario(); } catch (err) { console.warn('[server] demo seed failed:', (err as Error).message); }
   try { seedExamplePolicies(); } catch (err) { console.warn('[server] policy seed failed:', (err as Error).message); }
 }
@@ -166,12 +406,24 @@ eventBus.on('execution.completed', async (event) => {
 
 // Bridge agent status changes to WebSocket clients on the "agents" channel
 subscribeToAgentStatus((record) => {
-  try { broadcastEvent('agents', 'agent.status.changed', record as unknown as Record<string, unknown>); } catch {}
+  try { broadcastEvent('agents', 'agent.status.changed', record as unknown as Record<string, unknown>, deploymentTenantId); } catch {}
 });
 
 // Register task handlers and start workers (Phase 3 — Task Queue with atomic claim)
 registerTaskHandler('runSkillExecution', runSkillExecution);
-startWorkers({ workerCount: 4, maxConcurrentPerAgent: 2, maxConcurrentPerPersona: 8 });
+if (runRepository && pgPool) {
+    let tenants: string[] = [];
+    let checkedAt = 0;
+    startDurableWorkers({ repository: runRepository, execute: runDurableExecution,
+        schedule: async tenantId => { await scheduleRepository!.dispatchDue(tenantId); },
+        tenants: async () => {
+            if (deploymentBindingError) return [];
+            if (Date.now() - checkedAt > 5000) { tenants = (await pgPool!.query('SELECT id FROM tenants')).rows.map((row: { id: string }) => row.id); checkedAt = Date.now(); }
+            return tenants;
+        },
+        deliver: async event => { broadcastEvent(event.runId, event.type, { ...event.data, eventId: event.id, tenantId: event.tenantId }, event.tenantId); },
+    });
+} else startWorkers({ workerCount: 4, maxConcurrentPerAgent: 2, maxConcurrentPerPersona: 8 });
 const promptStore = new PromptStore();
 const capabilityGraph = new CapabilityGraph();
 const personaSystem = new PersonaSystem();
@@ -194,38 +446,12 @@ setMcpResolver(async (action) => {
   const toolName = String(params.__mcp_tool ?? action.resource_type ?? action.action);
   delete params.__mcp_tool;
   const r = await mcpManager.callTool(action.tool_id, toolName, params);
-  if (!r.ok) return null; // fall back to legacy connectors / simulation on MCP failure
+  if (!r.ok) throw new Error(r.error ?? 'MCP tool call failed'); // Never replace a failed live call with another execution path
   return r.structured ?? { mcp: true, server: r.server, tool: r.tool, content: r.content };
 });
 void mcpManager.init(loadMcpServerConfigs())
   .then((n) => { if (n > 0) console.log(`[mcp] connected ${n} MCP server(s)`); })
   .catch((err) => console.warn('[mcp] init failed:', err));
-
-/**
- * Adapt an adopted community skill (FSSkillDef) into an executable single-step
- * UnifiedSkillDef. The skill's markdown body is passed separately as the step's
- * instructions (via customPrompt) so the LLM receives the actual skill content.
- */
-function synthesizeAdoptedSkill(fs: ReturnType<typeof getAllFsSkills>[number]): any {
-  return {
-    id: fs.id,
-    slug: fs.slug,
-    name: fs.name,
-    description: fs.description || fs.name,
-    icon: '🧩',
-    persona: fs.persona,
-    executableType: 'skill',
-    cluster: fs.cluster ?? 'Adopted Skills',
-    complexity: fs.complexity ?? 'moderate',
-    estimatedTime: fs.estimatedTime ?? '~varies',
-    inputs: [{ id: 'request', label: 'Request / Context', type: 'textarea', required: false, section: 'basic', helpText: 'Optional context or target for this skill.' }],
-    steps: [{ id: `${fs.id}-s1`, order: 1, name: fs.name, agent: '', tool: 'Claude', outputKey: 'result', capability: 'content.generate' }],
-    outputs: ['result'],
-    requiredTools: ['Claude'],
-    optionalTools: fs.requiredTools ?? [],
-    tags: fs.tags ?? [],
-  };
-}
 
 // ---------------------------------------------------------------------------
 // Gateway-wide persistence — wire all ephemeral stores to backing store
@@ -293,6 +519,53 @@ registerStore('agent_memory',
 // Generic connection store for ConnectionsHub
 interface ConnectionRecord { connectorId: string; status: string; connectedAt?: string; lastTestedAt?: string; credentials?: Record<string, string>; error?: string; }
 const connectionStore = new Map<string, ConnectionRecord>();
+
+/** What a connection looks like over the wire. Structurally cannot carry a secret. */
+interface RedactedConnection {
+    connectorId: string;
+    status: string;
+    connectedAt?: string;
+    lastTestedAt?: string;
+    error?: string;
+    /** Names of the credential fields that are set. Never their values. */
+    credentialFields: string[];
+    /** Last 4 characters of the primary credential, for "is this the key I think it is?". */
+    maskedHint?: string;
+}
+
+/**
+ * Strip credentials from a connection record.
+ *
+ * `GET /api/connections` previously returned `Object.fromEntries(connectionStore)`
+ * — every stored token in plaintext, with no role check, no tenant filter and no
+ * redaction. With the anonymous fallback enabled (its old default) that was an
+ * unauthenticated credential dump for GitHub, Jira, Slack, HubSpot and the rest.
+ *
+ * Returning a redacted shape rather than deleting the field is deliberate: the
+ * operator still needs to know a credential is present and roughly which one it
+ * is, and a separate DTO means a future field added to ConnectionRecord cannot
+ * leak by being spread into a response.
+ */
+function redactConnection(rec: ConnectionRecord): RedactedConnection {
+    const fields = Object.entries(rec.credentials ?? {})
+        .filter(([, v]) => typeof v === 'string' && v.trim().length > 0)
+        .map(([k]) => k);
+
+    const primary = rec.credentials?.[fields[0] ?? ''] ?? '';
+    // Only hint when there is enough material that 4 characters are not the whole
+    // secret.
+    const maskedHint = primary.length >= 12 ? `…${primary.slice(-4)}` : undefined;
+
+    return {
+        connectorId: rec.connectorId,
+        status: rec.status,
+        connectedAt: rec.connectedAt,
+        lastTestedAt: rec.lastTestedAt,
+        error: rec.error,
+        credentialFields: fields,
+        maskedHint,
+    };
+}
 
 // Real audit log — records actual gateway operations.
 // Tamper-evident via hash-chain: each entry includes SHA-256(prev_hash || entry_json),
@@ -450,8 +723,19 @@ registerStore('agent_evals',
   }
 );
 
-initGatewayPersistence(store); // Restore all ephemeral stores from backing store
-initWorkflowStore();           // Rehydrate pipeline executions from file-backed workflow store
+if (!deploymentBindingError) await initGatewayPersistence(store, Boolean(runRepository)); // Restore legacy stores read-only when the durable runtime owns writes
+if (!deploymentBindingError) await restoreAuditFromDb();
+// Share the one Store. Previously called with no argument, which built a SECOND
+// PersistentStore over the same store.json and silently clobbered this one's
+// tables on every debounced save.
+// Rehydrate pipeline executions from the shared store. Same policy as the other
+// restore paths: report the failure, keep serving, do not exit.
+try {
+  if (!deploymentBindingError) await initWorkflowStore(store);
+} catch (err) {
+  rehydrationError ??= (err as Error).message;
+  console.error(`[server] REHYDRATION FAILED (pipeline executions): ${(err as Error).message}`);
+}
 
 const PORT = parseInt(process.env.PORT ?? '3000', 10);
 
@@ -481,23 +765,38 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     if (req.url && (req.url === '/_/gateway' || req.url.startsWith('/_/gateway/'))) {
         req.url = req.url.slice('/_/gateway'.length) || '/';
     }
+    const requestStarted = performance.now();
     const url = new URL(req.url ?? '/', `http://localhost:${PORT}`);
     const path = url.pathname;
     const method = req.method ?? 'GET';
+    if (deploymentBindingError && !['/api/live', '/api/ready', '/api/health'].includes(path)) { sendJSON(res, 503, { error: deploymentBindingError }); return; }
+    if (env.NODE_ENV === 'production' && storeResult.mode === 'ephemeral' &&
+        (!['GET', 'HEAD', 'OPTIONS'].includes(method) || path.endsWith('/callback'))) {
+        sendJSON(res, 503, { error: 'Durable storage is required for production writes' });
+        return;
+    }
 
     // CORS
-    // Allowlist read from CORS_ALLOWED_ORIGINS (comma-separated). When UNSET,
-    // fall back to '*' to preserve the dev/demo flow. When set, reflect the
-    // request Origin only if it is in the allowlist (otherwise omit the header).
-    const corsAllowedRaw = process.env.CORS_ALLOWED_ORIGINS;
+    // Allowlist read from CORS_ALLOWED_ORIGINS (comma-separated). When set,
+    // reflect the request Origin only if it is in the allowlist.
+    //
+    // When UNSET the old behaviour was `Access-Control-Allow-Origin: *` in EVERY
+    // environment, production included, which let any site on the internet make
+    // credentialed calls on a user's behalf. It now falls back to '*' only
+    // outside production, and sends no header at all in production — fail closed.
+    // @agentos/config warns at boot when it is unset in production.
+    const corsAllowedRaw = env.CORS_ALLOWED_ORIGINS;
     if (corsAllowedRaw === undefined) {
-        res.setHeader('Access-Control-Allow-Origin', '*');
+        if (env.NODE_ENV !== 'production') {
+            res.setHeader('Access-Control-Allow-Origin', '*');
+        }
     } else {
         const allowed = corsAllowedRaw.split(',').map(o => o.trim()).filter(Boolean);
         const origin = req.headers.origin;
         if (typeof origin === 'string' && allowed.includes(origin)) {
             res.setHeader('Access-Control-Allow-Origin', origin);
             res.setHeader('Vary', 'Origin');
+            res.setHeader('Access-Control-Allow-Credentials', 'true');
         }
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
@@ -509,20 +808,85 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
     for (const [key, val] of Object.entries(req.headers)) {
         headers[key.toLowerCase()] = Array.isArray(val) ? val[0] : val;
     }
-    const auth = authenticateRequest(headers);
-    if (!auth.authenticated) {
-        sendJSON(res, 401, { error: auth.error ?? 'Unauthorized' });
-        return;
+    // ── Public paths ─────────────────────────────────────────────────────────
+    // Checked BEFORE authentication. Without this the gateway was unreachable in
+    // production by construction: the auth gate ran ahead of every route, so
+    // liveness/readiness probes 401'd (containers never became healthy), and the
+    // only two ways to obtain a credential — /api/auth/token and the OIDC
+    // handshake — sat behind the very gate they were supposed to open. There was
+    // no bootstrap path at all.
+    //
+    // Exact method+path matches only. No prefixes, so this cannot accidentally
+    // widen to a subtree.
+    let auth: Awaited<ReturnType<typeof authenticateRequest>> | undefined;
+    if (path.startsWith('/api/auth/')) res.setHeader('Cache-Control', 'no-store');
+    if (!isPublicPath(method, path)) {
+        const browserCredential = !headers.authorization && !headers['x-api-key'] && (readCookie(req, 'eaos_access') || readCookie(req, 'eaos_refresh'));
+        if (browserCredential && !['GET', 'HEAD'].includes(method) && !isAllowedBrowserOrigin(req.headers.origin)) {
+            sendJSON(res, 403, { error: 'Untrusted browser origin' });
+            return;
+        }
+        if (browserCredential) {
+            const user = await getRefreshUser(readCookie(req, 'eaos_refresh'));
+            auth = { authenticated: Boolean(user), user, error: user ? undefined : 'Session expired or revoked' };
+        } else {
+            // In local demo mode a request with no credential is the administrator,
+            // so the gateway first establishes it is the developer's own (loopback
+            // client, local Host, no foreign Origin) — see localDemoVerdict.
+            auth = await authenticateRequest(headers, { localDemo: env.EAOS_DEMO_MODE === 'local' ? localDemoVerdict(req, trustedProxies) : undefined });
+        }
+        // A demo identity counts only while the mode that minted it is on.
+        // authenticateRequest enforces that for keys and tokens; the cookie session
+        // path above does not go through it, and visitor sessions last 14 days.
+        if (auth.user && !demoPrincipalPermitted(auth.user)) auth = { authenticated: false, error: DEMO_DISABLED_ERROR };
+        if (!auth.authenticated) {
+            sendJSON(res, 401, { error: auth.error ?? 'Unauthorized' });
+            return;
+        }
+        if (auth.user?.id === LOCAL_DEMO_PRINCIPAL_ID) {
+            const problem = await ensureLocalDemoUser();
+            if (problem) { sendJSON(res, 503, { error: problem }); return; }
+        }
     }
 
-    const userId = auth.user?.id ?? 'anonymous';
-    const authUser = auth.user;
+    if (auth?.user) {
+        const current = await resolvePlatformPrincipal(platformRepository, auth.user);
+        if (!current) { sendJSON(res, 403, { error: 'Tenant membership is suspended' }); return; }
+        auth.user = current;
+    }
+    const userId = auth?.user?.id ?? 'anonymous';
+    const authUser = auth?.user;
+    if (authUser && requestMeasurements) res.once('finish', () => requestMeasurements.record(authUser.tenantId, method, path, res.statusCode, Math.max(0, performance.now() - requestStarted)));
+    const tenantScopedRuntimeRoute = Boolean(runRepository && (
+        isPlatformRoute(path) || isIntegrationRoute(path, method) || isEntrypointRoute(path, method) || isWorkspaceRoute(path, method) || isScheduleRoute(path, method) || /^\/api\/chat\/sessions(?:\/[^/]+(?:\/messages)?)?$/.test(path) ||
+        ['/api/execute', '/api/executions', '/api/catalog', '/api/certification', '/api/workflows/inspect-yaml', '/api/openapi.json', '/api/classify', '/api/llm/models', '/api/auth/me', '/api/auth/token', '/api/auth/logout', '/api/auth/ws-ticket'].includes(path) ||
+        /^\/api\/users\/apikeys(?:\/[^/]+(?:\/rotate)?)?$/.test(path) ||
+        /^\/api\/(engineering|product|marketing|hr|ta|program)\/(skills|execute|executions)$/.test(path) ||
+        /^\/api\/(?:(?:engineering|product|marketing|hr|ta|program)\/)?executions\/[^/]+(?:\/(?:approve|reject)\/[^/]+|\/cancel|\/complete|\/trace|\/retry)?$/.test(path) ||
+        /^\/api\/workflows\/flagship\/[^/]+\/run$/.test(path)
+    ));
+    if (authUser && authUser.tenantId !== deploymentTenantId && !tenantScopedRuntimeRoute) {
+        sendJSON(res, 403, { error: 'Legacy endpoint is not available outside its bound deployment tenant' });
+        return;
+    }
+    if (runRepository && (!['GET', 'HEAD', 'OPTIONS'].includes(method) || /^\/api\/tools\/[^/]+\/(auth|callback)$/.test(path)) &&
+        !tenantScopedRuntimeRoute && path !== '/api/setup' && path !== '/api/review/run' && !path.startsWith('/api/auth/')) {
+        sendJSON(res, 422, { code: 'legacy_quarantined', error: 'Legacy writes require a tenant-scoped repository migration; no data was changed' }); return;
+    }
+    const chatOwner = { userId, tenantId: authUser?.tenantId ?? '' };
 
-    // Rate limiting — apply before any route processing
-    {
-        const { applyRateLimit } = await import('./rate-limiter.js');
-        const rl = applyRateLimit(res, userId, authUser?.role ?? 'unauthenticated');
-        if (rl.blocked) {
+    // Rate limiting — apply before any route processing. Unauthenticated calls key on
+    // the client as rateLimitSubject attributes it: behind the web tier's proxy the
+    // socket peer is the web server for every visitor, which made each public auth
+    // path one bucket for the whole deployment. When nothing in front of the web
+    // tier names clients, that is still true for a visitor's first calls, so those
+    // carry budgets sized for it (rate-limiter.ts unauthenticatedBudget).
+    if (!['/api/live', '/api/ready', '/api/health'].includes(path)) {
+        const { applyRateLimit, applyUnauthenticatedRateLimit } = await import('./rate-limiter.js');
+        const rl = authUser
+            ? applyRateLimit(res, `${authUser.tenantId}:${userId}`, authUser.role)
+            : applyUnauthenticatedRateLimit(res, req, method, path, trustedProxies);
+        if (rl?.blocked) {
             sendJSON(res, 429, { error: 'Rate limit exceeded', resetInMs: rl.resetInMs });
             return;
         }
@@ -560,35 +924,150 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
      *   - the user role is admin/operator.
      * Only in production, for a concrete non-admin user, do we enforce ownership.
      */
+    if (/^\/api\/(queue|approvals|notifications|webhooks|events|utcp|a2a|observability|governance|budget|improvement|vision|pmo|innovation|memory|evals|costs|runtime|scheduler|orchestrator|pipeline|swarms|meetings|delegation|cognitive)(\/|$)/.test(path) && guardRole('operator')) return;
+    if ((path === '/api/metrics' || path.startsWith('/api/agents/memory') || path.startsWith('/api/agents/kpis')) && guardRole('operator')) return;
+    const personaRoute = path.match(/^\/api\/(engineering|product|hr|marketing|ta|program)\//)?.[1];
+    if (personaRoute && authUser && !requirePersonaAccess(authUser, personaRoute)) { sendJSON(res, 403, { error: 'Persona access denied' }); return; }
+    if (method !== 'GET' && ['/api/connections/', '/api/tools/', '/api/marketing/tools/'].some(prefix => path.startsWith(prefix)) && guardRole('admin')) return;
+    if (/^\/api\/tools\/[^/]+\/(auth|(oauth\/)?callback)$/.test(path) && guardRole('admin')) return;
+    if (path === '/api/marketing/notifications/config' && guardRole('operator')) return;
+    if (method !== 'GET' && (path.startsWith('/api/marketplace/skills') || path === '/api/mcp/execute') && guardRole('operator')) return;
+    // Public demo visitors may decide steps of their OWN runs (always simulated):
+    // the executionRoute check below 404s any run they cannot read, and a role=user
+    // principal can only read runs it owns. Visitors cannot authenticate outside
+    // public mode at all; the mode check keeps this exemption from depending on that.
+    if (method === 'POST' && /^\/api\/(?:executions|(?:engineering|product|hr|marketing|ta|program)\/executions)\/[^/]+\/(approve|reject)\//.test(path) && !(env.EAOS_DEMO_MODE === 'public' && isDemoVisitor(authUser)) && guardRole('operator')) return;
+    /**
+     * Run mode follows one rule (run-mode.ts): demo visitors are always
+     * simulated, otherwise a client may choose, and with no choice no configured
+     * LLM provider means a labelled simulation rather than a run that is
+     * accepted and then fails. preparePersonaExecution applies it to every run
+     * it creates, so this request-level copy is for the paths that call a model
+     * without creating a run (the review pipeline, /api/query) and for labelling
+     * responses — it is not what keeps a run from going live.
+     */
+    const resolveSimulate = (requested?: unknown): boolean => decideSimulation(authUser?.id, requested);
     const IS_PRODUCTION = process.env.NODE_ENV === 'production';
     const enforceExecutionOwnership = (): boolean => {
-        if (!IS_PRODUCTION) return false;
-        if (!authUser || authUser.id === 'anonymous') return false;
-        if (authUser.role === 'admin' || authUser.role === 'operator') return false;
+        if (authUser?.role === 'admin' || authUser?.role === 'operator') return false;
         return true;
     };
     const ownsExecution = (exec: { userId?: string }): boolean =>
         exec.userId === userId;
+    type ScopedExecution = { userId?: string; tenantId?: string; persona?: string; workflowId?: string; requiredPersonas?: unknown };
+    const executionPersona = (exec: ScopedExecution) => exec.persona ?? (exec.workflowId ? 'marketing' : undefined);
+    const canReadExecution = (exec: ScopedExecution): boolean => {
+        const persona = executionPersona(exec);
+        return Boolean(authUser && persona && requirePersonaAccess(authUser, persona) && (!Array.isArray(exec.requiredPersonas) || exec.requiredPersonas.every(required => typeof required === 'string' && requirePersonaAccess(authUser, required))) && canReadStreamResource(authUser, {
+            userId: exec.userId, tenantId: exec.tenantId ?? (persona === 'marketing' ? deploymentTenantId : undefined),
+        }));
+    };
+    const listScopedPersonaExecutions = async (...args: Parameters<typeof listPersonaExecutions>) => runRepository && authUser
+        ? (await runRepository.list(authUser.tenantId, enforceExecutionOwnership() ? userId : undefined, args[1] ?? 20, 0, { persona: args[0], personas: ['engineering','product','marketing','hr','ta','program','executive','design','learning'].filter(persona => requirePersonaAccess(authUser, persona)) })).executions
+        : listPersonaExecutions(...args).filter(canReadExecution);
+    const loadExecution = async (id: string) => runRepository && authUser
+        ? runRepository.get(authUser.tenantId, id)
+        : getPersonaExecution(id) ?? marketingApi.getMarketingExecution(id);
+    const executionRoute = path.match(/^\/api\/(?:(engineering|product|hr|marketing|ta|program)\/)?executions\/([^/]+)(?:\/|$)/);
+    if (executionRoute) {
+        const [, persona, id] = executionRoute;
+        const record = await loadExecution(id!);
+        if (!record || !canReadExecution(record) || (persona && executionPersona(record) !== persona)) {
+            sendJSON(res, 404, { error: 'Execution not found' });
+            return;
+        }
+    }
 
     try {
         // Health — liveness check
+        // Liveness: is this process running? No dependency checks, no auth, no
+        // tenant data. Separated from /api/health so a container healthcheck
+        // cannot be failed by a degraded dependency — restarting the process does
+        // not fix an unreachable database, it just adds an outage.
+        if (path === '/api/live' && method === 'GET') {
+            sendJSON(res, 200, { status: 'alive', pid: process.pid, uptimeSec: Math.floor(process.uptime()) });
+            return;
+        }
+
         if (path === '/api/health' && method === 'GET') {
             sendJSON(res, 200, {
                 ...getHealth(),
-                services: { gateway: 'up', skills: 'up', workers: 'up', orchestrator: 'up' },
-                llmConfigured: !!process.env.ANTHROPIC_API_KEY,
-                githubConfigured: !!process.env.GITHUB_TOKEN,
-                persistenceEnabled: usePostgres ? 'postgres' : useInMemory ? 'in-memory' : 'file-backed',
-                wsClients: getWSClientCount(),
-                storeStats: 'stats' in store ? (store as PersistentStore).stats() : { tables: 0, totalRows: 0 },
+                // FIXME(phase-8): these four are hardcoded 'up' and are checked by
+                // nothing. Replaced by measured checks when /api/ready lands.
+                services: { gateway: 'up' },
+                llmConfigured: hasAnyLLMKey(),
+                persistence: storeResult.mode,
+                // Present only when we are NOT on the storage that was asked for.
+                // Silent degradation to ephemeral is how state "disappears".
+                persistenceDegraded: Boolean(storeResult.degradedReason),
             });
             return;
         }
 
         // Readiness — deep checks (DB, LLM, memory, circuits)
         if (path === '/api/ready' && method === 'GET') {
-            const readiness = await getReadiness();
-            sendJSON(res, readiness.status === 'ready' ? 200 : 503, readiness);
+            const storage = pgPool
+                ? await pgPool.query({ text: 'SELECT 1', query_timeout: 1500 }).then(() => true, () => false)
+                : storeResult.mode === 'file' && !storeResult.degradedReason;
+            const checks = { storage, restored: runRepository ? !deploymentBindingError : !rehydrationError, accepting: !shutdownStarted };
+            const ready = Object.values(checks).every(Boolean);
+            sendJSON(res, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready', checks });
+            return;
+        }
+
+        if (authUser && isPlatformRoute(path)) {
+            try {
+                const result = await platformRequest(platformRepository, runRepository, authUser, url, method, () => readBody(req), id => disconnectStreamUser({ ...authUser, id }));
+                sendJSON(res, result.status, result.data);
+            } catch (error) {
+                const status = (error as { statusCode?: number }).statusCode ?? 422;
+                sendJSON(res, status, { error: error instanceof Error ? error.message : 'Platform operation failed' });
+            }
+            return;
+        }
+        if (authUser && isIntegrationRoute(path, method)) {
+            const result = await integrationRequest(workspaceRepository, integrationRepository, connectors, authUser, url, method, () => readBody(req));
+            if (result.download) {
+                res.writeHead(result.status, { 'Content-Type': result.download.mimeType, 'Content-Length': result.download.bytes.length, 'Content-Disposition': attachmentDisposition(result.download.filename), 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' });
+                res.end(result.download.bytes);
+            } else sendJSON(res, result.status, result.data);
+            return;
+        }
+        if (authUser && isEntrypointRoute(path, method)) {
+            const key = req.headers['idempotency-key'];
+            if (key !== undefined && typeof key !== 'string') { sendJSON(res, 400, { error: 'Invalid idempotency key' }); return; }
+            const result = await entrypointRequest(runRepository, authUser, url, method, () => readBody(req), key);
+            sendJSON(res, result.status, result.data); return;
+        }
+        if (scheduleRepository && authUser && isScheduleRoute(path, method)) {
+            const result = await scheduleRequest(scheduleRepository, authUser, path, method, method === 'GET' ? {} : await readBody(req));
+            sendJSON(res, result.status, result.data); return;
+        }
+        if (workspaceRepository && authUser && isWorkspaceRoute(path, method)) {
+            const result = await workspaceRequest(workspaceRepository, authUser, url, method, () => readBody(req));
+            sendJSON(res, result.status, result.data); return;
+        }
+        if (path === '/api/runtime/quarantine' && method === 'GET' && pgPool) {
+            const report = await pgPool.query("SELECT _table AS source, count(*)::int AS records, count(*) FILTER (WHERE data->>'tenantId' IS NULL)::int AS missing_tenant, count(*) FILTER (WHERE data->>'userId' IS NULL)::int AS missing_owner FROM kv_store WHERE _table IN ('persona_executions','marketing_executions','execution_history') GROUP BY _table ORDER BY _table");
+            sendJSON(res, 200, { policy: 'quarantine-by-default', dryRun: true, applied: false, sources: report.rows, message: 'Legacy records remain outside canonical runtime APIs. Migration requires a reviewed ownership report and backup.' }); return;
+        }
+        if (path === '/api/openapi.json' && method === 'GET') { sendJSON(res, 200, executionOpenApi()); return; }
+        if (path === '/api/certification' && method === 'GET' && authUser) {
+            const definitions = getCompiledCatalog().filter(definition => requirePersonaAccess(authUser, definition.persona));
+            sendJSON(res, 200, { definitions: definitions.map(definition => ({ id: definition.id, persona: definition.persona, definitionHash: definition.definitionHash, ...describeWorkflowSupport(definition) })), externalCertification: 'Vendor-sandbox evidence and human domain review are required; automated fixtures are not live certification' }); return;
+        }
+        if (path === '/api/workflows/inspect-yaml' && method === 'POST' && authUser) {
+            if (guardRole('operator')) return;
+            const body = await readBody(req);
+            if (typeof body.source !== 'string') { sendJSON(res, 400, { error: 'YAML source required' }); return; }
+            try { sendJSON(res, 200, { definitions: inspectStarterYaml(body.source, authUser) }); } catch { sendJSON(res, 400, { error: 'Invalid or oversized starter YAML' }); }
+            return;
+        }
+        const catalogPersona = path.match(/^\/api\/(engineering|product|marketing|hr|ta|program)\/skills$/)?.[1];
+        if ((path === '/api/catalog' || catalogPersona) && method === 'GET') {
+            const skills = getCompiledCatalog().filter(definition => (!catalogPersona || definition.persona === catalogPersona) && authUser && requirePersonaAccess(authUser, definition.persona)).map(definition => ({ ...definition, support: describeWorkflowSupport(definition) }));
+            const clusters = Object.fromEntries([...new Set(skills.map(skill => skill.cluster))].map(cluster => [cluster, skills.filter(skill => skill.cluster === cluster)]));
+            sendJSON(res, 200, { schemaVersion: 1, skills, clusters, total: skills.length });
             return;
         }
 
@@ -673,15 +1152,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // ── Chat (Phase 4) ──
         if (path === '/api/chat/sessions' && method === 'GET') {
-            const sessions = listChatSessions(userId);
+            const sessions = await listChatSessions(chatOwner);
             sendJSON(res, 200, { sessions });
             return;
         }
 
         if (path === '/api/chat/sessions' && method === 'POST') {
             const body = await readBody(req);
-            const session = createChatSession({
-                userId,
+            const session = await createChatSession({
+                ...chatOwner,
                 title: (body.title as string) ?? undefined,
                 agentId: (body.agentId as string) ?? undefined,
                 persona: (body.persona as any) ?? undefined,
@@ -692,26 +1171,27 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         if (path.match(/^\/api\/chat\/sessions\/[^/]+$/) && method === 'GET') {
             const sessionId = path.split('/')[4]!;
-            const session = getChatSession(sessionId);
+            const session = await getChatSession(sessionId, chatOwner);
             if (!session) { sendJSON(res, 404, { error: 'Session not found' }); return; }
-            const messages = listChatMessages(sessionId, 100);
+            const messages = await listChatMessages(sessionId, chatOwner, 100);
             sendJSON(res, 200, { session, messages });
             return;
         }
 
         if (path.match(/^\/api\/chat\/sessions\/[^/]+$/) && method === 'DELETE') {
             const sessionId = path.split('/')[4]!;
-            const ok = archiveChatSession(sessionId);
+            const ok = await archiveChatSession(sessionId, chatOwner);
             sendJSON(res, ok ? 200 : 404, { ok });
             return;
         }
 
         if (path.match(/^\/api\/chat\/sessions\/[^/]+\/messages$/) && method === 'POST') {
             const sessionId = path.split('/')[4]!;
+            if (!await getChatSession(sessionId, chatOwner)) { sendJSON(res, 404, { error: 'Session not found' }); return; }
             const body = await readBody(req);
             const content = (body.content as string) ?? '';
             if (!content.trim()) { sendJSON(res, 400, { error: 'content required' }); return; }
-            const result = await postChatMessage({ sessionId, userId, content });
+            const result = await postChatMessage({ sessionId, ...chatOwner, content, principal: authUser });
             sendJSON(res, result.replyPath === 'error' ? 500 : 200, result);
             return;
         }
@@ -729,7 +1209,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
 
         if (path === '/api/skills/fs/reload' && method === 'POST') {
-            if (IS_PRODUCTION && guardRole('operator')) return;
+            if (guardRole('operator')) return;
             const body = await readBody(req);
             const persona = (body.persona as string) ?? undefined;
             const result = reloadFsSkills(persona);
@@ -745,12 +1225,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
-        // POST /api/skills/fs/execute — run an adopted community skill (works for ANY
-        // persona, incl. design/program/ta that the unified /api/execute doesn't branch on).
+        // POST /api/skills/fs/execute — run an adopted community skill under its folder's
+        // workflow persona (design/learning/leadership folders have no workflow runtime).
         if (path === '/api/skills/fs/execute' && method === 'POST') {
             const body = await readBody(req);
             const skillId = String((body.skillId as string) ?? '');
-            const reqPersona = body.persona ? String(body.persona) : undefined;
             const inputs = (body.inputs as Record<string, unknown>) ?? {};
             const simulate = typeof body.simulate === 'boolean' ? body.simulate : undefined;
             const provider = body.provider as string | undefined;
@@ -759,16 +1238,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
             if (!fsSkill) { sendJSON(res, 404, { error: `Adopted skill not found: ${skillId}` }); return; }
 
-            const persona = fsSkill.persona || reqPersona || 'engineering';
-            if (authUser && !requirePersonaAccess(authUser, persona)) {
-                sendJSON(res, 403, { error: `Access denied for persona: ${persona}` }); return;
+            // The skill's folder decides its persona; a request cannot run it as another.
+            const persona = adoptedSkillPersona(fsSkill);
+            if (authUser && !requirePersonaAccess(authUser, persona ?? fsSkill.persona)) {
+                sendJSON(res, 403, { error: `Access denied for persona: ${persona ?? fsSkill.persona}` }); return;
             }
-
             const skill = synthesizeAdoptedSkill(fsSkill);
-            const shouldSimulate = simulate !== undefined ? simulate : !hasAnyLLMKey();
-            const exec = createPersonaExecution(persona as any, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
+            if (!persona || !skill) { sendJSON(res, 422, { error: `Adopted skills for persona ${fsSkill.persona} have no workflow runtime` }); return; }
+
+            const shouldSimulate = resolveSimulate(simulate);
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona, skill, inputs, userId, shouldSimulate, fsSkill.systemPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `${persona} / ${fsSkill.name} (adopted)`);
-            broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate: shouldSimulate, adopted: true });
+            broadcastEvent(exec.id, 'session.started', { tenantId: exec.tenantId, persona, skillId, simulate: exec.mode === 'simulation', adopted: true }, exec.tenantId);
             sendJSON(res, 201, { execution: exec });
             return;
         }
@@ -787,7 +1268,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
         // POST /api/mcp/servers/:id/call — call a tool on an MCP server: { tool, arguments }
         if (path.match(/^\/api\/mcp\/servers\/[^/]+\/call$/) && method === 'POST') {
-            if (IS_PRODUCTION && guardRole('operator')) return;
+            if (guardRole('operator')) return;
             const id = decodeURIComponent(path.split('/')[4]!);
             const body = await readBody(req);
             const toolName = String((body.tool as string) ?? (body.name as string) ?? '');
@@ -801,9 +1282,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // ── Voice (inclusive access) — proxies to the connected voice MCP server ──
         // POST /api/voice/transcribe — speech-to-text. 501 (graceful) when no voice server.
         if (path === '/api/voice/transcribe' && method === 'POST') {
-            if (!mcpManager.hasServer('voicebox')) { sendJSON(res, 501, { simulated: true, reason: 'Voice server not connected — set VOICEBOX_URL.' }); return; }
             const body = await readBody(req);
-            const r = await mcpManager.callTool('voicebox', 'voicebox.transcribe', { audio_base64: (body as any).audio_base64, audio_path: (body as any).audio_path, language: (body as any).language });
+            if (body.audio_path !== undefined || typeof body.audio_base64 !== 'string' || !body.audio_base64) { sendJSON(res, 400, { error: 'Provide audio_base64; server file paths are not accepted' }); return; }
+            if (!mcpManager.hasServer('voicebox')) { sendJSON(res, 501, { simulated: true, reason: 'Voice server not connected — set VOICEBOX_URL.' }); return; }
+            const r = await mcpManager.callTool('voicebox', 'voicebox.transcribe', { audio_base64: body.audio_base64, language: (body as any).language });
             sendJSON(res, r.ok ? 200 : 502, { ok: r.ok, text: r.content, ...(r.structured ?? {}), error: r.error });
             return;
         }
@@ -848,9 +1330,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const roles = Array.isArray(body.roles) ? (body.roles as string[]).map(String) : undefined;
             const provider = body.provider as string | undefined;
             const modelId = body.modelId as string | undefined;
+            // The verdict is delivered in this response, so stop calling providers
+            // once nobody can receive it: the caller (or the web proxy in front of
+            // it) disconnected, or the deadline every hop in front is sized for passed.
+            const abandoned = new AbortController();
+            res.on('close', () => { if (!res.writableEnded) abandoned.abort(); });
+            const signal = AbortSignal.any([abandoned.signal, AbortSignal.timeout(REVIEW_DEADLINE_MS)]);
             try {
-                const result = await runReviewPipeline(artifact, { roles, provider, modelId });
+                const result = await runReviewPipeline(artifact, { roles, provider, modelId, simulate: resolveSimulate(body.simulate), signal });
+                // Audited even when abandoned: the reviewers that did run were billed.
                 recordAudit(userId, 'review.run', `autoplan review → ${result.finalVerdict} (${result.reviewers.length} reviewers)`);
+                if (abandoned.signal.aborted) return;
                 sendJSON(res, 200, result);
             } catch (err) {
                 sendJSON(res, 500, { error: (err as Error).message });
@@ -862,16 +1352,66 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // Auth routes — token issuance + user info
         // -----------------------------------------------------------------
 
+        // POST /api/setup — one-shot first-run bootstrap
+        //
+        // Public (see public-paths.ts) because it exists to mint the very first
+        // credential: requiring one would be the deadlock this replaces. It is
+        // protected by EAOS_SETUP_TOKEN, which the operator sets before the
+        // process starts, and by a row that acts as a single-use lock — the
+        // second call gets 410 whichever replica serves it.
+        if (path === '/api/setup' && method === 'POST') {
+            const body = await readBody(req);
+            if (body.tenantId !== undefined && body.tenantId !== deploymentTenantId) { sendJSON(res, 403, { error: 'Setup tenant does not match this deployment' }); return; }
+            const result = await runSetup({ ...body, tenantId: deploymentTenantId }, {
+                setupToken: env.EAOS_SETUP_TOKEN,
+                store,
+                pgPool,
+            });
+
+            if (!result.ok) {
+                // Deliberately not audited as a security event at this point:
+                // there is no principal yet, and an attacker controls the only
+                // input. The rate limiter is the control that matters here.
+                console.warn(`[setup] refused: ${result.error}`);
+                sendJSON(res, result.status, { error: result.error, detail: result.detail });
+                return;
+            }
+
+            // keyPrefix only — the raw key is returned in the body and must
+            // never reach a log, which is the whole point of showing it once.
+            console.log(
+                `[setup] bootstrap complete — tenant=${result.tenantId} user=${result.userId} key=${result.keyPrefix}…`,
+            );
+            sendJSON(res, 201, {
+                apiKey: result.apiKey,
+                keyPrefix: result.keyPrefix,
+                userId: result.userId,
+                tenantId: result.tenantId,
+                warning: 'Save this key — it is shown once and is not recoverable.',
+                nextStep: 'Exchange it for a session token: POST /api/auth/token with X-API-Key.',
+            });
+            return;
+        }
+
         // POST /api/auth/token — issue JWT from API key or credentials
         if (path === '/api/auth/token' && method === 'POST') {
-            if (!authUser) { sendJSON(res, 401, { error: 'Authentication required to issue token' }); return; }
-            try {
-                const body = await readBody(req);
-                const expiresIn = typeof body.expiresIn === 'number' ? body.expiresIn : 86400;
-                const token = generateJWT(authUser, expiresIn);
-                sendJSON(res, 200, { token, expiresIn, user: { id: authUser.id, email: authUser.email, name: authUser.name, role: authUser.role, teams: authUser.teams, personaScopes: authUser.personaScopes } });
-            } catch (err) {
-                sendJSON(res, 500, { error: 'JWT_SECRET not configured — cannot issue tokens' });
+            if (!authUser || authUser.id === 'anonymous') { sendJSON(res, 401, { error: 'Authentication required to issue token' }); return; }
+            // A demo visitor already holds the only session it needs; more credentials
+            // for an anonymous internet visitor are only more to outlive the demo.
+            if (isDemoVisitor(authUser)) { sendJSON(res, 403, { error: 'Demo sessions cannot issue further credentials' }); return; }
+            const body = await readBody(req);
+            // createBrowserSession ends the session no later than the presenting key
+            // (authorityExpiresAt), and reports the access lifetime it actually granted.
+            if (body.browser === true) {
+                if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
+                const issued = await createBrowserSession(authUser);
+                setSessionCookies(res, issued);
+                sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
+            } else {
+                const expiresIn = typeof body.expiresIn === 'number' ? body.expiresIn : 900;
+                if (!Number.isInteger(expiresIn) || expiresIn < 1 || expiresIn > 86400) { sendJSON(res, 400, { error: 'Invalid token lifetime' }); return; }
+                const issued = await createBrowserSession(authUser, expiresIn);
+                sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
             }
             return;
         }
@@ -879,7 +1419,80 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // GET /api/auth/me — return current user info from token
         if (path === '/api/auth/me' && method === 'GET') {
             if (!authUser) { sendJSON(res, 401, { error: 'Not authenticated' }); return; }
-            sendJSON(res, 200, { user: { id: authUser.id, email: authUser.email, name: authUser.name, role: authUser.role, teams: authUser.teams, personaScopes: authUser.personaScopes, tenantId: authUser.tenantId } });
+            sendJSON(res, 200, { user: { id: authUser.id, email: authUser.email, name: authUser.name, role: authUser.role, teams: authUser.teams, personaScopes: authUser.personaScopes, tenantId: authUser.tenantId, demo: isDemoPrincipal(authUser) } });
+            return;
+        }
+
+        // GET /api/auth/config — which sign-in options the UI should offer (public)
+        if (path === '/api/auth/config' && method === 'GET') {
+            sendJSON(res, 200, {
+                demoMode: env.EAOS_DEMO_MODE,
+                sso: Boolean(process.env.OIDC_ISSUER_URL && process.env.OIDC_CLIENT_ID),
+                llmConfigured: hasAnyLLMKey(),
+            });
+            return;
+        }
+
+        // POST /api/auth/demo — isolated, simulation-only demo visitor (EAOS_DEMO_MODE=public).
+        // Public (see public-paths.ts). Each call is a fresh role=user principal, so a
+        // visitor sees only its own runs; resolveSimulate() forces them to simulation.
+        if (path === '/api/auth/demo' && method === 'POST') {
+            if (env.EAOS_DEMO_MODE !== 'public') { sendJSON(res, 404, { error: 'Demo sessions are not enabled on this deployment' }); return; }
+            if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
+            const visitor = randomUUID();
+            const principal = {
+                id: `${DEMO_PRINCIPAL_PREFIX}${visitor}`, email: `demo-${visitor}@demo.invalid`, name: 'Demo visitor', role: 'user' as const,
+                teams: [], personaScopes: ['*' as const], tenantId: deploymentTenantId,
+            };
+            try { await provisionDemoUser(pgPool, principal); } catch (err) {
+                if (err instanceof DemoTenantMissingError) { sendJSON(res, 409, { error: err.message }); return; }
+                throw err;
+            }
+            const issued = await createBrowserSession(principal);
+            setSessionCookies(res, issued);
+            sendJSON(res, 200, { expiresIn: issued.expiresIn, user: { ...issued.user, demo: true } });
+            return;
+        }
+
+        if (path === '/api/auth/token/refresh' && method === 'POST') {
+            if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
+            const issued = await refreshBrowserSession(readCookie(req, 'eaos_refresh'));
+            // A demo session whose mode has been switched off is over, not renewable.
+            if (issued && !demoPrincipalPermitted(issued.user)) {
+                await revokeBrowserSession(issued.user.sessionId!);
+                setSessionCookies(res);
+                sendJSON(res, 401, { error: DEMO_DISABLED_ERROR });
+                return;
+            }
+            setSessionCookies(res, issued);
+            if (!issued) { sendJSON(res, 401, { error: 'Session expired or revoked' }); return; }
+            sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
+            return;
+        }
+
+        if (path === '/api/auth/logout' && method === 'POST') {
+            if (authUser?.sessionId) await revokeBrowserSession(authUser.sessionId);
+            if (authUser) disconnectStreamUser(authUser);
+            setSessionCookies(res);
+            sendJSON(res, 200, { loggedOut: true });
+            return;
+        }
+
+        if (path === '/api/auth/ws-ticket' && method === 'POST') {
+            if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
+            sendJSON(res, 200, { ticket: issueStreamTicket(authUser), expiresIn: 30 });
+            return;
+        }
+
+        if (path === '/api/auth/oidc/exchange' && method === 'POST') {
+            if (!isAllowedBrowserOrigin(req.headers.origin)) { sendJSON(res, 403, { error: 'Untrusted browser origin' }); return; }
+            const body = await readBody(req);
+            const principal = typeof body.code === 'string' ? consumeLoginCode(body.code, readCookie(req, 'eaos_login')) : undefined;
+            if (!principal) { sendJSON(res, 401, { error: 'Invalid or expired login code' }); return; }
+            const issued = await createBrowserSession(principal);
+            setSessionCookies(res, issued);
+            res.setHeader('Set-Cookie', [...res.getHeader('Set-Cookie') as string[], cookie('eaos_login', '', 0)]);
+            sendJSON(res, 200, { token: issued.token, expiresIn: issued.expiresIn, user: issued.user });
             return;
         }
 
@@ -887,7 +1500,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/auth/oidc/authorize' && method === 'GET') {
             try {
                 const { buildAuthorizationUrl } = await import('./oidc-provider.js');
-                const { url } = await buildAuthorizationUrl();
+                const binding = randomBytes(32).toString('hex');
+                const { url } = await buildAuthorizationUrl(binding);
+                res.setHeader('Set-Cookie', cookie('eaos_login', binding, 600));
                 res.writeHead(302, { Location: url });
                 res.end();
             } catch (err) {
@@ -904,10 +1519,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 const state = params.get('state') ?? '';
                 if (!code) { sendJSON(res, 400, { error: 'Missing code parameter' }); return; }
 
-                const { exchangeCode, verifyIdToken, provisionUser } = await import('./oidc-provider.js');
-                const tokens = await exchangeCode(code);
-                const claims = verifyIdToken(tokens.id_token, state);
+                const { completeAuthorization, provisionUser } = await import('./oidc-provider.js');
+                const binding = readCookie(req, 'eaos_login');
+                const claims = await completeAuthorization(code, state, binding);
                 const oidcUser = provisionUser(claims);
+                if (oidcUser.tenantId !== deploymentTenantId) throw new Error('OIDC tenant does not match this deployment');
 
                 const agentosUser: AuthUser = {
                     id: oidcUser.id,
@@ -918,9 +1534,11 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                     personaScopes: ['*'],
                     tenantId: oidcUser.tenantId,
                 };
-                const jwt = generateJWT(agentosUser, 86400);
-                const frontendUrl = process.env.FRONTEND_URL ?? '/';
-                res.writeHead(302, { Location: `${frontendUrl}?token=${jwt}` });
+                const frontend = new URL(process.env.FRONTEND_URL ?? 'http://localhost:3010');
+                if (!isAllowedBrowserOrigin(frontend.origin)) throw new Error('FRONTEND_URL must be an allowed browser origin');
+                const loginCode = issueLoginCode(await persistOidcUser(agentosUser), binding);
+                frontend.searchParams.set('login_code', loginCode);
+                res.writeHead(302, { Location: frontend.toString() });
                 res.end();
             } catch (err) {
                 sendJSON(res, 500, { error: 'OIDC callback failed: ' + (err as Error).message });
@@ -931,73 +1549,97 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // POST /api/users/apikeys — create new API key (returns raw key once, stores hash in DB)
         if (path === '/api/users/apikeys' && method === 'POST') {
             if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
+            // An anonymous demo visitor gets one session, not a durable key to keep.
+            if (isDemoVisitor(authUser)) { sendJSON(res, 403, { error: 'Demo sessions cannot create API keys' }); return; }
             try {
                 const { generateApiKey } = await import('./auth.js');
                 const body = await readBody(req);
                 const label = typeof body.label === 'string' ? body.label : 'api-key';
-                const expiresAt = typeof body.expiresAt === 'string' ? body.expiresAt : null;
+                // Never later than the credential presenting this request: an expiring
+                // key (or a session minted from one) cannot mint a key that outlives it.
+                const expiresAt = boundedKeyExpiry(typeof body.expiresAt === 'string' ? body.expiresAt : null, authUser);
                 const { rawKey, keyHash, keyPrefix } = generateApiKey();
                 const keyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-                if (pgPool) {
-                    const tenantId = getTenantId(authUser as any, headers);
-                    await withTenantContext(pgPool as any, tenantId, (client) => client.query(
-                        `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, expires_at, created_at, tenant_id)
-                         VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7)
-                         ON CONFLICT (id) DO NOTHING`,
-                        [keyId, authUser.id, keyHash, keyPrefix, label, expiresAt, tenantId]
-                    ));
+                // The column is `name`, not `label` (migration 003), and it is
+                // NOT NULL — so the previous INSERT failed twice over on a
+                // migrated database. `scopes` is written explicitly because the
+                // column default is '{read,execute}', which `resolveApiKey` maps
+                // onto `personaScopes`, and `requirePersonaAccess` then denies
+                // every persona: a key that authenticates but can do nothing.
+                const scopes = resolveApiKeyScopes(authUser, body.scopes);
+                if (body.expiresAt != null && (typeof body.expiresAt !== 'string' || !(Date.parse(body.expiresAt) > Date.now()))) {
+                    sendJSON(res, 400, { error: 'expiresAt must be a valid future timestamp' });
+                    return;
                 }
-                sendJSON(res, 201, { id: keyId, rawKey, keyPrefix, label, expiresAt, warning: 'Save this key — it will not be shown again' });
+
+                if (pgPool) {
+                    const tenantId = authUser.tenantId;
+                    await withTenantContext(pgPool as any, tenantId, (client) => client.query(
+                        `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, name, scopes, expires_at, created_at, tenant_id)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8)
+                         ON CONFLICT (id) DO NOTHING`,
+                        [keyId, authUser.id, keyHash, keyPrefix, label, scopes, expiresAt, tenantId]
+                    ));
+                } else {
+                    // No relational store. Previously this fell through and still
+                    // answered 201 with a key that had been written nowhere — the
+                    // caller saved a credential that could never authenticate.
+                    // Persist to the shared store instead, which is what the
+                    // resolver now reads on this path.
+                    persistApiKeyToStore({
+                        id: keyId,
+                        keyHash,
+                        keyPrefix,
+                        userId: authUser.id,
+                        email: authUser.email,
+                        name: authUser.name,
+                        role: authUser.role,
+                        tenantId: authUser.tenantId ?? 'default',
+                        scopes,
+                        label,
+                        expiresAt,
+                    });
+                }
+                sendJSON(res, 201, { id: keyId, rawKey, keyPrefix, label, scopes, expiresAt, warning: 'Save this key — it will not be shown again' });
             } catch (err) {
-                sendJSON(res, 500, { error: (err as Error).message });
+                sendJSON(res, (err as { statusCode?: number }).statusCode ?? 500, { error: (err as Error).message });
+            }
+            return;
+        }
+
+        if (path === '/api/users/apikeys' && method === 'GET') {
+            if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
+            if (pgPool) {
+                const result = await withTenantContext(pgPool, authUser.tenantId, client => client.query(
+                    'SELECT id, key_prefix AS "keyPrefix", name AS label, scopes, created_at AS "createdAt", last_used_at AS "lastUsedAt", expires_at AS "expiresAt" FROM api_keys WHERE user_id=$1 AND tenant_id=$2 ORDER BY created_at DESC',
+                    [authUser.id, authUser.tenantId],
+                )) as { rows: unknown[] };
+                sendJSON(res, 200, { keys: result.rows });
+            } else {
+                sendJSON(res, 200, { keys: listApiKeysForUser(authUser) });
             }
             return;
         }
 
         // DELETE /api/users/apikeys/:keyId — revoke API key
-        if (path.startsWith('/api/users/apikeys/') && !path.endsWith('/rotate') && method === 'DELETE') {
+        if (path.match(/^\/api\/users\/apikeys\/[^/]+$/) && method === 'DELETE') {
             if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
-            const keyId = path.split('/')[4];
-            if (pgPool) {
-                const tenantId = getTenantId(authUser as any, headers);
-                await withTenantContext(pgPool as any, tenantId, (client) =>
-                    client.query(`DELETE FROM api_keys WHERE id=$1 AND user_id=$2`, [keyId, authUser.id]));
-            }
-            sendJSON(res, 200, { revoked: keyId });
+            const keyId = path.split('/')[4]!;
+            const revoked = await revokeApiKey(keyId, authUser, pgPool);
+            if (revoked) disconnectStreamUser(authUser);
+            sendJSON(res, revoked ? 200 : 404, revoked ? { revoked: keyId } : { error: 'Key not found' });
             return;
         }
 
         // POST /api/users/apikeys/:keyId/rotate — generate replacement, revoke old atomically
-        if (path.startsWith('/api/users/apikeys/') && path.endsWith('/rotate') && method === 'POST') {
+        if (path.match(/^\/api\/users\/apikeys\/[^/]+\/rotate$/) && method === 'POST') {
             if (!authUser) { sendJSON(res, 401, { error: 'Authentication required' }); return; }
-            const keyId = path.split('/')[4];
-            try {
-                const { generateApiKey } = await import('./auth.js');
-                const { rawKey, keyHash, keyPrefix } = generateApiKey();
-                const newKeyId = `key_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-                if (pgPool) {
-                    const client = await pgPool.connect();
-                    try {
-                        await client.query('BEGIN');
-                        await setTenantContext(client as any, getTenantId(authUser as any, headers));
-                        const existing = await client.query(`SELECT label, expires_at FROM api_keys WHERE id=$1 AND user_id=$2`, [keyId, authUser.id]);
-                        if (existing.rowCount === 0) { await client.query('ROLLBACK'); sendJSON(res, 404, { error: 'Key not found' }); return; }
-                        const { label, expires_at } = existing.rows[0];
-                        await client.query(`DELETE FROM api_keys WHERE id=$1`, [keyId]);
-                        await client.query(
-                            `INSERT INTO api_keys (id, user_id, key_hash, key_prefix, label, expires_at, created_at, tenant_id)
-                             VALUES ($1,$2,$3,$4,$5,$6,NOW(),$7)`,
-                            [newKeyId, authUser.id, keyHash, keyPrefix, label, expires_at, authUser.tenantId ?? 'default']
-                        );
-                        await client.query('COMMIT');
-                    } finally { client.release(); }
-                }
-                sendJSON(res, 200, { id: newKeyId, rawKey, keyPrefix, revokedId: keyId, warning: 'Save this key — it will not be shown again' });
-            } catch (err) {
-                sendJSON(res, 500, { error: (err as Error).message });
-            }
+            const keyId = path.split('/')[4]!;
+            const replacement = await rotateApiKey(keyId, authUser, pgPool);
+            if (!replacement) { sendJSON(res, 404, { error: 'Key not found' }); return; }
+            disconnectStreamUser(authUser);
+            sendJSON(res, 200, { ...replacement, revokedId: keyId, warning: 'Save this key — it will not be shown again' });
             return;
         }
 
@@ -1047,8 +1689,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // POST /api/executions/:id/approve/:stepId — approve a step
         // -----------------------------------------------------------------
 
-        if (path === '/api/execute' && method === 'POST') {
-            const body = await readBody(req);
+        const legacyExecution = path.match(/^\/api\/(engineering|product|marketing|hr|ta|program)\/execute$/);
+        if ((path === '/api/execute' || legacyExecution) && method === 'POST') {
+            const rawBody = await readBody(req);
+            const body = legacyExecution ? { ...rawBody, persona: legacyExecution[1], skillId: rawBody.skillId ?? rawBody.workflowId } : rawBody;
             let parsed: import('./validation.js').ExecuteBody;
             try {
                 parsed = validate(ExecuteSchema, body);
@@ -1069,48 +1713,43 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             }
 
             // Resolve skill from persona catalog
-            let skill;
-            if (persona === 'engineering') skill = getEngineeringSkill(skillId);
-            else if (persona === 'product') skill = getProductSkill(skillId);
-            else if (persona === 'hr') skill = getHRSkill(skillId);
-            else if (persona === 'marketing') {
-                // Marketing uses workflow execution (separate path for now)
-                try {
-                    const shouldSimulateMktg = simulate !== undefined ? simulate : !hasAnyLLMKey();
-                    const exec = marketingApi.createMarketingExecution(skillId, inputs ?? {}, userId, shouldSimulateMktg, customPrompt, provider as any, modelId);
-                    recordAudit(userId, 'skill.execute', `Marketing / ${exec.workflowName}`);
-                    broadcastEvent(exec.id, 'session.started', { persona: 'marketing', skillId, simulate, provider });
-                    sendJSON(res, 201, { execution: exec });
-                } catch (err) { sendJSON(res, 400, { error: (err as Error).message }); }
-                return;
+            let skill: import('./engineering-skills-data.js').PersonaSkillDef | undefined = getCompiledDefinition(skillId, persona);
+            // Marketing and all other personas use the same compiled execution path
+            if (skill && authUser && requiredPersonas(skill).some(required => !requirePersonaAccess(authUser, required))) {
+                sendJSON(res, 403, { error: 'Access denied for a workflow step persona' }); return;
             }
 
             // Fallback: adopted community skill (skills/<persona>/<slug>/SKILL.md)
             let adoptedBody: string | undefined;
             if (!skill) {
                 const fsSkill = getAllFsSkills().find(s => s.id === skillId || s.slug === skillId);
-                if (fsSkill) { skill = synthesizeAdoptedSkill(fsSkill); adoptedBody = fsSkill.systemPrompt; }
+                if (fsSkill) {
+                    // Persona access was checked for the requested persona, so the
+                    // skill must belong to it; non-workflow folders cannot run here.
+                    if (adoptedSkillPersona(fsSkill) !== persona) { sendJSON(res, 422, { error: `Adopted skill ${fsSkill.id} does not run under persona ${persona}` }); return; }
+                    skill = synthesizeAdoptedSkill(fsSkill); adoptedBody = fsSkill.systemPrompt;
+                }
             }
 
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
 
-            // If the client didn't send simulate, auto-detect: no key configured → sandbox mode
-            const shouldSimulate = simulate !== undefined ? simulate : !hasAnyLLMKey();
+            const shouldSimulate = resolveSimulate(simulate);
             // Adopted skills carry their instructions in the markdown body — feed it as customPrompt.
             const effectiveCustomPrompt = adoptedBody
                 ? (customPrompt ? `${adoptedBody}\n\n---\n${customPrompt}` : adoptedBody)
                 : customPrompt;
-            const exec = createPersonaExecution(persona as any, skill, inputs ?? {}, userId, shouldSimulate, effectiveCustomPrompt, provider as any, modelId);
-            recordAudit(userId, 'skill.execute', `${persona} / ${skill.name}`);
-            broadcastEvent(exec.id, 'session.started', { persona, skillId, simulate, provider });
-            sendJSON(res, 201, { execution: exec });
+            const requestKey = req.headers['idempotency-key'];
+            if (requestKey !== undefined && (typeof requestKey !== 'string' || requestKey.length > 200)) { sendJSON(res, 400, { error: 'Invalid idempotency key' }); return; }
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona as any, skill, inputs ?? {}, userId, shouldSimulate, effectiveCustomPrompt, provider as any, modelId, requestKey);
+            if (!runRepository) recordAudit(userId, 'skill.execute', `${persona} / ${skill.name}`);
+            broadcastEvent(exec.id, 'session.started', { tenantId: authUser!.tenantId, persona, skillId, simulate: exec.mode === 'simulation', provider }, authUser!.tenantId);
+            const execution = persona === 'marketing' ? { ...exec, workflowId: exec.skillId, workflowName: exec.skillName } : exec;
+            sendJSON(res, legacyExecution && ['engineering', 'product', 'hr'].includes(persona) ? 200 : 201, { execution });
             return;
         }
 
         if (path === '/api/executions' && method === 'GET') {
-            const persona = url.searchParams.get('persona') ?? undefined;
-            const status = url.searchParams.get('status') ?? undefined;
-            const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
+            const { persona, status, limit, offset } = validate(ExecutionListQuerySchema, Object.fromEntries(url.searchParams));
 
             // Persona access check
             if (persona && authUser && !requirePersonaAccess(authUser, persona)) {
@@ -1118,25 +1757,23 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 return;
             }
 
-            let execs;
-            if (persona) {
-                execs = listPersonaExecutions(persona as any, limit);
-            } else {
-                execs = getAllExecutions()
-                    .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
-                    .slice(0, limit);
+            if (runRepository && authUser) {
+                const allowedPersonas = ['engineering', 'product', 'marketing', 'hr', 'ta', 'program', 'executive', 'design', 'learning'].filter(value => requirePersonaAccess(authUser, value));
+                const result = await runRepository.list(authUser.tenantId, enforceExecutionOwnership() ? userId : undefined, limit, offset, { persona, status, personas: allowedPersonas });
+                sendJSON(res, 200, { ...result, limit, offset }); return;
             }
-            if (status) { execs = execs.filter(e => e.status === status); }
+            let execs = getAllExecutions().filter(execution => (!persona || execution.persona === persona) && (!status || execution.status === status))
+                .sort((a, b) => b.startedAt.localeCompare(a.startedAt));
             // IDOR: in production, a concrete non-admin user only sees their own
             // executions. Dev/demo/anonymous/admin/operator see everything.
-            if (enforceExecutionOwnership()) { execs = execs.filter(ownsExecution); }
-            sendJSON(res, 200, { executions: execs, total: execs.length });
+            execs = execs.filter(canReadExecution);
+            sendJSON(res, 200, { executions: execs.slice(offset, offset + limit), total: execs.length, limit, offset });
             return;
         }
 
         if (path.match(/^\/api\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/').pop()!;
-            const exec = getPersonaExecution(execId) ?? marketingApi.getMarketingExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             // IDOR: in production, a concrete non-admin user may only read their
             // own execution. 404 (not 403) to avoid leaking existence.
@@ -1144,9 +1781,31 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 sendJSON(res, 404, { error: 'Execution not found' });
                 return;
             }
-            const aar = getAfterActionReport(execId);
+            const aar = getAfterActionReport(execId, canReadExecution);
             sendJSON(res, 200, { execution: exec, afterActionReport: aar ?? null });
             return;
+        }
+
+        const executionTrace = path.match(/^\/api\/executions\/([^/]+)\/trace$/);
+        if (runRepository && authUser && executionTrace && method === 'GET') {
+            sendJSON(res, 200, await runRepository.trace(authUser.tenantId, executionTrace[1]!)); return;
+        }
+        const durableDecision = path.match(/^\/api\/(?:(?:engineering|product|marketing|hr|ta|program)\/)?executions\/([^/]+)\/(approve|reject)\/([^/]+)$/);
+        if (runRepository && authUser && durableDecision && method === 'POST') {
+            const body = await readBody(req);
+            await runRepository.decide(authUser.tenantId, durableDecision[1]!, durableDecision[3]!, userId, durableDecision[2] === 'approve', typeof body.reason === 'string' ? body.reason.slice(0, 2000) : undefined, body.confirmations && typeof body.confirmations === 'object' && !Array.isArray(body.confirmations) ? body.confirmations as Record<string, boolean> : {});
+            sendJSON(res, 200, { success: true, decision: durableDecision[2] }); return;
+        }
+        const retryRun = path.match(/^\/api\/executions\/([^/]+)\/retry$/);
+        if (runRepository && authUser && retryRun && method === 'POST') {
+            if (guardRole('operator')) return;
+            const retried = await runRepository.retryFailed(authUser.tenantId, retryRun[1]!, enforceExecutionOwnership() ? userId : undefined);
+            sendJSON(res, retried ? 202 : 409, { retried }); return;
+        }
+        const cancelRun = path.match(/^\/api\/executions\/([^/]+)\/cancel$/);
+        if (runRepository && authUser && cancelRun && method === 'POST') {
+            const cancelled = await runRepository.cancel(authUser.tenantId, cancelRun[1]!, enforceExecutionOwnership() ? userId : undefined);
+            sendJSON(res, cancelled ? 200 : 409, { cancelled }); return;
         }
 
         if (path.match(/^\/api\/executions\/[^/]+\/approve\/[^/]+$/) && method === 'POST') {
@@ -1156,8 +1815,8 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             // Unified approve route: flips persona store synchronously AND releases
             // any marketing loop blocked on approval-bus.waitForApproval().
             const body = await readBody(req).catch(() => ({})) as { approverId?: string };
-            const personaRes = approvePersonaStep(execId, stepId);
-            const busRes = approveViaBus(execId, stepId, body.approverId ?? userId);
+            const personaRes = approvePersonaStep(execId, stepId, userId);
+            const busRes = approveViaBus(execId, stepId, userId);
             const success = personaRes.success || busRes.success;
             const message = success ? 'Step approved' : `${personaRes.message} / ${busRes.message}`;
             recordAudit(userId, 'approval.granted', `${execId}/${stepId}`);
@@ -1208,6 +1867,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 sendJSON(res, 400, { error: 'Missing query field' });
                 return;
             }
+            // A query calls a model directly and has no simulated form, so a request
+            // the run-mode rule would simulate — a demo visitor's, or any caller's
+            // while no LLM provider is configured — is refused before any provider
+            // is called, instead of spending the deployment's key on it.
+            if (resolveSimulate(body.simulate)) {
+                sendJSON(res, 422, { code: 'simulation_only', error: 'This request runs as a simulation (demo session, simulate requested, or no LLM provider configured), and queries have no simulated form; no model was called' });
+                return;
+            }
 
             await eventBus.emit('query.received', { query, userId });
             const result = await executeQuery(query, userId, sessions, executions);
@@ -1254,12 +1921,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const typeFilter = url.searchParams.get('type'); // 'skill' | 'workflow' | null
             const personaFilter = url.searchParams.get('persona');
             const all = [
-                ...ENGINEERING_SKILLS,
-                ...PRODUCT_SKILLS,
-                ...HR_SKILLS,
-                ...TA_SKILLS,
-                ...PROGRAM_SKILLS,
-                ...marketingApi.getMarketingSkills(),
+                ...getCompiledCatalog(),
                 // Adopted community skills (gstack, mattpocock/skills) loaded from disk.
                 ...(getAllFsSkills().map((s) => ({
                     id: s.id,
@@ -1643,7 +2305,8 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (simulate) {
                 const sim = simulateSkillExecution(skill);
                 sendJSON(res, 200, {
-                    status: 'complete',
+                    status: 'simulated',
+                    provenance: 'simulated',
                     mode: 'simulation',
                     skillId,
                     executionId: `sim-${Date.now()}`,
@@ -1655,29 +2318,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 return;
             }
 
-            const runtimeSec = 30 + Math.floor(Math.random() * 60);
-            const cost = 0.15 + Math.random() * 0.5;
-            skillMarketplace.recordExecution(skillId, userId, true, runtimeSec, cost);
-            memoryGraph.recordExecution({
-                userId,
-                skillId,
-                skillName: skill.name,
-                personaId: skill.personaId,
-                success: true,
-                runtimeSec,
-                cost,
-                agentsUsed: skill.agents.map(a => a.name),
-                toolsUsed: skill.requiredTools.map(t => t.name),
-                outputs: skill.outputs,
-            });
-            sendJSON(res, 200, {
-                status: 'complete',
-                skillId,
-                executionId: `exec-${Date.now()}`,
-                runtimeSec,
-                cost,
-                outputs: skill.outputs.map(o => ({ name: o, status: 'generated' })),
-            });
+            sendJSON(res, 422, { status: 'unsupported', provenance: 'none', error: 'Marketplace definition has no validated live execution adapter', skillId });
             return;
         }
 
@@ -2031,25 +2672,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!tmpl) { sendJSON(res, 404, { error: 'Workflow not found' }); return; }
             const body = await readBody(req).catch(() => ({})) as { inputs?: Record<string, unknown>; simulate?: boolean };
             const inputs = body.inputs ?? {};
-            const shouldSimulate = body.simulate !== undefined ? body.simulate : !hasAnyLLMKey();
+            const shouldSimulate = resolveSimulate(body.simulate);
             // Cross-functional templates span personas; the execution persona is the first
             // recognized one (each step carries its own agent). Steps are topologically ordered,
             // so the sequential runner satisfies dependsOn; requiresApproval steps pause on the
             // approval bus (POST .../approve/:stepId), and side-effecting tool calls are gated.
-            const persona = (['engineering', 'product', 'hr', 'marketing'].find((p) => tmpl.personas.includes(p)) ?? 'engineering') as 'engineering' | 'product' | 'hr' | 'marketing';
-            const skill = {
-                id: tmpl.id,
-                name: tmpl.name,
-                description: (tmpl as { description?: string }).description ?? '',
-                category: 'flagship',
-                requiredTools: Array.from(new Set(tmpl.steps.map((s) => s.tool).filter((t) => t && t !== 'Claude'))),
-                steps: tmpl.steps.map((s) => ({
-                    id: s.id, name: s.name, agent: s.agent, tool: s.tool,
-                    outputKey: s.outputKey, requiresApproval: s.requiresApproval, dependsOn: s.dependsOn,
-                })),
-            };
-            const exec = createPersonaExecution(persona, skill as any, inputs, userId, shouldSimulate);
-            recordAudit(userId, 'workflow.flagship.run', `${tmpl.name} (${tmpl.steps.length} steps)`);
+            const skill = getCompiledDefinition(tmpl.id)!;
+            const persona = skill.persona;
+            if (authUser && requiredPersonas(skill).some(required => !requirePersonaAccess(authUser, required))) {
+                sendJSON(res, 403, { error: 'Access denied for a workflow step persona' }); return;
+            }
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', persona, skill as any, inputs, userId, shouldSimulate);
+            if (!runRepository) recordAudit(userId, 'workflow.flagship.run', `${tmpl.name} (${tmpl.steps.length} steps)`);
             sendJSON(res, 201, { execution: exec });
             return;
         }
@@ -2378,32 +3012,12 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
-        if (path === '/api/scheduler/jobs' && method === 'POST') {
+        // Create, change, delete, run and toggle: persona and ownership checks live
+        // in legacy-scheduler-api.ts, mirroring the durable schedule-api.ts.
+        if (isLegacySchedulerWrite(path, method)) {
             if (guardRole('operator')) return;
-            const body = await readBody(req);
-            const { name, skillId, skillName, personaId, scheduleType, cronExpression, intervalMs, eventTrigger, oneTimeAt, timeout, retries, tags, inputs } = body as Record<string, unknown>;
-            if (!name || !skillId || !scheduleType) {
-                sendJSON(res, 400, { error: 'Missing required fields: name, skillId, scheduleType' });
-                return;
-            }
-            const job = scheduler.createJob({
-                name: name as string,
-                skillId: skillId as string,
-                skillName: (skillName as string) || (skillId as string),
-                personaId: (personaId as string) || 'general',
-                scheduleType: scheduleType as Parameters<typeof scheduler.createJob>[0]['scheduleType'],
-                cronExpression: cronExpression as string | undefined,
-                intervalMs: intervalMs as number | undefined,
-                eventTrigger: eventTrigger as string | undefined,
-                oneTimeAt: oneTimeAt as string | undefined,
-                timeout: timeout as number | undefined,
-                retries: retries as number | undefined,
-                tags: (tags as string[]) || [],
-                inputs: inputs as Record<string, unknown> | undefined,
-                status: 'active',
-                createdBy: userId,
-            });
-            sendJSON(res, 201, { job });
+            const result = await legacySchedulerRequest(scheduler, authUser!, path, method, await readBody(req) as Record<string, unknown>);
+            sendJSON(res, result.status, result.data);
             return;
         }
 
@@ -2413,44 +3027,6 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
             const logs = scheduler.getJobLogs(jobId);
             sendJSON(res, 200, { job, logs });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+$/) && method === 'PATCH') {
-            if (guardRole('operator')) return;
-            const jobId = path.split('/').pop()!;
-            const body = await readBody(req);
-            const job = scheduler.updateJob(jobId, body as Parameters<typeof scheduler.updateJob>[1]);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            sendJSON(res, 200, { job });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+$/) && method === 'DELETE') {
-            if (guardRole('operator')) return;
-            const jobId = path.split('/').pop()!;
-            const ok = scheduler.deleteJob(jobId);
-            if (!ok) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            sendJSON(res, 200, { deleted: jobId });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+\/run$/) && method === 'POST') {
-            const jobId = path.split('/')[4];
-            const job = scheduler.getJob(jobId);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            const log = await scheduler.executeJob(jobId, 'manual');
-            sendJSON(res, 200, { log, job: scheduler.getJob(jobId) });
-            return;
-        }
-
-        if (path.match(/^\/api\/scheduler\/jobs\/[^/]+\/toggle$/) && method === 'POST') {
-            const jobId = path.split('/')[4];
-            const job = scheduler.getJob(jobId);
-            if (!job) { sendJSON(res, 404, { error: 'Job not found' }); return; }
-            const newStatus = job.status === 'active' ? 'paused' : 'active';
-            const updated = scheduler.updateJob(jobId, { status: newStatus });
-            sendJSON(res, 200, { job: updated });
             return;
         }
 
@@ -2675,7 +3251,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/observability/agents' && method === 'GET') {
             // Real agent data from KPI store + registry
             const kpis = getAgentKPIs();
-            const stats = getExecutionStats();
+            const stats = await getExecutionStats();
             const activeSet = new Set(stats.activeAgents);
             const agents = kpis.map(k => {
                 const identity = getAgentIdentity(k.agentId);
@@ -2700,7 +3276,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         }
 
         if (path === '/api/observability/metrics' && method === 'GET') {
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const kpis = getAgentKPIs();
             sendJSON(res, 200, {
                 gateway: { status: 'healthy', uptime: process.uptime(), memoryMb: Math.round(process.memoryUsage().heapUsed / 1_000_000 * 100) / 100, wsClients: getWSClientCount() },
@@ -2779,10 +3355,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // ACP Executions
         // -----------------------------------------------------------------------
         if (path === '/api/acp/executions' && method === 'GET') {
-            // Real execution data — show recent executions with agent flow
-            const allExecs = getAllExecutions()
-              .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
-              .slice(0, 10);
+            // Real execution data — show recent executions with agent flow, scoped
+            // like /api/executions: only runs the caller may read, and durable runs
+            // from the repository rather than this replica's working copies.
+            const allExecs = runRepository && authUser
+              ? (await runRepository.list(authUser.tenantId, enforceExecutionOwnership() ? userId : undefined, 10, 0, { personas: ['engineering', 'product', 'marketing', 'hr', 'ta', 'program', 'executive', 'design', 'learning'].filter(value => requirePersonaAccess(authUser, value)) })).executions as unknown as ReturnType<typeof getAllExecutions>
+              : getAllExecutions()
+                .filter(canReadExecution)
+                .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+                .slice(0, 10);
 
             const executions = allExecs.map(exec => {
               const agentSet = new Map<string, { id: string; name: string; persona: string; model: string }>();
@@ -3183,7 +3764,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/governance/costs' && method === 'GET') {
             if (guardRole('operator')) return;
             // Real cost attribution from actual execution data
-            const execStats = getExecutionStats();
+            const execStats = await getExecutionStats();
             const now = new Date();
             const period = `${now.toLocaleString('en', { month: 'long' })} ${now.getFullYear()}`;
             const breakdown = Object.entries(execStats.byPersona).map(([persona, data]) => ({
@@ -3400,7 +3981,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const { workflowId, inputs, simulate, customPrompt, provider, modelId } = body as { workflowId: string; inputs?: Record<string, unknown>; simulate?: boolean; customPrompt?: string; provider?: string; modelId?: string };
             if (!workflowId) { sendJSON(res, 400, { error: 'Missing workflowId' }); return; }
             try {
-                const exec = marketingApi.createMarketingExecution(workflowId, inputs ?? {}, userId, simulate === true, customPrompt, provider as any, modelId);
+                const exec = await marketingApi.createMarketingExecution(authUser!.tenantId, workflowId, inputs ?? {}, userId, resolveSimulate(simulate), customPrompt, provider as any, modelId);
                 sendJSON(res, 201, { execution: exec });
             } catch (err) {
                 sendJSON(res, 400, { error: (err as Error).message });
@@ -3410,7 +3991,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         if (path.match(/^\/api\/marketing\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/').pop()!;
-            const exec = marketingApi.getMarketingExecution(execId);
+            const exec = await loadExecution(execId!);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -3418,28 +3999,18 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         if (path.match(/^\/api\/marketing\/executions\/[^/]+\/complete$/) && method === 'POST') {
             const execId = path.split('/')[4];
-            const exec = marketingApi.getMarketingExecution(execId);
+            const exec = await loadExecution(execId!);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
-            memoryGraph.recordExecution({
-                userId: exec.userId ?? 'anonymous',
-                skillId: exec.workflowId,
-                skillName: exec.workflowName,
-                personaId: 'marketing',
-                success: exec.status === 'completed',
-                runtimeSec: exec.completedAt && exec.startedAt ? Math.round((new Date(exec.completedAt).getTime() - new Date(exec.startedAt).getTime()) / 1000) : 0,
-                cost: 0,
-                agentsUsed: [...new Set(exec.steps.map((s) => s.agent))],
-                toolsUsed: [...new Set(exec.steps.map((s) => s.tool).filter(Boolean))] as string[],
-                outputs: Object.keys(exec.outputs),
-            });
-            const updated = marketingApi.updateMarketingExecution(execId, { status: 'completed', completedAt: new Date().toISOString() });
-            sendJSON(res, 200, { execution: updated });
+            if (!['completed', 'simulated'].includes(exec.status)) { sendJSON(res, 409, { error: 'Execution has not completed its required work' }); return; }
+            sendJSON(res, 200, { execution: exec });
             return;
         }
 
         if (path === '/api/marketing/executions' && method === 'GET') {
             const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
-            const execs = marketingApi.getRecentMarketingExecutions(limit);
+            const execs = runRepository
+                ? (await listScopedPersonaExecutions('marketing', limit)).map(execution => ({ ...execution, workflowId: execution.skillId, workflowName: execution.skillName }))
+                : marketingApi.getRecentMarketingExecutions(limit).filter(canReadExecution);
             sendJSON(res, 200, { executions: execs, total: execs.length });
             return;
         }
@@ -3515,7 +4086,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const toolId = path.split('/')[3]!;
             const flow = getToolConnectFlow(toolId);
             if (shouldRedirectToOAuth(toolId) && flow.oauthUrl) {
-                res.writeHead(302, { Location: flow.oauthUrl });
+                res.writeHead(302, { Location: beginToolAuthorization(flow, authUser!) });
                 res.end();
             } else {
                 sendJSON(res, 200, {
@@ -3539,8 +4110,9 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const toolId = parts[3]!;
             const code = url.searchParams.get('code');
             const err = url.searchParams.get('error');
-            const baseUrl = process.env.GATEWAY_URL ?? `http://${req.headers.host ?? 'localhost:3000'}`;
-            const redirectUri = `${baseUrl}/api/tools/${toolId}/callback`;
+            const authorization = authUser ? consumeToolAuthorization(url.searchParams.get('state') ?? '', toolId, authUser) : undefined;
+            if (!authorization) { sendJSON(res, 400, { error: 'Invalid or expired connector authorization state' }); return; }
+            const redirectUri = authorization.redirectUri;
 
             if (err) {
                 res.writeHead(400, { 'Content-Type': 'text/html' });
@@ -3578,7 +4150,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // Channels CRUD
         if (path === '/api/notifications/channels' && method === 'GET') {
-            sendJSON(res, 200, { channels: listChannels() });
+            sendJSON(res, 200, { channels: listChannels().map(redactChannel) });
             return;
         }
         if (path === '/api/notifications/channels' && method === 'POST') {
@@ -3586,14 +4158,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const body = await readBody(req) as { channel: string; name: string; config: unknown };
             const ch = createChannel(body.channel as Parameters<typeof createChannel>[0], body.name, body.config as Parameters<typeof createChannel>[2]);
             recordAudit(userId, 'notification.channel.create', ch.id);
-            sendJSON(res, 201, ch);
+            sendJSON(res, 201, redactChannel(ch));
             return;
         }
         if (path.match(/^\/api\/notifications\/channels\/[^/]+$/) && method === 'GET') {
             const id = path.split('/')[4]!;
             const ch = getChannel(id);
             if (!ch) { sendJSON(res, 404, { error: 'Channel not found' }); return; }
-            sendJSON(res, 200, ch);
+            sendJSON(res, 200, redactChannel(ch));
             return;
         }
         if (path.match(/^\/api\/notifications\/channels\/[^/]+$/) && method === 'PUT') {
@@ -3603,7 +4175,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const ch = updateChannel(id, body as Parameters<typeof updateChannel>[1]);
             if (!ch) { sendJSON(res, 404, { error: 'Channel not found' }); return; }
             recordAudit(userId, 'notification.channel.update', id);
-            sendJSON(res, 200, ch);
+            sendJSON(res, 200, redactChannel(ch));
             return;
         }
         if (path.match(/^\/api\/notifications\/channels\/[^/]+$/) && method === 'DELETE') {
@@ -3689,7 +4261,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // Endpoints CRUD
         if (path === '/api/webhooks/endpoints' && method === 'GET') {
-            sendJSON(res, 200, { endpoints: listEndpoints() });
+            sendJSON(res, 200, { endpoints: listEndpoints().map(redactEndpoint) });
             return;
         }
         if (path === '/api/webhooks/endpoints' && method === 'POST') {
@@ -3704,7 +4276,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const id = path.split('/')[4]!;
             const ep = getEndpoint(id);
             if (!ep) { sendJSON(res, 404, { error: 'Endpoint not found' }); return; }
-            sendJSON(res, 200, ep);
+            sendJSON(res, 200, redactEndpoint(ep));
             return;
         }
         if (path.match(/^\/api\/webhooks\/endpoints\/[^/]+$/) && method === 'DELETE') {
@@ -3719,7 +4291,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // Subscriptions CRUD
         if (path === '/api/webhooks/subscriptions' && method === 'GET') {
-            sendJSON(res, 200, { subscriptions: listSubscriptions() });
+            sendJSON(res, 200, { subscriptions: listSubscriptions().map(redactSubscription) });
             return;
         }
         if (path === '/api/webhooks/subscriptions' && method === 'POST') {
@@ -3727,14 +4299,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const body = await readBody(req) as { name: string; eventPattern: string; targetUrl: string; headers?: Record<string, string> };
             const sub = createSubscription(body.name, body.eventPattern, body.targetUrl, { headers: body.headers });
             recordAudit(userId, 'webhook.subscription.create', sub.id);
-            sendJSON(res, 201, sub);
+            sendJSON(res, 201, { ...redactSubscription(sub), signingSecret: sub.signingSecret });
             return;
         }
         if (path.match(/^\/api\/webhooks\/subscriptions\/[^/]+$/) && method === 'GET') {
             const id = path.split('/')[4]!;
             const sub = getSubscription(id);
             if (!sub) { sendJSON(res, 404, { error: 'Subscription not found' }); return; }
-            sendJSON(res, 200, sub);
+            sendJSON(res, 200, redactSubscription(sub));
             return;
         }
         if (path.match(/^\/api\/webhooks\/subscriptions\/[^/]+$/) && method === 'DELETE') {
@@ -4180,7 +4752,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // GET /api/connections — list all connection states
         if (path === '/api/connections' && method === 'GET') {
-            sendJSON(res, 200, { connections: Object.fromEntries(connectionStore) });
+            // Listing which integrations are wired is an administrative view.
+            if (guardRole('admin')) return;
+            // TODO(phase-9): filter by tenant. `connectionStore` is keyed by bare
+            // connectorId, so tenant B's connect currently overwrites tenant A's
+            // credentials — fixed when connections move to PK (tenant_id, connector_id).
+            const redacted: Record<string, RedactedConnection> = {};
+            for (const [key, rec] of connectionStore) redacted[key] = redactConnection(rec);
+            sendJSON(res, 200, { connections: redacted });
             return;
         }
 
@@ -4224,15 +4803,23 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
                 sendJSON(res, 400, { ok: false, error: 'Not connected. Add credentials first.' });
                 return;
             }
-            // Simulate a lightweight test (real validation would call the provider's health endpoint)
-            const simulatedOk = Math.random() > 0.05; // 95% pass rate in sim
-            if (simulatedOk) {
-                connectionStore.set(connectorId, { ...state, status: 'connected', lastTestedAt: new Date().toISOString() });
-                sendJSON(res, 200, { ok: true, message: 'Connection validated successfully.' });
-            } else {
-                connectionStore.set(connectorId, { ...state, status: 'error', error: 'Credentials rejected by provider.' });
-                sendJSON(res, 400, { ok: false, error: 'Test failed — credentials may be expired.' });
-            }
+            // This was `Math.random() > 0.05` — a coin flip reported to the user as
+            // "Connection validated successfully", and it WROTE that verdict into
+            // the connection status. So a broken credential could be marked
+            // healthy, and a working one marked rejected, at random.
+            //
+            // A real test means calling each provider's identity endpoint (GitHub
+            // /user, Slack auth.test, Jira /myself …). Until those are wired per
+            // connector, saying so is the only honest answer: 501 leaves the stored
+            // status untouched rather than overwriting it with a guess.
+            sendJSON(res, 501, {
+                ok: false,
+                error: 'Connection testing is not implemented for this connector yet.',
+                detail:
+                    'This endpoint used to return a random pass/fail and record it as the connection status. ' +
+                    'It now reports honestly instead. Credential validity is still proven the real way: ' +
+                    'run a skill that uses this connector and inspect the run.',
+            });
             return;
         }
 
@@ -4240,7 +4827,10 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path.match(/^\/api\/connections\/[^/]+\/status$/) && method === 'GET') {
             const connectorId = path.split('/')[3]!;
             const state = connectionStore.get(connectorId) ?? { connectorId, status: 'not-connected' };
-            sendJSON(res, 200, { connection: state });
+            // Redacted, same as the list route. This handler returned the raw
+            // record, so a single connector's credentials leaked here too — and
+            // unlike the list route it had no role check at all.
+            sendJSON(res, 200, { connection: redactConnection(state) });
             return;
         }
 
@@ -4273,7 +4863,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getEngineeringSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('engineering', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', 'engineering', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `Engineering / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'engineering', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4282,7 +4872,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // GET /api/engineering/executions — list recent executions
         if (path === '/api/engineering/executions' && method === 'GET') {
-            const execs = listPersonaExecutions('engineering');
+            const execs = await listScopedPersonaExecutions('engineering');
             sendJSON(res, 200, { executions: execs });
             return;
         }
@@ -4290,7 +4880,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // GET /api/engineering/executions/:id — single execution
         if (path.match(/^\/api\/engineering\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/')[4]!;
-            const exec = getPersonaExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec || exec.persona !== 'engineering') { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -4301,7 +4891,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const parts = path.split('/');
             const execId = parts[4]!;
             const stepId = parts[6]!;
-            const result = approvePersonaStep(execId, stepId);
+            const result = approvePersonaStep(execId, stepId, userId);
             sendJSON(res, result.success ? 200 : 400, result);
             return;
         }
@@ -4335,7 +4925,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getProductSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('product', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', 'product', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `Product / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'product', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4344,7 +4934,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // GET /api/product/executions — list recent executions
         if (path === '/api/product/executions' && method === 'GET') {
-            const execs = listPersonaExecutions('product');
+            const execs = await listScopedPersonaExecutions('product');
             sendJSON(res, 200, { executions: execs });
             return;
         }
@@ -4352,7 +4942,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // GET /api/product/executions/:id — single execution
         if (path.match(/^\/api\/product\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/')[4]!;
-            const exec = getPersonaExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec || exec.persona !== 'product') { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -4363,7 +4953,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const parts = path.split('/');
             const execId = parts[4]!;
             const stepId = parts[6]!;
-            const result = approvePersonaStep(execId, stepId);
+            const result = approvePersonaStep(execId, stepId, userId);
             sendJSON(res, result.success ? 200 : 400, result);
             return;
         }
@@ -4397,7 +4987,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getHRSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const exec = createPersonaExecution('hr', skill, inputs ?? {}, undefined, simulate, customPrompt, provider as any, modelId);
+            const exec = await createPersonaExecution(authUser?.tenantId ?? 'default', 'hr', skill, inputs ?? {}, userId, simulate, customPrompt, provider as any, modelId);
             recordAudit(userId, 'skill.execute', `HR / ${skill.name}`);
             broadcastEvent(exec.id, 'session.started', { persona: 'hr', skillId, simulate, provider });
             sendJSON(res, 200, { execution: exec });
@@ -4406,7 +4996,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // GET /api/hr/executions — list recent executions
         if (path === '/api/hr/executions' && method === 'GET') {
-            const execs = listPersonaExecutions('hr');
+            const execs = await listScopedPersonaExecutions('hr');
             sendJSON(res, 200, { executions: execs });
             return;
         }
@@ -4414,7 +5004,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         // GET /api/hr/executions/:id — single execution
         if (path.match(/^\/api\/hr\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/')[4]!;
-            const exec = getPersonaExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec || exec.persona !== 'hr') { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -4425,7 +5015,7 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             const parts = path.split('/');
             const execId = parts[4]!;
             const stepId = parts[6]!;
-            const result = approvePersonaStep(execId, stepId);
+            const result = approvePersonaStep(execId, stepId, userId);
             sendJSON(res, result.success ? 200 : 400, result);
             return;
         }
@@ -4454,20 +5044,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getTASkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = createPersonaExecution('ta' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'ta' as any, skill as any, inputs || {}, userId, resolveSimulate(simulate));
             sendJSON(res, 201, { execution });
             return;
         }
 
         if (path === '/api/ta/executions' && method === 'GET') {
-            const execs = listPersonaExecutions('ta' as any);
+            const execs = await listScopedPersonaExecutions('ta' as any);
             sendJSON(res, 200, { executions: execs });
             return;
         }
 
         if (path.match(/^\/api\/ta\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/')[4]!;
-            const exec = getPersonaExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -4497,20 +5087,20 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             if (!skillId) { sendJSON(res, 400, { error: 'skillId required' }); return; }
             const skill = getProgramSkill(skillId);
             if (!skill) { sendJSON(res, 404, { error: `Skill not found: ${skillId}` }); return; }
-            const execution = createPersonaExecution('program' as any, skill as any, inputs || {}, userId, simulate ?? false);
+            const execution = await createPersonaExecution(authUser?.tenantId ?? 'default', 'program' as any, skill as any, inputs || {}, userId, resolveSimulate(simulate));
             sendJSON(res, 201, { execution });
             return;
         }
 
         if (path === '/api/program/executions' && method === 'GET') {
-            const execs = listPersonaExecutions('program' as any);
+            const execs = await listScopedPersonaExecutions('program' as any);
             sendJSON(res, 200, { executions: execs });
             return;
         }
 
         if (path.match(/^\/api\/program\/executions\/[^/]+$/) && method === 'GET') {
             const execId = path.split('/')[4]!;
-            const exec = getPersonaExecution(execId);
+            const exec = await loadExecution(execId);
             if (!exec) { sendJSON(res, 404, { error: 'Execution not found' }); return; }
             sendJSON(res, 200, { execution: exec });
             return;
@@ -4724,6 +5314,14 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
             return;
         }
 
+        // GET /api/llm/models — the models a live run may name, with the price its
+        // budget is reserved at. Anything else is refused at submission, so a model
+        // picker should offer only these. Pricing and availability only: no tenant data.
+        if (path === '/api/llm/models' && method === 'GET') {
+            sendJSON(res, 200, { models: listPricedModels(), llmConfigured: hasAnyLLMKey(), defaultProvider: hasAnyLLMKey() ? getDefaultProvider() : null });
+            return;
+        }
+
         // -----------------------------------------------------------------------
         // Agent Registry API — Backend agent identities
         // -----------------------------------------------------------------------
@@ -4767,21 +5365,40 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
         // Agent Memory — per-agent accumulated context
         if (path === '/api/agents/memory' && method === 'GET') {
-            sendJSON(res, 200, { snapshots: getAllAgentMemorySnapshots() });
+            sendJSON(res, 200, { snapshots: getAllAgentMemorySnapshots(authUser?.tenantId ?? 'default') });
             return;
         }
 
         if (path.match(/^\/api\/agents\/memory\/[^/]+$/) && method === 'GET') {
             const agentId = decodeURIComponent(path.split('/')[4]!);
-            sendJSON(res, 200, { agentId, entries: getAgentMemory(agentId), document: getAgentMemoryDocument(agentId) });
+            // Scoped to the caller's own tenant. Reading another tenant's agent
+            // memory would expose their operational learnings verbatim.
+            const tenantId = authUser?.tenantId ?? 'default';
+            sendJSON(res, 200, {
+                agentId,
+                entries: getAgentMemory(tenantId, agentId),
+                document: getAgentMemoryDocument(tenantId, agentId),
+            });
             return;
         }
 
         if (path.match(/^\/api\/agents\/memory\/[^/]+$/) && method === 'POST') {
+            // Whatever is written here is spliced verbatim into this agent's system
+            // prompt on every later run in this tenant. That makes it a prompt
+            // injection primitive, so it is operator-only — it previously had no
+            // role check and no tenant scope at all, meaning any caller could
+            // implant instructions into every tenant's agents permanently.
+            if (guardRole('operator')) return;
             const agentId = decodeURIComponent(path.split('/')[4]!);
             const body = await readBody(req);
             if (!body.kind || !body.content) { sendJSON(res, 400, { error: 'kind and content required' }); return; }
-            const entry = recordAgentMemory(agentId, body.kind as 'learning' | 'correction' | 'pattern' | 'preference', body.content as string, (body.source as string) ?? 'manual');
+            const entry = recordAgentMemory(
+                authUser?.tenantId ?? 'default',
+                agentId,
+                body.kind as 'learning' | 'correction' | 'pattern' | 'preference',
+                body.content as string,
+                (body.source as string) ?? 'manual',
+            );
             sendJSON(res, 201, { entry });
             return;
         }
@@ -4945,14 +5562,15 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
         if (path === '/api/aar' && method === 'GET') {
             const persona = url.searchParams.get('persona') ?? undefined;
             const limit = parseInt(url.searchParams.get('limit') ?? '20', 10);
-            sendJSON(res, 200, { reports: listAfterActionReports(persona, limit) });
+            sendJSON(res, 200, { reports: listAfterActionReports(canReadExecution, persona, limit) });
             return;
         }
 
         // GET /api/aar/:executionId — get AAR for a specific execution
         if (path.match(/^\/api\/aar\/[^/]+$/) && method === 'GET') {
             const executionId = decodeURIComponent(path.split('/')[3]!);
-            const aar = getAfterActionReport(executionId);
+            // Not found and not readable answer alike, so ids of other users' runs do not leak.
+            const aar = getAfterActionReport(executionId, canReadExecution);
             if (!aar) { sendJSON(res, 404, { error: 'No After-Action Report for this execution' }); return; }
             sendJSON(res, 200, { report: aar });
             return;
@@ -5148,19 +5766,46 @@ async function readBody(req: http.IncomingMessage): Promise<Record<string, unkno
 // Start server
 // ---------------------------------------------------------------------------
 
-const server = http.createServer(handleRequest);
+const server = http.createServer((req, res) => {
+    const started = Date.now();
+    res.once('finish', () => recordRequest(Date.now() - started, res.statusCode >= 500));
+    void handleRequest(req, res).catch(() => sendJSON(res, 503, { error: 'Request dependency unavailable' }));
+});
 
 // Initialize OpenTelemetry (non-blocking — logs warning if OTel packages missing)
 void initOTel('gateway');
 
 // Attach WebSocket handler for live execution streaming
-attachWebSocket(server);
+attachWebSocket(server, {
+    authenticate: async req => {
+        const result = await authenticateRequest(
+            { authorization: req.headers.authorization, 'x-api-key': typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : undefined },
+            { localDemo: env.EAOS_DEMO_MODE === 'local' ? localDemoVerdict(req, trustedProxies) : undefined },
+        );
+        return result.authenticated && result.user && (runRepository || result.user.tenantId === deploymentTenantId) ? result.user : undefined;
+    },
+    authorize: async (user, channel) => {
+        const current = await resolvePlatformPrincipal(platformRepository, user);
+        if (!current) return false;
+        user = current;
+        if (channel.startsWith('chat:')) return Boolean(await getChatSession(channel.slice(5), { userId: user.id, tenantId: user.tenantId }));
+        // Agent status spans every principal's runs (current run ids and skills), so
+        // it is operator telemetry, like /api/metrics; others are refused, not dropped.
+        if (channel === 'agents') return user.role === 'admin' || user.role === 'operator' ? true : 'denied';
+        const id = streamChannelKey(channel);
+        const execution = runRepository ? await runRepository.get(user.tenantId, id) : getPersonaExecution(id, user.tenantId);
+        return Boolean(execution && requirePersonaAccess(user, execution.persona) && (!Array.isArray(execution.requiredPersonas) || execution.requiredPersonas.every(persona => typeof persona === 'string' && requirePersonaAccess(user, persona))) && canReadStreamResource(user, execution));
+    },
+});
 
-server.listen(PORT, () => {
+// HOST unset listens on every interface, which a container needs; `pnpm dev` sets
+// 127.0.0.1 so local demo mode is not reachable from the network at all.
+const onListening = () => {
     console.log(`\n  ╔══════════════════════════════════════╗`);
     console.log(`  ║   EOS Gateway — Enterprise OS API    ║`);
     console.log(`  ║   http://localhost:${PORT}              ║`);
     console.log(`  ╚══════════════════════════════════════╝\n`);
+    console.log(`  Listening on ${env.HOST ?? 'every interface'}, port ${PORT}`);
     console.log(`  Endpoints:`);
     console.log(`    POST /api/query                    — Natural language query`);
     console.log(`    GET  /api/query/:id                — Get session result`);
@@ -5193,26 +5838,35 @@ server.listen(PORT, () => {
     console.log(`    WS   /ws                            — Live execution streaming`);
     console.log(`\n  LLM: ${process.env.ANTHROPIC_API_KEY ? '✅ ANTHROPIC_API_KEY configured — real AI calls enabled' : '⚠️  ANTHROPIC_API_KEY not set — using fallback responses'}`);
     console.log(`  GitHub: ${process.env.GITHUB_TOKEN ? '✅ GITHUB_TOKEN configured' : '⚠️  GITHUB_TOKEN not set'}`);
-    console.log(`  Persistence: ${usePostgres ? '✅ PostgreSQL (DATABASE_URL)' : useInMemory ? '📝 In-memory store (PERSIST=false)' : '✅ File-backed persistent store (default)'}`);
+    console.log(`  Persistence: ${storeResult.mode === 'postgres' ? '✅ PostgreSQL (DATABASE_URL)' : storeResult.mode === 'file' ? `✅ File-backed (${storeResult.path})` : '⚠️  EPHEMERAL — in-memory only, all state lost on restart'}`);
     console.log(`  OpenTelemetry: ${process.env.OTEL_EXPORTER_OTLP_ENDPOINT ? '✅ Exporting to ' + process.env.OTEL_EXPORTER_OTLP_ENDPOINT : '📝 Set OTEL_EXPORTER_OTLP_ENDPOINT to enable'}\n`);
-});
+};
+if (env.HOST) server.listen(PORT, env.HOST, onListening);
+else server.listen(PORT, onListening);
 
 // Graceful shutdown — flush persistent store
-process.on('SIGTERM', () => {
-    flushGatewayPersistence();
-    if ('flush' in store) (store as PersistentStore).flush();
-    if ('close' in store) void (store as PostgresStore).close();
-    void shutdownOTel();
-    void mcpManager.disconnectAll();
-    server.close();
-});
-process.on('SIGINT', () => {
-    flushGatewayPersistence();
-    if ('flush' in store) (store as PersistentStore).flush();
-    if ('close' in store) void (store as PostgresStore).close();
-    void shutdownOTel();
-    void mcpManager.disconnectAll();
-    server.close();
-});
+let shutdownStarted = false;
+async function shutdown(): Promise<void> {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    const deadline = setTimeout(() => process.exit(1), 15_000);
+    closeWebSockets();
+    const closed = new Promise<void>(resolve => server.close(() => resolve()));
+    try {
+        await stopWorkers();
+        await requestMeasurements?.flush();
+        await flushGatewayPersistence();
+        if ('flush' in store) (store as PersistentStore).flush();
+        if ('close' in store) await (store as PostgresStore).close();
+        await Promise.all([shutdownOTel(), mcpManager.disconnectAll(), closed]);
+        clearTimeout(deadline);
+        process.exit(0);
+    } catch {
+        clearTimeout(deadline);
+        process.exit(1);
+    }
+}
+process.on('SIGTERM', () => { void shutdown(); });
+process.on('SIGINT', () => { void shutdown(); });
 
 export { server };

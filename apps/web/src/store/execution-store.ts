@@ -11,7 +11,7 @@ import { persist } from 'zustand/middleware';
 // Types
 // ---------------------------------------------------------------------------
 
-export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'approval_required' | 'skipped';
+export type StepStatus = import('@agentos/skills/schema').StepStatus;
 
 export interface ExecutionStep {
   stepId: string;
@@ -38,7 +38,7 @@ export interface ExecutionEdge {
 
 export type ExecutionMode = 'sequential' | 'dag';
 
-export type ExecutionStatus = 'configuring' | 'precheck' | 'queued' | 'running' | 'completed' | 'failed' | 'paused';
+export type ExecutionStatus = 'configuring' | 'precheck' | import('@agentos/skills/schema').ExecutionStatus;
 
 export interface Execution {
   id: string;
@@ -93,6 +93,7 @@ export interface SkillDefinition {
   steps: SkillStep[];
   /** Input fields the user needs to fill */
   inputFields: SkillInputField[];
+  support?: { executionClass: string; readiness: string; certification: { vendorSandbox: string; domainReview: string } };
   /** Output format definition */
   outputFormat?: string;
   icon?: string;
@@ -119,6 +120,7 @@ export interface SkillInputField {
   type: 'text' | 'textarea' | 'number' | 'date' | 'select' | 'multiselect' | 'file';
   placeholder?: string;
   required: boolean;
+  multiple?: boolean;
   options?: { label: string; value: string }[];
   /** Short inline hint shown below the input */
   hint?: string;

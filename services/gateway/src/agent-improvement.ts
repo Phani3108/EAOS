@@ -9,6 +9,7 @@
  */
 
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 import { eventBus } from './event-bus.js';
 
 // ---------------------------------------------------------------------------
@@ -129,22 +130,22 @@ function persist(table: string, id: string, data: unknown): void {
   } catch { /* ignore */ }
 }
 
-export function initImprovementStore(store: Store): void {
+export async function initImprovementStore(store: Store): Promise<void> {
   backingStore = store;
   try {
-    for (const row of store.all(REVIEWS_TABLE)) {
+    for (const row of await readAll(store, REVIEWS_TABLE)) {
       const r = row as unknown as PerformanceReview;
       if (r.id) reviews.set(r.id, r);
     }
-    for (const row of store.all(PLANS_TABLE)) {
+    for (const row of await readAll(store, PLANS_TABLE)) {
       const p = row as unknown as ImprovementPlan;
       if (p.id) plans.set(p.id, p);
     }
-    for (const row of store.all(FEEDBACK_TABLE)) {
+    for (const row of await readAll(store, FEEDBACK_TABLE)) {
       const f = row as unknown as FeedbackEntry;
       if (f.id) feedback.push(f);
     }
-    for (const row of store.all(EXEMPLARS_TABLE)) {
+    for (const row of await readAll(store, EXEMPLARS_TABLE)) {
       const e = row as unknown as TrainingExemplar;
       if (e.id) exemplars.set(e.id, e);
     }

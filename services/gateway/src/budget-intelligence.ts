@@ -7,6 +7,7 @@
  */
 
 import type { Store } from './db.js';
+import { readAll } from './db.js';
 import { eventBus } from './event-bus.js';
 
 // ---------------------------------------------------------------------------
@@ -93,18 +94,18 @@ function persist(table: string, id: string, data: unknown): void {
   } catch { /* ignore */ }
 }
 
-export function initBudgetStore(store: Store): void {
+export async function initBudgetStore(store: Store): Promise<void> {
   backingStore = store;
   try {
-    for (const row of store.all(BUDGETS_TABLE)) {
+    for (const row of await readAll(store, BUDGETS_TABLE)) {
       const b = row as unknown as AgentBudget;
       if (b.agentId) budgets.set(b.agentId, b);
     }
-    for (const row of store.all(SPEND_TABLE)) {
+    for (const row of await readAll(store, SPEND_TABLE)) {
       const s = row as unknown as SpendEntry;
       if (s.id) spendLog.push(s);
     }
-    for (const row of store.all(ALERTS_TABLE)) {
+    for (const row of await readAll(store, ALERTS_TABLE)) {
       const a = row as unknown as CostAlert;
       if (a.id) alerts.push(a);
     }

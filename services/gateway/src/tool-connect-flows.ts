@@ -5,6 +5,29 @@
  * @copyright © 2026 Phani Marupaka. All rights reserved.
  */
 
+import { randomBytes } from 'node:crypto';
+import type { AuthUser } from './auth.js';
+
+const pending = new Map<string, { toolId: string; userId: string; tenantId: string; sessionId: string; redirectUri: string; expiresAt: number }>();
+
+export function beginToolAuthorization(flow: ToolConnectFlow, user: AuthUser): string {
+  if (!user.sessionId || !flow.oauthUrl || !flow.redirectUri) throw new Error('A browser session and configured OAuth redirect are required');
+  for (const [key, entry] of pending) if (entry.expiresAt <= Date.now()) pending.delete(key);
+  if (pending.size >= 1000) throw new Error('Too many pending connector authorizations');
+  const state = randomBytes(32).toString('hex');
+  pending.set(state, { toolId: flow.toolId, userId: user.id, tenantId: user.tenantId, sessionId: user.sessionId, redirectUri: flow.redirectUri, expiresAt: Date.now() + 600_000 });
+  const url = new URL(flow.oauthUrl);
+  url.searchParams.set('state', state);
+  return url.toString();
+}
+
+export function consumeToolAuthorization(state: string, toolId: string, user: AuthUser): { redirectUri: string } | undefined {
+  const entry = pending.get(state);
+  pending.delete(state);
+  return entry && entry.expiresAt > Date.now() && entry.toolId === toolId && entry.userId === user.id &&
+    entry.tenantId === user.tenantId && entry.sessionId === user.sessionId ? { redirectUri: entry.redirectUri } : undefined;
+}
+
 export interface ToolConnectFlow {
   toolId: string;
   authType: 'oauth' | 'api_key';

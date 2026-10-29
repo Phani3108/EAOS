@@ -62,6 +62,13 @@ export type { MemoryClient, EventPublisher, DelegationClient } from './context.j
 
 // Workflow Runner
 export { WorkflowRunner } from './workflow-runner.js';
+export type { WorkflowClient } from './workflow-runner.js';
+export { GatewayWorkflowClient } from './gateway-workflow-client.js';
+export { PlatformClient } from './platform-client.js';
+export type { OperationsSummary, LabeledDataset, DatasetRecord, EvaluationEvidence, RegistryCandidate, ConnectorConformanceReport, TenantMember, PlatformEvent } from './platform-client.js';
+export type { CanonicalWorkflowSnapshot } from './gateway-workflow-client.js';
+export { validateGraph, planGraph, resolveGraphInput } from './graph-plan.js';
+export type { GraphNodeState, GraphDependency, GraphPlan } from './graph-plan.js';
 export type {
     TaskDispatcher,
     ConditionEvaluator,

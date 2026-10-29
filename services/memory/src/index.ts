@@ -78,10 +78,39 @@ CREATE INDEX IF NOT EXISTS idx_me_worker ON memory_episodes(worker_id);
 // Embedding helper — uses OpenAI-compatible API or falls back to random vec
 // ---------------------------------------------------------------------------
 
-async function embed(text: string): Promise<number[]> {
+/** Raised when no embedding provider is configured. Not retryable. */
+export class EmbeddingsNotConfiguredError extends Error {
+    readonly name = 'EmbeddingsNotConfiguredError';
+    constructor() {
+        super(
+            'OPENAI_API_KEY is not set, so no real embeddings can be produced. ' +
+                'Set it, or set MEMORY_ALLOW_SYNTHETIC_EMBEDDINGS=true for local ' +
+                'development (synthetic vectors can be searched but never stored).',
+        );
+    }
+}
+
+/**
+ * An embedding plus where it came from.
+ *
+ * `synthetic` vectors are hash-derived and carry no semantic meaning. Cosine
+ * similarity over them produces confident-looking numbers that mean nothing, so
+ * they are opt-in, always reported, and never written to the database — a stored
+ * synthetic vector would silently corrupt every future search against that
+ * namespace, with no way to identify it after the fact.
+ */
+interface Embedding {
+    vector: number[];
+    basis: 'measured' | 'synthetic';
+}
+
+async function embed(text: string): Promise<Embedding> {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-        // Deterministic pseudo-random vector for dev (hash-based)
+        if (process.env.MEMORY_ALLOW_SYNTHETIC_EMBEDDINGS !== 'true') {
+            throw new EmbeddingsNotConfiguredError();
+        }
+        // Deterministic pseudo-random vector for local dev only.
         const vec: number[] = [];
         let h = 0;
         for (let i = 0; i < text.length; i++) h = ((h << 5) - h + text.charCodeAt(i)) | 0;
@@ -91,7 +120,7 @@ async function embed(text: string): Promise<number[]> {
         }
         // Normalize
         const mag = Math.sqrt(vec.reduce((s, v) => s + v * v, 0));
-        return vec.map(v => v / mag);
+        return { vector: vec.map(v => v / mag), basis: 'synthetic' };
     }
 
     const res = await fetch('https://api.openai.com/v1/embeddings', {
@@ -102,7 +131,7 @@ async function embed(text: string): Promise<number[]> {
 
     if (!res.ok) throw new Error(`Embedding API error: ${res.status}`);
     const data = (await res.json()) as { data: Array<{ embedding: number[] }> };
-    return data.data[0].embedding;
+    return { vector: data.data[0].embedding, basis: 'measured' };
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +171,26 @@ class MemoryService {
                 if (path === '/upsert' && method === 'POST') {
                     const { namespace, content, metadata } = body as { namespace: string; content: string; metadata?: Record<string, unknown> };
                     if (!namespace || !content) { send(res, 400, { error: 'namespace and content required' }); return; }
-                    const vec = await embed(content);
+                    const emb = await embed(content);
+                    // A synthetic vector must never be persisted: it is
+                    // indistinguishable from a real one once stored, and it
+                    // degrades every subsequent kNN query in this namespace.
+                    if (emb.basis === 'synthetic') {
+                        send(res, 503, {
+                            error: 'Refusing to store a synthetic embedding',
+                            reason:
+                                'No embedding provider is configured. Set OPENAI_API_KEY. ' +
+                                'Synthetic vectors are searchable in dev but are never written, ' +
+                                'because a stored one would silently corrupt this namespace.',
+                            embeddingBasis: emb.basis,
+                        });
+                        return;
+                    }
                     const { rows } = await db.query(
                         `INSERT INTO memory_vectors (namespace, content, embedding, metadata) VALUES ($1, $2, $3::vector, $4) RETURNING id`,
-                        [namespace, content, `[${vec.join(',')}]`, JSON.stringify(metadata ?? {})],
+                        [namespace, content, `[${emb.vector.join(',')}]`, JSON.stringify(metadata ?? {})],
                     );
-                    send(res, 200, { id: rows[0].id });
+                    send(res, 200, { id: rows[0].id, embeddingBasis: emb.basis });
                     return;
                 }
 
@@ -157,7 +200,7 @@ class MemoryService {
                         namespace: string; query: string; topK?: number; minSimilarity?: number;
                     };
                     if (!namespace || !query) { send(res, 400, { error: 'namespace and query required' }); return; }
-                    const vec = await embed(query);
+                    const emb = await embed(query);
                     const k = topK ?? 5;
                     const minSim = minSimilarity ?? 0.5;
                     const { rows } = await db.query(
@@ -166,9 +209,12 @@ class MemoryService {
                          WHERE namespace = $2 AND 1 - (embedding <=> $1::vector) >= $3
                          ORDER BY embedding <=> $1::vector
                          LIMIT $4`,
-                        [`[${vec.join(',')}]`, namespace, minSim, k],
+                        [`[${emb.vector.join(',')}]`, namespace, minSim, k],
                     );
-                    send(res, 200, { results: rows });
+                    // `embeddingBasis` travels with the results so a caller can
+                    // tell a real semantic match from a meaningless dev one. The
+                    // similarity numbers look identical either way.
+                    send(res, 200, { results: rows, embeddingBasis: emb.basis });
                     return;
                 }
 

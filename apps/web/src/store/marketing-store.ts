@@ -14,7 +14,7 @@ import { persist } from 'zustand/middleware';
 
 export type MarketingSection = 'run' | 'library' | 'pipelines' | 'history';
 
-export type ExecutionStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'approval_required';
+export type ExecutionStepStatus = import('@agentos/skills/schema').StepStatus;
 
 export interface ExecutionStepEvent {
   id: string;
@@ -41,7 +41,8 @@ export interface MarketingExecution {
   id: string;
   workflowId: string;
   workflowName: string;
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'paused';
+  status: import('@agentos/skills/schema').ExecutionStatus;
+  mode?: import('@agentos/skills/schema').RunMode;
   steps: ExecutionStepEvent[];
   outputs: Record<string, string>;
   startedAt: string;
