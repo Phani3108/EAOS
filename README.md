@@ -227,36 +227,19 @@ Connector calls resolve their secret from Vault at call time. All outbound conne
 
 ## ✨ Highlights
 
-- 🤖 **53 autonomous agents** across 5 regiments (Titan · Olympian · Asgard · Explorer · Eden)
-- 🏛️ **Military hierarchy** — General → Field Marshal → Colonel → Captain → Corporal
-- 🧰 **60+ pre-built skills** spanning Engineering, Marketing, Product, HR, Talent, PMO
-- 🔌 **MCP tool layer** with 8+ adapters (Jira, GitHub, Slack, Confluence, HubSpot, GA4, LinkedIn, Figma)
-- 🔄 **A2A protocol** for agent-to-agent delegation, review, critique, escalation
-- 📦 **UTCP packets** — universal task context standard for every execution
-- 🧭 **5 flagship workflows** — PRD→Jira · Incident RCA · Campaign Launch · Hiring Pipeline · Launch Readiness
-- 🎯 **Model router** — Haiku → Sonnet → Opus with cost metering & circuit breakers
-- 🛡️ **Governance built-in** — RBAC, audit trail, compliance checks, cost attribution, budget controls
-- 📊 **150+ API routes** — fully implemented backend with real persistence
-- 🧩 **Skill Library** — adopted, file-defined EAOS skills (QA loop · security audit · PRD writer · technical spec · product discovery) runnable from the UI
-- 🏛️ **Regiment Review** — collaborative Strategy → Design → Engineering → DevEx review chain where each stage sees the prior verdicts
-- 🔌 **Real MCP client** — stdio + HTTP transports with graceful degradation (codebase-memory, voicebox)
-- 🎬 **Guided onboarding + dark mode** — storytelling home, an "experience the magic" first-run flow, light/dark themes, and toast feedback
-- 🔒 **Hardened security** — OIDC JWKS verification · mandatory JWT in prod · IDOR-scoped reads · CORS allowlist · safe expression eval · SkillSpector skill-scan gate
-
----
-
-## 🧬 How It Works
-
-```
-You state a goal
-  → Intent Engine selects the workflow
-    → Agents collaborate (A2A) and run skills
-      → Tools execute the work (MCP)
-        → Outputs are aggregated and reviewed
-          → Human approves → Memory + after-action report
-```
-
-Vision-level goals are **decomposed** by the C-suite and **cascaded** down through regiments to individual agents — the same loop scales from a single skill run to a cross-functional swarm.
+- 🤖 **53 agents in 5 regiments plus High Command**: Titan (executive and programs), Olympian (marketing), Asgard (engineering), Explorer (product) and Eden (HR and talent). Every agent has a call sign and a rank.
+- 🪖 **Ranks with accountability**: General → Field Marshal → Colonel → Captain → Corporal. Every step of a run names the agent that did it.
+- 🧰 **81 runnable definitions**:
+  - 46 persona skills and 30 marketing workflows.
+  - 5 flagship workflows: PRD → Jira, Incident RCA, Campaign Launch, Hiring Pipeline and Launch Readiness.
+  - Plus 18 adopted file-defined skills.
+- ⚙️ **Durable runtime on PostgreSQL**: idempotent runs, fenced worker leases, approval gates that survive restarts, child runs, deadlines, schedules and an event outbox.
+- 🧑‍⚖️ **Human approval gates**: confirmations, named approvers and a check that the draft hasn't changed, before any external action.
+- 🧪 **Simulation by default**: with no model key, runs are simulated and labelled. Add a key and a budget to go live.
+- 🔌 **Verified connectors**: GitHub, Jira and Slack through Vault secret references, with every write read back. An MCP client handles voicebox, code-memory and SkillSpector.
+- 🤝 **Multi-agent modes**: goal planner, pipelines with quality gates, swarms with phase approvals, and chat that starts runs.
+- 🏛️ **Regiment Review**: a strategy → design → engineering → developer-experience review chain, where each reviewer sees the earlier verdicts.
+- 📏 **Evaluations and a release gate**: labelled datasets, and registry promotion that needs live evidence and an independent reviewer.
 
 ---
 
@@ -268,76 +251,45 @@ git clone https://github.com/Phani3108/EAOS.git
 cd EAOS
 pnpm install
 
-# 🔐 Set up environment
-cp deploy/.env.example .env
-# Edit .env — add at minimum: ANTHROPIC_API_KEY
-
-# ▶️ Run gateway + frontend
+# ▶️ One command: dev PostgreSQL (Docker), migrations, gateway and web.
+#    Local demo mode, so no sign-in is needed on this machine.
 pnpm dev
-
-# 🐳 Or use Docker
-docker compose -f deploy/docker-compose.production.yml up -d
 ```
 
-- 🌐 **Frontend** — http://localhost:3010
-- 🛠️ **Gateway** — http://localhost:3000
-- 📈 **Grafana** — http://localhost:3001
+- 🌐 **Web**: http://localhost:3010 · 🛠️ **Gateway**: http://localhost:3000.
+- 🧪 **Going live:** runs are simulated until you add a model key. Copy `.env.example` to `.env`, set `ANTHROPIC_API_KEY` (or another provider), restart, then set a workspace budget with `PUT /api/runtime/usage`.
+- 🗂️ **Without Docker,** `pnpm dev` falls back to the file store (limited mode).
+- 🐳 **Production-style stack:**
+  1. `cp deploy/.env.example deploy/.env` and fill in every REQUIRED value.
+  2. Run `docker compose -f deploy/docker-compose.production.yml up -d`.
+  3. Grafana is on http://localhost:3001.
+- ✅ **Prerequisites:** Node.js ≥ 22.20, pnpm 10.14 (via corepack), and Docker for the dev database.
 
-### ✅ Prerequisites
+Deployment, authentication, connectors, budgets and every runtime contract are in **[docs/operations.md](docs/operations.md)**.
 
-- 🟢 Node.js >= 20.0.0
-- 📦 pnpm >= 9.0.0
+### Verification
+
+- `pnpm build && pnpm typecheck && pnpm lint && pnpm test`: build, type checks, lint and 427 unit and contract tests.
+- `pnpm audit --prod --audit-level=high`: a blocking release check.
+- `EAOS_TEST_DATABASE_URL=… pnpm test:m0` (database `eaos_m0_fixture`): migrations, row-level security, and the key and session lifecycle.
+- `EAOS_TEST_DATABASE_URL=… pnpm test:m2` (database `eaos_m2_fixture`): durable-runtime acceptance, including the M3–M7 contracts. `test:m3` to `test:m7` run the same suite.
+- `pnpm exec playwright install chromium`, then `pnpm test:browser`: browser sign-in through the production proxy.
+- The fixture suites create rows and roles, so never point them at real data.
 
 ---
 
-## 🏛️ Architecture
+## 🪖 Organization
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Frontend (Next.js 14)                 │
-│  Sidebar │ Command Palette │ Main Content │ Right Panel  │
-├──────────┴─────────────────┴──────────────┴─────────────┤
-│                    Gateway API (Node.js)                 │
-│  150+ API routes │ JWT Auth │ Event Bus │ WebSocket      │
-├─────────────────────────────────────────────────────────┤
-│              Agent Hierarchy (53 Agents)                 │
-│  Titan │ Olympian │ Asgard │ Explorer │ Eden Regiments   │
-├─────────────────────────────────────────────────────────┤
-│  C-Suite Layer │ Vision/PMO │ Innovation │ Budget/Cost   │
-├─────────────────────────────────────────────────────────┤
-│  Persistence: File-backed │ PostgreSQL │ In-Memory       │
-│  Event Bus │ Notification Dispatch │ Webhook Connector   │
-├─────────────────────────────────────────────────────────┤
-│  Connectors: Jira │ GitHub │ Slack │ Teams │ HubSpot     │
-└─────────────────────────────────────────────────────────┘
-```
+| Regiment | Function | Officers | Agents |
+|---|---|---|---|
+| High Command | Orchestration | Olympus · Chief of Staff (Field Marshal) | 1 |
+| Titan | Executive and programs | Kronos · CEO, Hyperion · CMO, Atlas · CTO, Themis · CPO, Rhea · CHRO, Mnemosyne · PMO Director (Generals) | 6 |
+| Olympian | Marketing | Zeus · Marketing Director (Colonel) | 9 |
+| Asgard | Engineering | Odin · Engineering Director (Colonel) | 13 |
+| Explorer | Product | Magellan · Product Director (Colonel) | 13 |
+| Eden | HR and talent | Gaia · HR & TA Director (Colonel) | 11 |
 
-### 🪖 Organizational Hierarchy
-
-- 🏛️ **Board / Vision Layer**
-  - 👑 **CEO** — Supreme Commander · Titan Regiment
-    - 📣 **CMO** → Olympian Regiment (Marketing)
-    - 🛠️ **CTO** → Asgard Regiment (Engineering)
-    - 📐 **CPO** → Explorer Regiment (Product)
-    - 🧑‍💼 **CHRO** → Eden Regiment (HR & Talent)
-    - 💰 **CFO** → Budget Intelligence
-    - 📋 **PMO** → Program Management Office
-
----
-
-## 🧱 Tech Stack
-
-| Layer | Technology |
-|---|---|
-| 🎨 **Frontend** | Next.js 14 · React 18 · TypeScript · Tailwind · Zustand · Framer Motion |
-| 🛣️ **Gateway API** | Node.js HTTP server · TypeScript |
-| 🗄️ **State** | Zustand |
-| 🔄 **Data Fetching** | TanStack React Query |
-| 📦 **Monorepo** | pnpm workspaces · Turborepo |
-| 📐 **Schemas** | JSON Schema (skills · tools · prompts · workflows · workers · policies) |
-| 🐘 **Database** | PostgreSQL (Prisma for Prompt Library) |
-| 🤖 **Agent Runtimes** | LangGraph (default) · AutoGen · CrewAI · Custom |
-| 🔌 **Connectors** | Jira · GitHub · Slack · Confluence · Teams |
+Ranks across all regiments: 6 Generals, 1 Field Marshal, 4 Colonels, 34 Captains and 8 Corporals (`services/gateway/src/agent-registry.ts`).
 
 ---
 
@@ -345,56 +297,48 @@ docker compose -f deploy/docker-compose.production.yml up -d
 
 ```
 EAOS/
-├── 🎨 apps/web/                # Next.js 14 frontend (App Router · Tailwind · Framer Motion)
+├── 🎨 apps/web/             # Next.js 15 web app
 ├── 🛣️ services/
-│   ├── gateway/                # API gateway (Node.js HTTP, 150+ routes) — the runtime core
-│   ├── cognitive-engine/       # Multi-step LLM reasoning pipeline
-│   └── memory/                 # Memory service
-├── 📦 packages/                # 28 packages (schemas · auth · workflow-engine · memory-pipeline · router · policy · db · sandbox…)
-├── 🧩 skills/                  # File-defined EAOS skills by persona (design · engineering · hr · product · program · marketing · leadership · learning)
-├── 🗃️ skills-unported/         # Quarantined skills pending EAOS-native rewrite
-├── 🔌 connectors/              # GitHub · Jira · Slack · Teams
-├── 👷 workers/                 # developer-knowledge · incident-intelligence · engineering · marketing · leadership · transcript-actions
-├── 🤖 agents/marketing/        # Marketing Agent Graph (SOMAN)
-├── 🔄 workflows/               # Flagship cross-functional workflow DAGs
-├── 🧠 third_party/             # Adopted-OSS notices + licenses (deer-flow · hermes · gstack · mattpocock)
-├── 📚 prompt-library/          # Prompt Library (Prisma-based)
-├── 🔌 mcp.servers.json         # MCP server registry (stdio + HTTP)
-└── 📸 docs/screenshots/        # App screenshots
+│   ├── gateway/             # API gateway and durable-runtime workers: the core
+│   ├── cognitive-engine/    # Standalone reasoning service (not called by the gateway)
+│   └── memory/              # Embedding memory service (not wired to the gateway yet)
+├── 📦 packages/             # 29 workspace packages (auth, config, db, sdk, skills, secrets, workflow-engine, …)
+├── 🔌 connectors/           # GitHub · Jira · Slack (Teams bot not implemented)
+├── 🧩 skills/               # 18 adopted file-defined skills, by persona
+├── 🗃️ skills-unported/      # Quarantined skills pending an EAOS-native rewrite
+├── 🔄 workflows/            # YAML starters (inspect-only; not runnable yet)
+├── 👷 workers/              # Worker definitions
+├── 🤖 agents/marketing/     # Marketing agent graph
+├── 📚 prompt-library/       # Separate Prompt Library app (Prisma)
+├── 🐳 deploy/               # Dockerfile, dev and production compose, app-role SQL
+├── 🧪 tests/                # PostgreSQL acceptance (M0, M2) and browser suites
+├── 📖 docs/                 # Product definition, roadmap, workflow readout, operations guide
+├── 🧠 third_party/          # Adopted open-source notices and licences
+└── 🔌 mcp.servers.json      # MCP server registry (env-gated)
 ```
 
 ---
 
-## 🛣️ API Endpoints (150+)
+## 🛣️ API
 
-| Group | Routes | Description |
-|---|---|---|
-| 🔐 **Auth** | `POST /api/auth/token` · `GET /api/auth/me` | JWT issuance & user info |
-| ▶️ **Execution** | `POST /api/execute` · `GET /api/executions[/:id]` | Unified skill execution |
-| 👔 **C-Suite** | `GET /api/csuite[/:id[/chain]]` | Agent hierarchy & command chain |
-| 🎯 **Vision/PMO** | `POST /api/vision[/:id/decompose,cascade]` | Vision decomposition & cascading |
-| 🧪 **Innovation** | `/api/innovation/{experiments,hackathons,graduations}/*` | Innovation labs CRUD + state |
-| 💰 **Budget** | `/api/budget/{agents,spend,alerts,dashboard}/*` | Cost tracking & CFO dashboard |
-| 📈 **Improvement** | `/api/improvement/{reviews,plans,feedback,exemplars}/*` | Reviews · plans · feedback |
-| 🔔 **Notifications** | `/api/notifications/{channels,rules,dispatch}/*` | Multi-channel dispatch |
-| 🔗 **Webhooks** | `/api/webhooks/{endpoints,subscriptions,receive}/*` | HMAC-SHA256 signed |
-| 🧩 **Skills** | `/api/skills/unified` · `/api/marketplace/skills/*` | Marketplace with voting |
-| 🪟 **Personas** | `/api/{engineering,product,hr,marketing}/*` | Persona-gated execution |
-| 🤖 **Agents** | `/api/agents/{registry,kpis,memory}` | Registry · KPIs · memory |
-| ⏰ **Scheduler** | `/api/scheduler/{jobs,events}/*` | Cron / interval / event-driven |
-| 💬 **Blog/Forum** | `/api/{blog/posts,forum/threads}/*` | Content with voting |
-| 🧠 **Cognitive** | `/api/cognitive/{process,decompose,reason}` | Multi-step LLM pipeline |
-| 🔍 **Observability** | `/api/{governance/audit,events,health}` | Audit · events · health |
-| 🧩 **Skill Library** | `/api/skills/fs[/execute]` · `/api/skills/scan` | File-defined skills + scan gate |
-| 🏛️ **Review** | `/api/review/{run,chain}` | Collaborative Regiment Review chain |
-| 🔌 **MCP** | `/api/mcp/{servers,tools,execute,stats}` | Real MCP client (stdio + HTTP) |
-| 🐝 **Swarms** | `/api/swarms/{launch,templates,stats}` | A2A swarm orchestration |
+These are the canonical routes. On PostgreSQL, writes to legacy routes outside this list answer `422 legacy_quarantined`.
+
+| Area | Routes |
+|---|---|
+| 🔐 **Auth and identity** | `POST /api/setup` · `/api/auth/{token,me,config,demo,token/refresh,logout,ws-ticket}` · `/api/auth/oidc/{authorize,callback,exchange}` · `/api/users/apikeys` |
+| ▶️ **Runs** | `POST /api/execute` · `GET /api/executions[/:id[/trace]]` · `POST /api/executions/:id/{approve,reject}/:stepId` · `POST /api/executions/:id/{cancel,retry}` |
+| 🧰 **Catalogue** | `/api/catalog` · `/api/{persona}/skills` · `/api/certification` · `/api/llm/models` · `/api/workflows/flagship[/:id/run]` · `/api/workflows/inspect-yaml` |
+| 🤝 **Multi-agent** | `/api/orchestrator/goal` · `/api/pipeline/execute` · `/api/swarms/launch` · `/api/swarms/:id/advance` · `/api/workflows/{execute,validate}` · `/api/chat/sessions[/:id/messages]` |
+| 🔌 **Integrations** | `/api/connections[/:type/{connect,test,status,disconnect}]` · `/api/artifacts[/:id]` · `/api/mcp/servers` |
+| ⏰ **Automation and usage** | `/api/scheduler/jobs[...]` · `/api/scheduler/events` · `/api/runtime/usage` |
+| 📊 **Operations and governance** | `/api/operations/{summary,jobs,events,agents,audit,notifications}` · `/api/evaluations[/datasets]` · `/api/registry/{packages,connectors}` · `/api/knowledge/{search,governance}` · `/api/prompts` · `/api/admin/members` · `/api/review/{run,chain}` |
+| 💓 **Health** | `/api/live` · `/api/ready` · `/api/health` |
 
 ---
 
 ## 🌐 Marketing Agent Graph (SOMAN)
 
-The **Self-Optimizing Marketing Agent Network** — a collaborative agent system reasoning through shared state:
+The **Self-Optimizing Marketing Agent Network** is a collaborative agent graph that reasons through shared state. It runs as a pipeline (`POST /api/pipeline/execute`, operator) with bounded feedback iterations; live vendor actions stay behind approval gates.
 
 ```
                      🧭 Marketing Orchestrator
@@ -414,53 +358,33 @@ The **Self-Optimizing Marketing Agent Network** — a collaborative agent system
                        🔁 Optimization Agent ◀── Feedback Loop
 ```
 
-🔁 **Optimization loop:** Campaign → Performance Signals → Analytics → Optimization → Strategy Adjust → Creative Regen → New Campaign
-
----
-
-## 📐 Schemas
-
-All definitions are validated against JSON schemas in `packages/schemas/`:
-
-- 🧩 `skill.schema.json` — Skill definitions
-- 🔌 `tool.schema.json` — Tool connectors
-- 📚 `prompt.schema.json` — Prompt library entries
-- 🔄 `workflow.schema.json` — Workflow definitions
-- 👷 `worker.schema.json` — Worker configurations
-- 📡 `event.schema.json` — Event types
-- 🛡️ `policy.schema.json` — Policy rules
-- 🌐 `capability-graph.schema.json` — Tool capability graph
-
 ---
 
 ## 🧠 Adopted Open Source
 
-EAOS harvests and adapts best-in-class open-source agent tooling into EAOS-native form (full notices in `third_party/NOTICE`):
+EAOS adopts proven open-source agent tooling in EAOS-native form. Full notices are in `third_party/NOTICE`.
 
-| Source | Adopted as |
+| Source (licence) | Adopted as |
 |---|---|
-| **bytedance/deer-flow** | Orchestrator prompt (live in the swarm path) + AgentMemory schema |
-| **Hermes Agent** | Best-practice agent use cases |
-| **gstack · mattpocock skills** | Curated, EAOS-renamed entries in the Skill Library |
+| **mattpocock/skills** · **garrytan/gstack** (MIT) | Curated, EAOS-renamed skills in the Skill Library. Skills tied to gstack's own tooling are quarantined in `skills-unported/` |
+| **bytedance/deer-flow** (MIT) | Orchestrator prompt (legacy swarm engine) and the agent-memory schema |
+| **NousResearch/hermes-agent** (MIT) | Agent best-practice patterns |
+| **NVIDIA/SkillSpector** (Apache-2.0) | Skill security scan (MCP, optional) |
+| **jamiepine/voicebox** (MIT) | Voice (MCP, optional) |
+| **DeusData/codebase-memory-mcp** (MIT) | Semantic code memory (MCP, optional) |
 
 > 🧩 Adopted artifacts use **EAOS nomenclature**, not source-repo names, so the platform speaks one consistent language.
 
 ---
 
-## 📜 License
-
-MIT
-
----
-
-## 👤 Author
+## 📜 License and Author
 
 **Created & developed by [Phani Marupaka](https://linkedin.com/in/phani-marupaka)**
 
-© 2026 Phani Marupaka. All rights reserved.
+© 2026 Phani Marupaka. All rights reserved. EAOS is proprietary software. Adopted third-party components keep their own licences, listed in `third_party/NOTICE`.
 
 > ⚖️ Unauthorized reproduction, distribution, or modification of this software, in whole or in part, is strictly prohibited under applicable trademark and copyright laws including but not limited to the Digital Millennium Copyright Act (DMCA), the Lanham Act (15 U.S.C. § 1051 et seq.), and equivalent international intellectual property statutes. This software contains embedded provenance markers and attribution watermarks protected under 17 U.S.C. § 1202. Removal or alteration of such markers constitutes a violation of federal law.
 
 ---
 
-🛠️ Built with **Next.js · TypeScript · Tailwind CSS** — and a lot of AI agents. 🤖✨
+🛠️ Built with **Next.js · TypeScript · Node.js · PostgreSQL**, and a lot of AI agents. 🤖✨
