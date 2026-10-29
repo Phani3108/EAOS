@@ -227,36 +227,19 @@ Connector calls resolve their secret from Vault at call time. All outbound conne
 
 ## ✨ Highlights
 
-- 🤖 **53 autonomous agents** across 5 regiments (Titan · Olympian · Asgard · Explorer · Eden)
-- 🏛️ **Military hierarchy** — General → Field Marshal → Colonel → Captain → Corporal
-- 🧰 **60+ pre-built skills** spanning Engineering, Marketing, Product, HR, Talent, PMO
-- 🔌 **MCP tool layer** with 8+ adapters (Jira, GitHub, Slack, Confluence, HubSpot, GA4, LinkedIn, Figma)
-- 🔄 **A2A protocol** for agent-to-agent delegation, review, critique, escalation
-- 📦 **UTCP packets** — universal task context standard for every execution
-- 🧭 **5 flagship workflows** — PRD→Jira · Incident RCA · Campaign Launch · Hiring Pipeline · Launch Readiness
-- 🎯 **Model router** — Haiku → Sonnet → Opus with cost metering & circuit breakers
-- 🛡️ **Governance built-in** — RBAC, audit trail, compliance checks, cost attribution, budget controls
-- 📊 **150+ API routes** — fully implemented backend with real persistence
-- 🧩 **Skill Library** — adopted, file-defined EAOS skills (QA loop · security audit · PRD writer · technical spec · product discovery) runnable from the UI
-- 🏛️ **Regiment Review** — collaborative Strategy → Design → Engineering → DevEx review chain where each stage sees the prior verdicts
-- 🔌 **Real MCP client** — stdio + HTTP transports with graceful degradation (codebase-memory, voicebox)
-- 🎬 **Guided onboarding + dark mode** — storytelling home, an "experience the magic" first-run flow, light/dark themes, and toast feedback
-- 🔒 **Hardened security** — OIDC JWKS verification · mandatory JWT in prod · IDOR-scoped reads · CORS allowlist · safe expression eval · SkillSpector skill-scan gate
-
----
-
-## 🧬 How It Works
-
-```
-You state a goal
-  → Intent Engine selects the workflow
-    → Agents collaborate (A2A) and run skills
-      → Tools execute the work (MCP)
-        → Outputs are aggregated and reviewed
-          → Human approves → Memory + after-action report
-```
-
-Vision-level goals are **decomposed** by the C-suite and **cascaded** down through regiments to individual agents — the same loop scales from a single skill run to a cross-functional swarm.
+- 🤖 **53 agents in 5 regiments plus High Command**: Titan (executive and programs), Olympian (marketing), Asgard (engineering), Explorer (product) and Eden (HR and talent). Every agent has a call sign and a rank.
+- 🪖 **Ranks with accountability**: General → Field Marshal → Colonel → Captain → Corporal. Every step of a run names the agent that did it.
+- 🧰 **81 runnable definitions**:
+  - 46 persona skills and 30 marketing workflows.
+  - 5 flagship workflows: PRD → Jira, Incident RCA, Campaign Launch, Hiring Pipeline and Launch Readiness.
+  - Plus 18 adopted file-defined skills.
+- ⚙️ **Durable runtime on PostgreSQL**: idempotent runs, fenced worker leases, approval gates that survive restarts, child runs, deadlines, schedules and an event outbox.
+- 🧑‍⚖️ **Human approval gates**: confirmations, named approvers and a check that the draft hasn't changed, before any external action.
+- 🧪 **Simulation by default**: with no model key, runs are simulated and labelled. Add a key and a budget to go live.
+- 🔌 **Verified connectors**: GitHub, Jira and Slack through Vault secret references, with every write read back. An MCP client handles voicebox, code-memory and SkillSpector.
+- 🤝 **Multi-agent modes**: goal planner, pipelines with quality gates, swarms with phase approvals, and chat that starts runs.
+- 🏛️ **Regiment Review**: a strategy → design → engineering → developer-experience review chain, where each reviewer sees the earlier verdicts.
+- 📏 **Evaluations and a release gate**: labelled datasets, and registry promotion that needs live evidence and an independent reviewer.
 
 ---
 
@@ -268,155 +251,45 @@ git clone https://github.com/Phani3108/EAOS.git
 cd EAOS
 pnpm install
 
-# 🔐 Set up environment
-cp .env.example .env
-# Edit .env — set JWT_SECRET and EAOS_SETUP_TOKEN; add LLM keys for real execution
-
-# ▶️ Run gateway + frontend
+# ▶️ One command: dev PostgreSQL (Docker), migrations, gateway and web.
+#    Local demo mode, so no sign-in is needed on this machine.
 pnpm dev
-
-# 🐳 Or use Docker — fill in every blank REQUIRED value in deploy/.env first
-cp deploy/.env.example deploy/.env
-docker compose -f deploy/docker-compose.production.yml up -d
 ```
 
-- 🌐 **Frontend** — http://localhost:3010
-- 🛠️ **Gateway** — http://localhost:3000
-- 📈 **Grafana** — http://localhost:3001
+- 🌐 **Web**: http://localhost:3010 · 🛠️ **Gateway**: http://localhost:3000.
+- 🧪 **Going live:** runs are simulated until you add a model key. Copy `.env.example` to `.env`, set `ANTHROPIC_API_KEY` (or another provider), restart, then set a workspace budget with `PUT /api/runtime/usage`.
+- 🗂️ **Without Docker,** `pnpm dev` falls back to the file store (limited mode).
+- 🐳 **Production-style stack:**
+  1. `cp deploy/.env.example deploy/.env` and fill in every REQUIRED value.
+  2. Run `docker compose -f deploy/docker-compose.production.yml up -d`.
+  3. Grafana is on http://localhost:3001.
+- ✅ **Prerequisites:** Node.js ≥ 22.20, pnpm 10.14 (via corepack), and Docker for the dev database.
 
-### Current release scope and authentication
-
-- Canonical execution uses versioned definitions, stable identities and explicit live/simulated/unsupported outcomes. PostgreSQL mode uses transactional run/job admission, fenced worker leases, durable approval continuations and a tenant-scoped outbox. The broader capability inventory remains unverified until its adapters and business workflows pass conformance checks.
-- Set `JWT_SECRET` and `EAOS_SETUP_TOKEN` before first startup. Open the browser sign-in screen, choose first-time administrator setup, and save the API key shown once. Anonymous access is off by default.
-- Docker (`deploy/docker-compose.production.yml`, configured by `deploy/.env`) requires `POSTGRES_PASSWORD`, `EAOS_APP_DB_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET` and `GRAFANA_PASSWORD`, and has no default passwords. It runs tracked migrations as the database owner, then provisions the gateway's separate `eaos_app` login and its grants (`deploy/postgres/app-role.sql`) before the gateway starts; the gateway connects only as that login. Production refuses owner/superuser/BYPASSRLS application roles. Redis is not published on the host and requires its password; Postgres is published on loopback only. Use TLS for a public deployment.
-- `EAOS_TENANT_ID` binds legacy state and bootstrap configuration, not ownership of other tenants' canonical runs. Canonical APIs enforce verified tenant/owner scope. In PostgreSQL mode, unmigrated legacy writes are rejected and snapshot restoration is read-only. `GET /api/runtime/quarantine` provides an administrator-only dry-run summary; existing data is never reassigned automatically.
-- Browser traffic uses the same-origin `/_/gateway` proxy. Set `FRONTEND_URL` and `CORS_ALLOWED_ORIGINS` to the public web origin; set `GATEWAY_URL` to that origin plus `/_/gateway`. Organization sign-in also needs the OIDC variables and an `OIDC_REDIRECT_URI` ending in `/_/gateway/api/auth/oidc/callback` on the web origin.
-- Sign-in, demo and SSO calls are rate limited per client. The `/_/gateway` proxy adds no `X-Forwarded-For`, so the gateway sees the web server's address for every visitor; until a TLS terminator in front of the web tier sets that header and the web tier is listed in `EAOS_TRUSTED_PROXIES` (IPs or CIDR blocks), a visitor's first calls share one bucket for the whole deployment. Those calls are budgeted for that: `GET /api/auth/config` is not limited, and starting the demo or SSO allows 60 a minute; other unauthenticated calls allow 10. The bundled compose file passes `EAOS_TRUSTED_PROXIES` through but trusts nobody by default, because trusting the web tier without such an edge lets any client name any address.
-- `pnpm dev` runs `EAOS_DEMO_MODE=local` with both servers bound to 127.0.0.1 (`HOST`). Local demo mode honours a credential-less request only from this machine — loopback client, localhost `Host`, no foreign browser `Origin`. Demo identities stop working when their mode is turned off.
-- API-key rotation/revocation ends the owner's issued sessions. Save the replacement before signing back in. Keep an independent `API_KEY_HASH_SECRET` for long-lived key hashes when rotating JWT signing keys; keys issued before it was set keep working and move onto it on first use. A key, or a session minted from one, cannot mint a credential that outlives the key's `expiresAt`.
-
-Application-role grants after migration live in `deploy/postgres/app-role.sql`, which Docker runs after every migration. For a database you provision yourself, run it as the migration owner with psql 15 or newer; it creates or re-keys the login (never the owner), strips any RLS-bypassing attribute and applies only the grants the gateway needs. Do not give that login schema ownership.
-
-```bash
-EAOS_APP_DB_PASSWORD=... psql "<owner connection URL>" -v ON_ERROR_STOP=1 -v app_role=eaos_app -f deploy/postgres/app-role.sql
-```
-
-File-backed mode remains an isolated local-development fallback, not a multi-worker durability guarantee. Canonical orchestration requires PostgreSQL and migrations through 025. Workers execute bounded parallel DAG nodes with serialized, fenced checkpoints; a coordinator parks only after active siblings settle. Completed nodes cannot move backwards, and interrupted unknown effects require reconciliation rather than automatic replay. Supported text uploads resolve through owner-scoped artifact records. Nonmigrated connector effects and unsupported file formats remain explicitly unsupported rather than borrowing credentials or fabricating extracted content.
-
-Migrated storage/API contracts:
-
-- Knowledge documents, private memory decisions/corrections and configuration records use owner-scoped, version-checked writes. Updates require the current `version`; stale updates return conflict instead of overwriting.
-- Chat sessions/messages are persisted and owner-scoped. PostgreSQL chat replies and structured `/skill-slug {"input":"value"}` commands submit canonical executions; the chat acknowledgement links the run rather than claiming a completed reply. On the file store, a message that would be simulated (a demo visitor, or no LLM provider configured) takes the same path instead of calling a provider directly.
-- Connections accept `secretRef: {provider, path, key?, version?}` plus an explicit resource/action `config`. Vault KV v2 is the implemented resolver; other stored provider references are not executable adapters. Configure paired `VAULT_ADDR` (HTTPS origin), `VAULT_TOKEN`, and optional `VAULT_KV_MOUNT` (default `secret`). Paths must start with the verified `tenantId/userId/`, ids written verbatim (an SSO user's is `oidc:<sha256>`, e.g. `default/oidc:3f2a…/github`); secret fields default to `token`. Jira stores a JSON string with `email` and `apiToken` in that field. No secret values are returned by connection APIs.
-- Saving a reference yields `configured`; `POST /api/connections/:id/test` verifies identity and configured resource access. GitHub config uses `repositories` and action names such as `read:pull_request` / `comment:pull_request`; Jira uses `endpoint`, `projects`, and `read:issue` / `create:issue`; Slack uses `channels` and `read:message` / `create:message`. Defaults authorize reads only. Connection verification is not proof of every write permission.
-- Current typed transport coverage is GitHub PR evidence/comment, Jira single-issue read/create, and Slack message read/create. Effect approval binds normalized inputs and credential version; durable receipts prevent blind duplicate writes, and remote readback is required for success. Readback tolerates documented vendor normalisation only: GitHub's canonical owner/repo casing, and Slack's `&amp;`/`&lt;`/`&gt;` escaping. Slack messages are posted with `parse=none` (no URL rewriting) and refused before dispatch above Slack's 40,000-character truncation limit. Unknown effects remain inconclusive pending reconciliation. Vault rotation/version or binding-key changes invalidate verification. Keep an independent `API_KEY_HASH_SECRET` for stable credential bindings across JWT rotation.
-- The new Vault/connector transport enforces exact HTTPS origins, DNS/IP validation and pinning, no redirects, response/body bounds and timeouts. Only the operator-configured Vault origin may use private addresses; tool targets may not. Legacy transports remain contained, not advertised as conforming.
-- An operator configures a tenant usage budget with `PUT /api/runtime/usage` and `limitMicros` (1,000,000 units = USD 1). Live provider requests reserve budget before dispatch. Successful responses settle estimated token cost; attempts the provider refused (an HTTP error status, or a connection never established) release their reservation; uncertain failures (a timeout or reset after sending, a gateway timeout, an unreadable response) retain reservations rather than inventing zero cost. Simulation does not consume live budget.
-- A live run may only name a model with a known price: `GET /api/llm/models` lists them (each provider's priced models, plus the configured Azure deployment and Ollama model). Any other `modelId` is refused with 400 at submission, listing the alternatives; omitting it uses the provider default.
-- Run mode is decided where every run is created, from its owner: demo visitors are always simulated, otherwise the client's `simulate` choice wins, and with no choice a gateway with no LLM provider configured simulates. This covers execute, chat, registry packages, goals, pipelines, swarms, workflows and schedules alike.
-- Schedules use validated five-field cron with an explicit IANA timezone (UTC by default), intervals, one-time or named event triggers. DST gaps are skipped and repeated fall-back wall-clock occurrences run once. New API schedules default to overlap skipping; existing unspecified policies retain compatibility. Missed occurrences coalesce rather than replaying an unbounded backlog. Event bindings map bounded string payload paths into declared text inputs. Run/event requests require a stable `deliveryId`; receipts and run admission commit together. Toggle/archive requests require `version`. Dispatch rechecks current membership/scopes.
-- `GET /api/executions/:id/trace` exposes authorized step attempts, artifact metadata and lineage. `POST /api/executions/:id/retry` is operator-only and does not replay rejected approvals or uncertain effects.
-- Recursive subworkflows admit child run + parent-step linkage in one transaction, inherit owner/mode/deadline, and resume parents durably. Limits are five child levels, 128 runs per tree, and 1,024 expanded definition nodes. Parent cancellation fences all active descendants; cross-run artifact lineage is retained.
-- Goal, SOMAN/pipeline and swarm compatibility routes now submit/read/cancel canonical runs. Natural-language planning uses a frozen authorized skill manifest and rejects invented agents/skills before child admission; simulated goals require an explicit task plan. Swarm phases are real child runs, and advancement authorizes a waiting gate rather than fabricating phase completion.
-- SOMAN feedback uses bounded child iterations and durable cooldowns. Prior-iteration state is separate from ordinary DAG dependencies. Required sections/citation presence are checked mechanically; semantic quality/circuit-breaker requirements remain human gates, not claimed factual certification. Live vendor activation remains M4 work.
-- Approval decisions remain durable while sibling nodes run. Required confirmation fields and designated approvers are enforced, and approved drafts are reused. Per-node retries/deadlines and explicit whole-tree deadlines are bounded; suspension does not occupy workers.
-- `WorkflowRunner` requires an authenticated `WorkflowClient`; `GatewayWorkflowClient` uses `POST /api/workflows/execute` plus canonical read/decision/cancel APIs. `GatewayWorkflowBridgeClient` supports the older workflow-engine shape through the same service. Arbitrary worker IDs, untyped tool actions, implicit failure skipping and executable hooks are rejected rather than converted to no-ops. The legacy runner is retained only for isolated characterization, not exported as the SDK default.
-
-M4/M5 acceptance boundaries:
-
-- `POST /api/artifacts` (also the marketing upload alias) accepts `{fileName,mimeType,contentBase64}`. UTF-8 text, Markdown, CSV, JSON and source code are supported. Limits: 512 KB raw bytes, 128k extracted characters, 64k expanded execution context, 20 references per run, and 64 MB/1,000 live files per owner. File names are sanitised, not rejected: directory parts, control/bidi characters and Windows-reserved characters are replaced. Archiving frees quota by dropping the content; the row and digest remain for run lineage. Public demo visitors share one 64 MB/5,000-file pool (2 MB/20 files each), and their uploads expire after 24 hours. PDF/Office/image extraction is not implemented. Download and archive operations enforce ownership; run admission pins artifact digests.
-- Structured artifact evidence reaches the model as JSON, not `[object Object]`. Changing fixture source content changes the observed model output in the controlled-provider gate. Simulation does not imply that an external action occurred.
-- `GET /api/certification` and catalog support fields distinguish content generation, typed external actions, and missing bindings. `POST /api/workflows/inspect-yaml` parses bounded YAML and reports compiled or unsupported starters; unknown workers/actions are not guessed. Legacy starters with unresolved bindings remain unsupported.
-- `pnpm test:m4` and `pnpm test:m5` run the combined disposable-database regression suite. The M5 matrix checks every catalog definition and all five flagships in simulation, plus representative six-family mocked content lifecycles. Vendor-sandbox completion proofs and human domain review remain pending by explicit user choice. These automated results do not certify six live external-operation verticals or every legacy action binding.
-
-M6/M7 operating and developer core:
-
-- `GET /api/operations/summary` derives authenticated-request counts/latency, live versus simulation outcomes, job state, usage ledger totals and labeled evaluation observations from PostgreSQL. Empty quality data stays null. Legacy random fingerprints are no longer an advertised measurement source.
-- `GET /api/operations/jobs` and the Operating Platform console expose unresolved work with authorized trace, eligible retry and recursive cancellation controls. Unknown effects cannot be forced to complete. `GET /api/operations/events?cursor=...` provides tenant/owner-scoped replay with a durable per-tenant sequence assigned after business commits; use event IDs to deduplicate at-least-once live delivery. Redis fanout remains deployment-specific.
-- Versioned datasets contain labeled cases, explicit readers and run-linked observations. A promotion requires current, complete live evidence for at least three distinct labeled cases, a passing review, an independent reviewer, and an administrator CAS activation. This is a governance floor, not statistical or vendor/business certification. Dataset/source revision or access changes invalidate stale evidence.
-- Knowledge/memory retrieval uses unexpired owner-requested independent reviews, explicit readers and current source versions. Memory promotion requires a completed live source run. `knowledgeQuery` resolves reviewed sources into bounded, cited user context; legacy global agent memories are not injected into PostgreSQL execution. Current retrieval is full-text, not a claim of complete connector/vector ingestion.
-- Notifications use owned terminal source runs and enabled Slack channels through canonical approved tool runs. Delivery state comes from the verified receipt, not a counter increment. Simulation cannot enqueue a live notification. New email/Teams/voice channels and billing activation remain disabled.
-- The canonical PostgreSQL registry is authoritative for runtime prompt versions. `/api/prompts` stages prompt-backed workflow candidates and lists only active reviewed versions; old prompt-library/editorial records are not reassigned or automatically imported. Candidates can be previewed by their publisher/designated evaluators before promotion. Private/tenant visibility, origin/license metadata, immutable hashes, independent review, activation and rollback-by-version share the same registry. Connector manifests stay non-executable while vendor certification, independent connector review and marketplace execution binding remain pending.
-- Tenant membership updates are admin-only, version-checked and audited; they revoke issued sessions and attenuate existing credentials. Active runs and stream delivery recheck membership; the last active administrator cannot be removed. This manages existing tenant principals, not an unimplemented invitation or billing flow.
-- `PlatformClient` adds typed operations/evaluation/registry/member APIs. The CLI uses `EAOS_TOKEN` or `EAOS_API_KEY` without persisting them. `run` defaults to simulation; `--live` is explicit. Commands include `ops`, `recovery`, `validate`, `run`, `watch`, `trace`, `export`, `approve`, `reject`, `cancel`, `retry`, `events`, `dataset-create`, `evaluate`, `stage`, `preview`, `review`, `activate`, `prompt-stage`, `members`, and `member-update`. JSON output can be redirected for reviewable evidence exports.
-- These core capabilities do not close the remaining M4/M5 certification gaps or all enterprise expansion. Connector marketplace activation, broader ingestion/retention/billing workflows and production operational certification remain explicitly gated.
-
-Connector conformance before marketplace activation:
-
-- The six native GitHub/Jira/Slack actions have registered input/output schemas. `GET /api/registry/connectors` exports their contracts, policies and adapter fingerprints; registration is not a certification claim. Resource probes verify the requested repository/project/channel identity. Jira project/parent and GitHub comment-target readback are checked, and Slack requires an unambiguous matching message.
-- GitHub PR evidence uses immutable base/head commit comparisons. The supported text-diff boundary is 100 files and 100 comparison commits; missing patches, inconsistent line counts and incomplete comparisons fail explicitly. Binary/oversized evidence is not silently represented as a complete review input. Connector outputs are bounded to 128k serialized characters; HTTPS transport bounds include DNS resolution and cancellation.
-- Connector staging accepts `{schemaVersion:1,id,actions}` for registered native IDs and seals it as a version-2 manifest. Duplicate, unknown and cross-connector actions are rejected. Adapter fingerprints bind schemas/policies and the gateway adapter/transport implementation; changed builds require restaging and invalidate pending action approval proofs. Existing completed receipts remain historical results, not newly generated certification evidence.
-- Migration 024 adds fenced, tenant-owned observations for successful reads and verified effects. Effects persist observations with their completed receipt in one transaction. Simulated work, mismatched frozen actions and effects without verified receipts cannot manufacture observations. Custom/injected transports are always labeled `custom_transport`; `native_transport` means the native HTTPS path was used, not that an authorized vendor sandbox certification was performed.
-- `GET /api/registry/packages/:id/conformance?hash=...` returns authorized per-action observations bound to the exact manifest/adapter, canonical completed run/step and current connection version. It considers a 90-day evidence window and returns blockers, not a fabricated certification flag. No HTTP endpoint accepts caller-authored pass/native-evidence claims. Old/unpinned manifests require restaging. Revoked connections and changed adapters invalidate current evidence eligibility.
-- `PlatformClient.connectorContracts()` / `connectorConformance()` and CLI `connector-contracts` / `conformance <packageId> <hash>` expose this state. The conformance command exits nonzero while activation is blocked; the registry UI shows the same blockers. Generic workflow evaluation, preview, review and activation cannot enable a connector version.
-- **Marketplace connector activation remains disabled.** The local contract/failure matrix does not replace vendor-sandbox certification, independent connector approval, publisher-origin attestation or an activation-time execution binding. The 24 unbound catalog workflows and 15 unsupported legacy starters are not silently repaired or certified by this work. External tests and real vendor actions still require specific authorization.
+Deployment, authentication, connectors, budgets and every runtime contract are in **[docs/operations.md](docs/operations.md)**.
 
 ### Verification
 
-- `pnpm build`, `pnpm typecheck`, `pnpm lint`, and `pnpm test` run the build, type checks, lint and actual root unit suites.
-- `pnpm audit --prod --audit-level=high` is a blocking release check.
-- `EAOS_TEST_DATABASE_URL=... pnpm test:m0` requires a disposable local PostgreSQL database named `eaos_m0_fixture`; it refuses to silently skip. It tests migrations, bootstrap, RLS, key/session lifecycle and the compiled gateway.
-- `EAOS_TEST_DATABASE_URL=... pnpm test:m2` requires a disposable local PostgreSQL database named `eaos_m2_fixture`. It checks non-owner RLS, admission rollback/idempotency, concurrent claims/fencing, retry delay, cancellation, approval expiry/resume, outbox delivery, two-tenant HTTP isolation, restart recovery and unavailable-storage liveness. It creates fixture rows and roles; never point it at customer data.
-- `EAOS_TEST_DATABASE_URL=... pnpm test:m3` runs the combined M2/M3 gate against `eaos_m2_fixture`, including recursive cancellation/deadlines, monotonic checkpoints, primary parallel overlap with a controlled fake provider, process-kill recovery, parallel approvals, full SOMAN/swarm flows, planner validation and authenticated SDK/bridge parity. It does not call real vendors.
-- `EAOS_TEST_DATABASE_URL=... pnpm test:m6` / `pnpm test:m7` run the combined fixture gate, including measured operations, governance/promotion denials, membership revocation, SDK/CLI behavior, notifications, event bindings/replay, and two gateway processes sharing PostgreSQL. The measured fixture load is not a production capacity promise.
-- If a managed macOS certificate chain prevents the pinned Playwright browser download, use Node's existing system CA store for that command (`NODE_OPTIONS=--use-system-ca pnpm exec playwright install chromium`); never disable TLS verification.
-- `pnpm exec playwright install chromium` then `pnpm test:browser` tests the production browser/proxy authentication flow and six-persona execution contract using isolated fixture servers on ports 32198/32199. Build workspace dependencies first. Browser tests never use real vendor credentials.
-
-### ✅ Prerequisites
-
-- 🟢 Node.js >= 22.20.0 (Docker/CI pin 22.23.2)
-- 📦 pnpm >= 9.0.0
+- `pnpm build && pnpm typecheck && pnpm lint && pnpm test`: build, type checks, lint and 427 unit and contract tests.
+- `pnpm audit --prod --audit-level=high`: a blocking release check.
+- `EAOS_TEST_DATABASE_URL=… pnpm test:m0` (database `eaos_m0_fixture`): migrations, row-level security, and the key and session lifecycle.
+- `EAOS_TEST_DATABASE_URL=… pnpm test:m2` (database `eaos_m2_fixture`): durable-runtime acceptance, including the M3–M7 contracts. `test:m3` to `test:m7` run the same suite.
+- `pnpm exec playwright install chromium`, then `pnpm test:browser`: browser sign-in through the production proxy.
+- The fixture suites create rows and roles, so never point them at real data.
 
 ---
 
-## 🏛️ Architecture
+## 🪖 Organization
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Frontend (Next.js 14)                 │
-│  Sidebar │ Command Palette │ Main Content │ Right Panel  │
-├──────────┴─────────────────┴──────────────┴─────────────┤
-│                    Gateway API (Node.js)                 │
-│  150+ API routes │ JWT Auth │ Event Bus │ WebSocket      │
-├─────────────────────────────────────────────────────────┤
-│              Agent Hierarchy (53 Agents)                 │
-│  Titan │ Olympian │ Asgard │ Explorer │ Eden Regiments   │
-├─────────────────────────────────────────────────────────┤
-│  C-Suite Layer │ Vision/PMO │ Innovation │ Budget/Cost   │
-├─────────────────────────────────────────────────────────┤
-│  Persistence: File-backed │ PostgreSQL │ In-Memory       │
-│  Event Bus │ Notification Dispatch │ Webhook Connector   │
-├─────────────────────────────────────────────────────────┤
-│  Connectors: Jira │ GitHub │ Slack │ Teams │ HubSpot     │
-└─────────────────────────────────────────────────────────┘
-```
+| Regiment | Function | Officers | Agents |
+|---|---|---|---|
+| High Command | Orchestration | Olympus · Chief of Staff (Field Marshal) | 1 |
+| Titan | Executive and programs | Kronos · CEO, Hyperion · CMO, Atlas · CTO, Themis · CPO, Rhea · CHRO, Mnemosyne · PMO Director (Generals) | 6 |
+| Olympian | Marketing | Zeus · Marketing Director (Colonel) | 9 |
+| Asgard | Engineering | Odin · Engineering Director (Colonel) | 13 |
+| Explorer | Product | Magellan · Product Director (Colonel) | 13 |
+| Eden | HR and talent | Gaia · HR & TA Director (Colonel) | 11 |
 
-### 🪖 Organizational Hierarchy
-
-- 🏛️ **Board / Vision Layer**
-  - 👑 **CEO** — Supreme Commander · Titan Regiment
-    - 📣 **CMO** → Olympian Regiment (Marketing)
-    - 🛠️ **CTO** → Asgard Regiment (Engineering)
-    - 📐 **CPO** → Explorer Regiment (Product)
-    - 🧑‍💼 **CHRO** → Eden Regiment (HR & Talent)
-    - 💰 **CFO** → Budget Intelligence
-    - 📋 **PMO** → Program Management Office
-
----
-
-## 🧱 Tech Stack
-
-| Layer | Technology |
-|---|---|
-| 🎨 **Frontend** | Next.js 14 · React 18 · TypeScript · Tailwind · Zustand · Framer Motion |
-| 🛣️ **Gateway API** | Node.js HTTP server · TypeScript |
-| 🗄️ **State** | Zustand |
-| 🔄 **Data Fetching** | TanStack React Query |
-| 📦 **Monorepo** | pnpm workspaces · Turborepo |
-| 📐 **Schemas** | JSON Schema (skills · tools · prompts · workflows · workers · policies) |
-| 🐘 **Database** | PostgreSQL (Prisma for Prompt Library) |
-| 🤖 **Agent Runtimes** | LangGraph (default) · AutoGen · CrewAI · Custom |
-| 🔌 **Connectors** | Jira · GitHub · Slack · Confluence · Teams |
+Ranks across all regiments: 6 Generals, 1 Field Marshal, 4 Colonels, 34 Captains and 8 Corporals (`services/gateway/src/agent-registry.ts`).
 
 ---
 
@@ -424,56 +297,48 @@ Connector conformance before marketplace activation:
 
 ```
 EAOS/
-├── 🎨 apps/web/                # Next.js 14 frontend (App Router · Tailwind · Framer Motion)
+├── 🎨 apps/web/             # Next.js 15 web app
 ├── 🛣️ services/
-│   ├── gateway/                # API gateway (Node.js HTTP, 150+ routes) — the runtime core
-│   ├── cognitive-engine/       # Multi-step LLM reasoning pipeline
-│   └── memory/                 # Memory service
-├── 📦 packages/                # 28 packages (schemas · auth · workflow-engine · memory-pipeline · router · policy · db · sandbox…)
-├── 🧩 skills/                  # File-defined EAOS skills by persona (design · engineering · hr · product · program · marketing · leadership · learning)
-├── 🗃️ skills-unported/         # Quarantined skills pending EAOS-native rewrite
-├── 🔌 connectors/              # GitHub · Jira · Slack · Teams
-├── 👷 workers/                 # developer-knowledge · incident-intelligence · engineering · marketing · leadership · transcript-actions
-├── 🤖 agents/marketing/        # Marketing Agent Graph (SOMAN)
-├── 🔄 workflows/               # Flagship cross-functional workflow DAGs
-├── 🧠 third_party/             # Adopted-OSS notices + licenses (deer-flow · hermes · gstack · mattpocock)
-├── 📚 prompt-library/          # Prompt Library (Prisma-based)
-├── 🔌 mcp.servers.json         # MCP server registry (stdio + HTTP)
-└── 📸 docs/screenshots/        # App screenshots
+│   ├── gateway/             # API gateway and durable-runtime workers: the core
+│   ├── cognitive-engine/    # Standalone reasoning service (not called by the gateway)
+│   └── memory/              # Embedding memory service (not wired to the gateway yet)
+├── 📦 packages/             # 29 workspace packages (auth, config, db, sdk, skills, secrets, workflow-engine, …)
+├── 🔌 connectors/           # GitHub · Jira · Slack (Teams bot not implemented)
+├── 🧩 skills/               # 18 adopted file-defined skills, by persona
+├── 🗃️ skills-unported/      # Quarantined skills pending an EAOS-native rewrite
+├── 🔄 workflows/            # YAML starters (inspect-only; not runnable yet)
+├── 👷 workers/              # Worker definitions
+├── 🤖 agents/marketing/     # Marketing agent graph
+├── 📚 prompt-library/       # Separate Prompt Library app (Prisma)
+├── 🐳 deploy/               # Dockerfile, dev and production compose, app-role SQL
+├── 🧪 tests/                # PostgreSQL acceptance (M0, M2) and browser suites
+├── 📖 docs/                 # Product definition, roadmap, workflow readout, operations guide
+├── 🧠 third_party/          # Adopted open-source notices and licences
+└── 🔌 mcp.servers.json      # MCP server registry (env-gated)
 ```
 
 ---
 
-## 🛣️ API Endpoints (150+)
+## 🛣️ API
 
-| Group | Routes | Description |
-|---|---|---|
-| 🔐 **Auth** | `POST /api/auth/token` · `GET /api/auth/me` | JWT issuance & user info |
-| ▶️ **Execution** | `POST /api/execute` · `GET /api/executions[/:id]` | Unified skill execution |
-| 👔 **C-Suite** | `GET /api/csuite[/:id[/chain]]` | Agent hierarchy & command chain |
-| 🎯 **Vision/PMO** | `POST /api/vision[/:id/decompose,cascade]` | Vision decomposition & cascading |
-| 🧪 **Innovation** | `/api/innovation/{experiments,hackathons,graduations}/*` | Innovation labs CRUD + state |
-| 💰 **Budget** | `/api/budget/{agents,spend,alerts,dashboard}/*` | Cost tracking & CFO dashboard |
-| 📈 **Improvement** | `/api/improvement/{reviews,plans,feedback,exemplars}/*` | Reviews · plans · feedback |
-| 🔔 **Notifications** | `/api/notifications/{channels,rules,dispatch}/*` | Multi-channel dispatch |
-| 🔗 **Webhooks** | `/api/webhooks/{endpoints,subscriptions,receive}/*` | HMAC-SHA256 signed |
-| 🧩 **Skills** | `/api/skills/unified` · `/api/marketplace/skills/*` | Marketplace with voting |
-| 🪟 **Personas** | `/api/{engineering,product,hr,marketing}/*` | Persona-gated execution |
-| 🤖 **Agents** | `/api/agents/{registry,kpis,memory}` | Registry · KPIs · memory |
-| ⏰ **Scheduler** | `/api/scheduler/{jobs,events}/*` | Cron / interval / event-driven |
-| 💬 **Blog/Forum** | `/api/{blog/posts,forum/threads}/*` | Content with voting |
-| 🧠 **Cognitive** | `/api/cognitive/{process,decompose,reason}` | Multi-step LLM pipeline |
-| 🔍 **Observability** | `/api/{governance/audit,events,health}` | Audit · events · health |
-| 🧩 **Skill Library** | `/api/skills/fs[/execute]` · `/api/skills/scan` | File-defined skills + scan gate |
-| 🏛️ **Review** | `/api/review/{run,chain}` | Collaborative Regiment Review chain |
-| 🔌 **MCP** | `/api/mcp/{servers,tools,execute,stats}` | Real MCP client (stdio + HTTP) |
-| 🐝 **Swarms** | `/api/swarms/{launch,templates,stats}` | A2A swarm orchestration |
+These are the canonical routes. On PostgreSQL, writes to legacy routes outside this list answer `422 legacy_quarantined`.
+
+| Area | Routes |
+|---|---|
+| 🔐 **Auth and identity** | `POST /api/setup` · `/api/auth/{token,me,config,demo,token/refresh,logout,ws-ticket}` · `/api/auth/oidc/{authorize,callback,exchange}` · `/api/users/apikeys` |
+| ▶️ **Runs** | `POST /api/execute` · `GET /api/executions[/:id[/trace]]` · `POST /api/executions/:id/{approve,reject}/:stepId` · `POST /api/executions/:id/{cancel,retry}` |
+| 🧰 **Catalogue** | `/api/catalog` · `/api/{persona}/skills` · `/api/certification` · `/api/llm/models` · `/api/workflows/flagship[/:id/run]` · `/api/workflows/inspect-yaml` |
+| 🤝 **Multi-agent** | `/api/orchestrator/goal` · `/api/pipeline/execute` · `/api/swarms/launch` · `/api/swarms/:id/advance` · `/api/workflows/{execute,validate}` · `/api/chat/sessions[/:id/messages]` |
+| 🔌 **Integrations** | `/api/connections[/:type/{connect,test,status,disconnect}]` · `/api/artifacts[/:id]` · `/api/mcp/servers` |
+| ⏰ **Automation and usage** | `/api/scheduler/jobs[...]` · `/api/scheduler/events` · `/api/runtime/usage` |
+| 📊 **Operations and governance** | `/api/operations/{summary,jobs,events,agents,audit,notifications}` · `/api/evaluations[/datasets]` · `/api/registry/{packages,connectors}` · `/api/knowledge/{search,governance}` · `/api/prompts` · `/api/admin/members` · `/api/review/{run,chain}` |
+| 💓 **Health** | `/api/live` · `/api/ready` · `/api/health` |
 
 ---
 
 ## 🌐 Marketing Agent Graph (SOMAN)
 
-The **Self-Optimizing Marketing Agent Network** — a collaborative agent system reasoning through shared state:
+The **Self-Optimizing Marketing Agent Network** is a collaborative agent graph that reasons through shared state. It runs as a pipeline (`POST /api/pipeline/execute`, operator) with bounded feedback iterations; live vendor actions stay behind approval gates.
 
 ```
                      🧭 Marketing Orchestrator
@@ -493,53 +358,33 @@ The **Self-Optimizing Marketing Agent Network** — a collaborative agent system
                        🔁 Optimization Agent ◀── Feedback Loop
 ```
 
-🔁 **Optimization loop:** Campaign → Performance Signals → Analytics → Optimization → Strategy Adjust → Creative Regen → New Campaign
-
----
-
-## 📐 Schemas
-
-All definitions are validated against JSON schemas in `packages/schemas/`:
-
-- 🧩 `skill.schema.json` — Skill definitions
-- 🔌 `tool.schema.json` — Tool connectors
-- 📚 `prompt.schema.json` — Prompt library entries
-- 🔄 `workflow.schema.json` — Workflow definitions
-- 👷 `worker.schema.json` — Worker configurations
-- 📡 `event.schema.json` — Event types
-- 🛡️ `policy.schema.json` — Policy rules
-- 🌐 `capability-graph.schema.json` — Tool capability graph
-
 ---
 
 ## 🧠 Adopted Open Source
 
-EAOS harvests and adapts best-in-class open-source agent tooling into EAOS-native form (full notices in `third_party/NOTICE`):
+EAOS adopts proven open-source agent tooling in EAOS-native form. Full notices are in `third_party/NOTICE`.
 
-| Source | Adopted as |
+| Source (licence) | Adopted as |
 |---|---|
-| **bytedance/deer-flow** | Orchestrator prompt (live in the swarm path) + AgentMemory schema |
-| **Hermes Agent** | Best-practice agent use cases |
-| **gstack · mattpocock skills** | Curated, EAOS-renamed entries in the Skill Library |
+| **mattpocock/skills** · **garrytan/gstack** (MIT) | Curated, EAOS-renamed skills in the Skill Library. Skills tied to gstack's own tooling are quarantined in `skills-unported/` |
+| **bytedance/deer-flow** (MIT) | Orchestrator prompt (legacy swarm engine) and the agent-memory schema |
+| **NousResearch/hermes-agent** (MIT) | Agent best-practice patterns |
+| **NVIDIA/SkillSpector** (Apache-2.0) | Skill security scan (MCP, optional) |
+| **jamiepine/voicebox** (MIT) | Voice (MCP, optional) |
+| **DeusData/codebase-memory-mcp** (MIT) | Semantic code memory (MCP, optional) |
 
 > 🧩 Adopted artifacts use **EAOS nomenclature**, not source-repo names, so the platform speaks one consistent language.
 
 ---
 
-## 📜 License
-
-MIT
-
----
-
-## 👤 Author
+## 📜 License and Author
 
 **Created & developed by [Phani Marupaka](https://linkedin.com/in/phani-marupaka)**
 
-© 2026 Phani Marupaka. All rights reserved.
+© 2026 Phani Marupaka. All rights reserved. EAOS is proprietary software. Adopted third-party components keep their own licences, listed in `third_party/NOTICE`.
 
 > ⚖️ Unauthorized reproduction, distribution, or modification of this software, in whole or in part, is strictly prohibited under applicable trademark and copyright laws including but not limited to the Digital Millennium Copyright Act (DMCA), the Lanham Act (15 U.S.C. § 1051 et seq.), and equivalent international intellectual property statutes. This software contains embedded provenance markers and attribution watermarks protected under 17 U.S.C. § 1202. Removal or alteration of such markers constitutes a violation of federal law.
 
 ---
 
-🛠️ Built with **Next.js · TypeScript · Tailwind CSS** — and a lot of AI agents. 🤖✨
+🛠️ Built with **Next.js · TypeScript · Node.js · PostgreSQL**, and a lot of AI agents. 🤖✨
