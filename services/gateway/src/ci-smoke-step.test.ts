@@ -7,7 +7,7 @@
  * crashed at boot left the step green.
  *
  * These tests run the step's own script, extracted from .github/workflows/ci.yml,
- * under the shell GitHub would use for it, with `pnpm` replaced by a fake gateway:
+ * under the shell GitHub would use for it, with `node` replaced by a fake gateway:
  * one that crashes, one that never becomes ready, one that is healthy, and one that
  * does not shut down cleanly.
  */
@@ -34,7 +34,7 @@ function shellCommand(step: WorkflowStep, scriptPath: string): string[] {
 }
 
 /**
- * Stands in for `pnpm --filter @agentos/gateway start`. It also records the env the
+ * Stands in for `node dist/server.js` (run from services/gateway). It also records the env the
  * step boots the gateway with, so the production-mode boot is part of the contract.
  */
 const FAKE_GATEWAY = `
@@ -69,8 +69,8 @@ let workDir: string;
 beforeAll(() => {
   workDir = mkdtempSync(join(tmpdir(), 'eaos-ci-smoke-'));
   writeFileSync(join(workDir, 'fake-gateway.cjs'), FAKE_GATEWAY);
-  writeFileSync(join(workDir, 'pnpm'), `#!/bin/sh\nexec "${process.execPath}" "${join(workDir, 'fake-gateway.cjs')}" "$@"\n`);
-  chmodSync(join(workDir, 'pnpm'), 0o755);
+  writeFileSync(join(workDir, 'node'), `#!/bin/sh\nexec "${process.execPath}" "${join(workDir, 'fake-gateway.cjs')}" "$@"\n`);
+  chmodSync(join(workDir, 'node'), 0o755);
   writeFileSync(join(workDir, 'smoke.sh'), smokeStep?.run ?? '');
 });
 
@@ -132,7 +132,7 @@ describe('CI gateway smoke step', () => {
     const result = await runSmokeStep('ready');
     expect(result.output).toContain('Gateway ready after');
     expect(result.code).toBe(0);
-    expect(result.booted?.args).toEqual(['--filter', '@agentos/gateway', 'start']);
+    expect(result.booted?.args).toEqual(['dist/server.js']);
     expect(result.booted?.NODE_ENV).toBe('production');
     // A per-run signing key, not one committed to the repository.
     expect(result.booted?.JWT_SECRET).toMatch(/^[a-f0-9]{64}$/);

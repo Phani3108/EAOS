@@ -116,7 +116,10 @@ jobs:
           DATA_DIR="$(mktemp -d)"
           export JWT_SECRET DATA_DIR
           log="$(mktemp)"
-          pnpm --filter @agentos/gateway start > "$log" 2>&1 &
+          # Start node itself, not `pnpm start`: the SIGTERM below must reach the
+          # gateway, and a package-manager wrapper that dies on the signal reports a
+          # non-zero exit for a gateway that shut down cleanly.
+          (cd services/gateway && exec node dist/server.js) > "$log" 2>&1 &
           gateway_pid=$!
           fail() {
             echo "::error title=Gateway smoke test::$1"
